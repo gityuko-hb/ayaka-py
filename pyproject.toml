@@ -1,0 +1,125 @@
+# [build-system]
+# requires = ["scikit-build-core>=0.9", "pybind11>=2.12"]
+# build-backend = "scikit_build_core.build"
+[build-system]
+requires = ["setuptools>=81.0.0", "wheel>=0.40.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ayaka"
+dynamic = ["version"]
+description = "High-performance LLM inference engine with CUDA/C++ native extensions"
+readme = "README.md"
+requires-python = ">=3.13, <3.14"
+license = { file = "./LICENSE" }
+dependencies = [
+    "aiohttp>=3.14.1",
+    "anthropic>=0.117.0",
+    "cachetools>=7.1.4",
+    "cmake>=4.4.0",
+    "datasets>=5.0.0",
+    "fastapi[standard]>=0.139.2",
+    "jinja2>=3.1",
+    "jsonschema>=4.26.0",
+    "msgspec>=0.21.1",
+    "ninja>=1.13.0",
+    "numpy>=2.5.1",
+    "openai>=2.46.0",
+    "openai-harmony>=0.0.8",
+    "packaging>=26.2",
+    "pillow>=12.3.0",
+    "protobuf>=7.35.1",
+    "psutil>=7.2.2",
+    "pyzmq>=26.1",
+    "pybase64>=1.4.3",
+    "pybind11>=3.0.4",
+    "pybind11-stubgen>=2.5.5",
+    "pydantic>=2.13.4",
+    "pyright>=1.1.411",
+    "python-multipart>=0.0.32",
+    "pyyaml>=6.0",
+    "regex>=2026.7.19",
+    "requests>=2.34.2",
+    "safetensors>=0.4",
+    "setuptools>=81.0.0",
+    "starlette>=1.3.1",
+    "tiktoken>=0.13.0",
+    "tokenizers>=0.19",
+    "tqdm>=4.69.0",
+    "transformers>=5.14.1",
+    "accelerate>=1.14.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "torch>=2.12",
+    "triton>=3.7,<3.8; sys_platform == 'linux'",
+    "triton-windows>=3.7,<3.8; sys_platform == 'win32'",
+]
+cpu = ["torch>=2.12"]
+
+[project.scripts]
+ayaka = "ayaka.entrypoints.cli:main"
+
+[tool.uv]
+no-build-isolation-package = ["torch"]
+conflicts = [[{ extra = "cuda" }, { extra = "cpu" }]]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", extra = "cuda" },
+    { index = "pytorch-cpu", extra = "cpu" },
+]
+
+[tool.scikit-build]
+wheel.packages = ["python/ayaka"]
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.dynamic]
+version = { attr = "ayaka.__version__.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["ayaka", "ayaka.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "I", "W"]
+ignore = ["F405", "F403"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 30
+markers = [
+    "slow: spawns a real OS process; keep to cases a thread cannot prove",
+]
+
+[tool.pyright]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.165.3",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.16.1",
+]
+test = ["psutil>=7.2.2"]
