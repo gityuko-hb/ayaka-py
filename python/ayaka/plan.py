@@ -202,3 +202,212 @@ class WeightResidencyPlan:
     @property
     def transfer_bytes(self) -> int:
         return sum(r.nbytes for r in self.residency if r.needs_transfer)
+    
+#! ParallelPlan
+@dataclass(frozen=True, slots=True)
+class ParallelPlan:
+    """TP/PP/EP are execution strategies, never model architecture.
+    Model code reads *nothing* from here — only ``ayaka.distributed`` does."""
+    
+    tp_size: int = 1
+    tp_rank: int = 0
+    pp_size: int = 1
+    pp_rank: int = 0
+    dp_size: int = 1
+    dp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
+    cp_size: int = 1
+    cp_rank: int = 0
+    sp_enabled: bool = False
+    
+    def __post_init__(self) -> None:
+        for size, rank, name in (
+            (self.tp_size, self.tp_rank, "tp"),
+            (self.pp_size, self.pp_rank, "pp"),
+            (self.dp_size, self.dp_rank, "dp"),
+            (self.ep_size, self.ep_rank, "ep"),
+            (self.cp_size, self.cp_rank, "cp"),
+        ):
+            if size < 1:
+                raise ValueError(f"{name}_size must be >= 1")
+            if not 0 <= rank < size:
+                raise ValueError(f"{name}_rank {rank} out of range for size {size}")
+
+    @property
+    def world_size(self) -> int:
+        return self.tp_size * self.pp_size * self.dp_size * self.cp_size
+
+    @property
+    def is_single_process(self) -> bool:
+        """When true every collective in ``ayaka.distributed`` degrades to identity"""
+        return self.world_size == 1 and self.ep_size == 1
+    
+#! CommunicationPlan
+class CommOpKind(enum.StrEnum):
+    ALL_REDUCE = "all_reduce"
+    ALL_GATHER = "all_gather"
+    REDUCE_SCATTER = "reduce_scatter"
+    BROADCAST = "broadcast"
+    ALL_TO_ALL = "all_to_all"
+    SEND = "send"
+    RECV = "recv"
+    BARRIER = "barrier"
+    
+
+@dataclass(frozen=True, slots=True)
+class CommOp:
+    kind: CommOpKind
+    group: str  # named process group: "tp" | "pp" | "ep" | ...
+    nbytes: int
+    dtype: DType
+    stream: StreamRole = StreamRole.COMM
+    peer_rank: int | None = None  # SEND/RECV only
+    layer_index: int | None = None  # anchor for overlap scheduling
+    
+@dataclass(frozen=True, slots=True)
+class CommunicationPlan:
+    ops: tuple[CommOp, ...] = ()
+    overlap_with_compute: bool = True
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(op.nbytes for op in self.ops)
+    
+#! KernelPlan
+@dataclass(frozen=True, slots=True)
+class KernelChoice:
+    """Model layer names an *operation*; the plan names the
+    *implementation*.  ``op`` is one of the ComputeBackend verbs."""
+
+    op: str  # "gemm" | "attention" | "rmsnorm" | "rope" | "moe" | "sample"
+    backend: str  # "torch" | "cuda" | "triton" | "flashinfer" | ...
+    variant: str = "default"
+    tile: tuple[int, ...] = ()  # backend-specific tile/stage hint
+
+
+@dataclass(frozen=True, slots=True)
+class KernelPlan:
+    choices: tuple[KernelChoice, ...] = ()
+    attention_backend: str = "torch"  # engine-global mode, never per-request
+
+    def choice_for(self, op: str) -> KernelChoice | None:
+        for c in self.choices:
+            if c.op == op:
+                return c
+        return None
+
+#! GraphPlan
+class GraphMode(enum.StrEnum):
+    EAGER = "eager"
+    CAPTURE = "capture"
+    REPLAY = "replay"
+    
+@dataclass(frozen=True, slots=True)
+class GraphPlan:
+    """CUDA-graph decision.  ``bucket`` is the padded batch size the graph was
+    captured for; a replay with a different bucket is a correctness bug, not a
+    slow path, because captured kernels bake in their launch dims."""
+
+    mode: GraphMode = GraphMode.EAGER
+    bucket: int = 0
+    graph_key: str = ""
+
+#! SamplingPlan
+@dataclass(frozen=True, slots=True)
+class SamplingPlan:
+    """The *shape* of this step's sampling, decided before the forward pass.
+
+    What is here and what is deliberately not: this branch carries counts and
+    flags, never producers.  A grammar matcher is a live object with mutable
+    state; putting one in a frozen plan would make the plan unhashable, make it
+    unshippable across a process boundary, and quietly give the executor a
+    handle it could advance.  The producers stay in ``ayaka.sampling`` and are
+    reached through the mask pipeline both sides already hold.
+
+    ``all_greedy`` is computed on host staging in ``ayaka.sampling.metadata``,
+    so it costs no sync.  It is what lets the executor take the argmax fast
+    path — no softmax, no RNG, no second read of the logits — and what fixes
+    the CUDA-graph bucket.
+
+    ``num_mask_rows`` is not ``num_rows``: under speculative verification one
+    sequence contributes ``propose_step + 1`` mask rows, so the bitmask arena
+    is taller than the batch.  Conflating the two is how a spec-decode path
+    ends up writing past the end of a mask buffer sized for decode.
+    """
+
+    num_rows: int = 0
+    num_mask_rows: int = 0
+    all_greedy: bool = True
+    any_penalty: bool = False
+    custom_ops: tuple[str, ...] = ()
+    
+    def __post_init__(self) -> None:
+        if self.num_rows < 0 or self.num_mask_rows < 0:
+            raise ValueError("sampling row counts must be non-negative")
+        if self.num_mask_rows and self.num_mask_rows < self.num_rows:
+            raise ValueError(
+                f"num_mask_rows {self.num_mask_rows} < num_rows {self.num_rows}: "
+                "every constrained row needs at least one mask row"
+            )
+
+    @property
+    def any_mask(self) -> bool:
+        return self.num_mask_rows > 0
+
+    @property
+    def graph_capturable(self) -> bool:
+        """Tier-2 custom ops run arbitrary user code and cannot be captured.
+
+        Stated as a property of the plan rather than discovered at capture
+        time: TensorRT-LLM discovers it at capture time and the failure is a
+        cryptic driver error inside a context manager.
+        """
+        return not self.custom_ops
+    
+#! ExecutionPlan
+@dataclass(frozen=True, slots=True)
+class ExecutionPlan:
+    """The whole step, decided.  Immutable and self-contained: an executor given
+    only this object and the model weights can run the step."""
+    
+    plan_id: str
+    step_id: int
+    batch: BatchPlan
+    compute: ComputePlan
+    memory: MemoryPlan
+    kv: KVPlan
+    weight_residency: WeightResidencyPlan = field(default_factory=WeightResidencyPlan)
+    parallel: ParallelPlan = field(default_factory=ParallelPlan)
+    communication: CommunicationPlan = field(default_factory=CommunicationPlan)
+    kernel: KernelPlan = field(default_factory=KernelPlan)
+    graph: GraphPlan = field(default_factory=GraphPlan)
+    sampling: SamplingPlan = field(default_factory=SamplingPlan)
+
+    # the plan is the unit of tracing.
+    trace_ids: tuple[str, ...] = ()
+    created_ns: int = 0
+
+    def __post_init__(self) -> None:
+        if len(self.kv.slot_mapping) != self.batch.num_tokens:
+            raise ValueError(
+                f"slot_mapping has {len(self.kv.slot_mapping)} entries, "
+                f"batch has {self.batch.num_tokens} tokens"
+            )
+        if len(self.kv.block_tables) != self.batch.num_seqs:
+            raise ValueError(
+                f"block_tables has {len(self.kv.block_tables)} rows, "
+                f"batch has {self.batch.num_seqs} sequences"
+            )
+        if self.graph.mode is GraphMode.REPLAY and not self.batch.is_pure_decode:
+            raise ValueError("graph replay requested for a non pure-decode batch")
+        if self.sampling.num_rows > self.batch.num_seqs:
+            raise ValueError(
+                f"sampling plans {self.sampling.num_rows} rows but the batch has "
+                f"{self.batch.num_seqs} sequences"
+            )
+        if self.graph.mode is GraphMode.REPLAY and not self.sampling.graph_capturable:
+            raise ValueError(
+                f"graph replay requested with custom ops {self.sampling.custom_ops}; "
+                "tier-2 ops are the slow path by design"
+            )
