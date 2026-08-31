@@ -150,3 +150,90 @@ class CommOpType(enum.StrEnum):
     def is_linear(self) -> bool:
         """Whether the reduction operator exhibits mathematical linearity over vectors."""
         return self in (CommOpType.SUM, CommOpType.AVG)
+
+@dataclass(frozen=True, slots=True)
+class DeviceGroup:
+    """A set of devices addressed as one collective domain.
+
+    ``name`` is what a :class:`~ayaka.plan.CommOp` refers to ("tp",
+    "pp", "ep"), so the plan stays free of concrete communicator objects.
+    """
+
+    name: str
+    devices: tuple[DeviceRef, ...]
+    ranks: tuple[int, ...] = ()
+    local_rank: int = 0
+
+    def __post_init__(self) -> None:
+        if self.ranks and len(self.ranks) != len(self.devices):
+            raise ValueError(f"group {self.name}: ranks/devices length mismatch")
+        if not 0 <= self.local_rank < max(len(self.devices), 1):
+            raise ValueError(f"group {self.name}: local_rank {self.local_rank} out of range")
+
+    @property
+    def size(self) -> int:
+        return len(self.devices)
+
+    @property
+    def is_trivial(self) -> bool:
+        """Single-rank group — every collective is identity.  The P0 path."""
+        return self.size <= 1
+    
+class AsyncHandle(Protocol):
+    """Returned by non-blocking collectives.  Deliberately minimal: the executor
+    only ever needs to know whether it can proceed, and to force a join."""
+
+    def wait(self) -> None: ...
+
+    def is_completed(self) -> bool: ...
+
+@runtime_checkable 
+class CommunicationBackend(Protocol):
+    """NCCL / gloo / RDMA / MPI are interchangeable behind this.
+
+    Tensors are ``Any`` cannot name a torch type.  Implementations live in
+    ``ayaka.distributed.communication``.
+
+    ``async_op=True`` returns an :class:`AsyncHandle` and the caller is
+    responsible for the join.  Every collective takes an explicit ``group`` —
+    there is no ambient "current group", because an ambient group is exactly how
+    TP and PP collectives get crossed under micro_batching.
+    """
+    
+    @property 
+    def name(self) -> str: ...
+    
+    def all_reduce(
+        self,
+        tensor: Any,
+        group: DeviceGroup,
+        op: CommOpType = CommOpType.SUM,
+        async_op: bool = False,
+    ) -> AsyncHandle | None: ...
+    
+    def all_gather(
+        self, output: Any, tensor: Any, group: DeviceGroup, async_op: bool = False
+    ) -> AsyncHandle | None: ...
+
+    def reduce_scatter(
+        self,
+        output: Any,
+        tensor: Any,
+        group: DeviceGroup,
+        op: CommOpType = CommOpType.SUM,
+        async_op: bool = False,
+    ) -> AsyncHandle | None: ...
+
+    def broadcast(
+        self, tensor: Any, group: DeviceGroup, src_rank: int = 0, async_op: bool = False
+    ) -> AsyncHandle | None: ...
+
+    def all_to_all(
+        self, output: Any, tensor: Any, group: DeviceGroup, async_op: bool = False
+    ) -> AsyncHandle | None: ...
+
+    def send(self, tensor: Any, group: DeviceGroup, dst_rank: int) -> AsyncHandle | None: ...
+
+    def recv(self, tensor: Any, group: DeviceGroup, src_rank: int) -> AsyncHandle | None: ...
+
+    def barrier(self, group: DeviceGroup) -> None: ...
