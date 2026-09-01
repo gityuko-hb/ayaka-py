@@ -18,6 +18,7 @@ class DType(enum.Enum):
     """
 
     # Floating Point Types 
+    FP64 = ("fp64", 64, False)
     FP32 = ("fp32", 32, False)
     FP16 = ("fp16", 16, False)
     BF16 = ("bf16", 16, False)
