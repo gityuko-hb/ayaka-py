@@ -10,6 +10,7 @@ __all__ = [
     "CapabilityError",
     "LazyModule",
     "has_module",
+    "import_module",
     "require_module",
     "resolve_qualname",
 ]
@@ -22,9 +23,7 @@ class CapabilityError(ImportError):
         self.capability = capability
         self.detail = detail
         self.remedy = remedy
-        super().__init__(
-            f"capability {capability!r} unavailable: {detail}. Remedy: {remedy}"
-        )
+        super().__init__(f"capability {capability!r} unavailable: {detail}. Remedy: {remedy}")
 
 
 @cache
@@ -40,6 +39,12 @@ def has_module(name: str) -> bool:
         # A parent package that itself fails to import raises rather than
         # returning None.
         return False
+
+
+def import_module(name: str) -> ModuleType:
+    """Import and return ``name`` while preserving the original import error."""
+
+    return importlib.import_module(name)
 
 
 def require_module(
@@ -67,7 +72,7 @@ def require_module(
     """
 
     try:
-        return importlib.import_module(name)
+        return import_module(name)
     except ImportError as exc:
         raise CapabilityError(
             capability or name,
@@ -104,9 +109,7 @@ class LazyModule(ModuleType):
 
     def _load(self) -> ModuleType:
         if self._loader is None:
-            module = require_module(
-                self.__name__, capability=self._capability, remedy=self._remedy
-            )
+            module = require_module(self.__name__, capability=self._capability, remedy=self._remedy)
             self._loader = module
 
             # Splice the real module in so subsequent lookups skip
@@ -135,7 +138,7 @@ def resolve_qualname(path: str) -> Any:
 
     if ":" in path:
         module_name, _, attr = path.partition(":")
-        module = importlib.import_module(module_name)
+        module = import_module(module_name)
         obj: Any = module
         for part in attr.split("."):
             obj = getattr(obj, part)
@@ -151,7 +154,7 @@ def resolve_qualname(path: str) -> Any:
     for split in range(len(parts) - 1, 0, -1):
         module_name = ".".join(parts[:split])
         try:
-            module = importlib.import_module(module_name)
+            module = import_module(module_name)
         except ImportError:
             continue
         obj = module
