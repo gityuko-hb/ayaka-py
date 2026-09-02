@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from ayaka.handles import PhysicalPageId
-from ayaka.kv.state import PageAllocationState, PageResidency
+from ayaka.memory.state import PageAllocationState, PageResidency
 
 
 @dataclass(slots=True)

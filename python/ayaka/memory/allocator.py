@@ -19,8 +19,8 @@ from ayaka.exceptions import (
     InvariantViolationError,
 )
 from ayaka.handles import KVPageHandle, PhysicalPageId
-from ayaka.kv.meta import PageMetadata
-from ayaka.kv.state import PageAllocationState
+from ayaka.memory.meta import PageMetadata
+from ayaka.memory.state import PageAllocationState
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,17 +125,27 @@ class PageAllocator:
             for allocating storage buffers whose page indexing matches the
             resulting ``PhysicalPageId`` values.
         """
+        if not isinstance(total_pages, int) or isinstance(total_pages, bool):
+            raise TypeError("total_pages must be an integer")
+        if not isinstance(page_size, int) or isinstance(page_size, bool):
+            raise TypeError("page_size must be an integer")
         if total_pages <= 0:
             raise ValueError("total_pages must be positive")
         if page_size <= 0:
             raise ValueError("page_size must be positive")
+        
         self._total_pages = total_pages
         self._page_size = page_size
+        # Generation 0 marks pages as never allocated; allocate() bumps to 1.
         self._pages = [
-            PageMetadata(physical_id=PhysicalPageId(index), generation=0)
+            PageMetadata(generation=0, physical_id=PhysicalPageId(index))
             for index in range(total_pages)
         ]
+        # Index-ordered free pool: deterministic, O(1) acquire at either end.
         self._ready_free: deque[int] = deque(range(total_pages))
+        # Min-heap of (pending_free_epoch, physical_index, generation): the
+        # epoch key lets us reclaim only when safe; index+generation make the
+        # tuple a deterministic total order and guard against stale entries.
         self._reclaim_heap: list[tuple[int, int, int]] = []
         self._current_epoch = 0
         self._reclaimed_pages_total = 0
@@ -153,8 +163,9 @@ class PageAllocator:
 
     @property
     def current_epoch(self) -> int:
-        """Return the greatest completed execution epoch observed so far."""
-        return self._current_epoch
+        """Epoch of the newest completed GPU step; monotonic."""
+        with self._lock:
+            return self._current_epoch
 
     def reserve_permanent_page(self) -> KVPageHandle:
         """Remove one free page permanently from normal allocator capacity.
@@ -210,6 +221,8 @@ class PageAllocator:
             :meth:`commit_reserved`, :meth:`rollback_reserved`, or
             :meth:`abandon_reserved` for every returned handle.
         """
+        if not isinstance(num_pages, int) or isinstance(num_pages, bool):
+            raise TypeError("num_pages must be an integer")
         if num_pages < 0:
             raise ValueError("num_pages must be non-negative")
         if num_pages == 0:
@@ -704,6 +717,26 @@ class PageAllocator:
             if len(free_indices) != len(set(free_indices)):
                 raise InvariantViolationError("duplicate page in ready-free queue")
             free_set = set(free_indices)
+            valid_reclaim_entries = [
+                (epoch, index, generation)
+                for epoch, index, generation in self._reclaim_heap
+                if 0 <= index < self._total_pages
+                and self._pages[index].generation == generation
+                and self._pages[index].allocation_state
+                is PageAllocationState.RECLAIM_PENDING
+                and self._pages[index].pending_free_epoch == epoch
+            ]
+            pending_count = sum(
+                meta.allocation_state is PageAllocationState.RECLAIM_PENDING
+                for meta in self._pages
+            )
+            if (
+                len(valid_reclaim_entries) != pending_count
+                or len(set(valid_reclaim_entries)) != pending_count
+            ):
+                raise InvariantViolationError(
+                    "reclaim heap does not uniquely cover every pending page"
+                )  
 
             for index, meta in enumerate(self._pages):
                 counts = (
@@ -782,7 +815,7 @@ class PageAllocator:
             InvalidHandleError: If the index is outside the allocator, the
                 generation is stale, or the slot is currently ``FREE``.
         """
-        if handle.index >= self._total_pages:
+        if not 0 <= handle.index < self._total_pages:
             raise InvalidHandleError(f"page index {handle.index} is out of range")
         meta = self._pages[handle.index]
         if (
@@ -889,6 +922,8 @@ class PageAllocator:
             InvariantViolationError: If any reference remains on the page.
         """
         index = meta.physical_id.value
+        if meta.allocation_state is PageAllocationState.FREE:
+            raise InvariantViolationError("cannot free an already-free page")
         if meta.total_refs:
             raise InvariantViolationError("cannot free a referenced page")
         meta.allocation_state = PageAllocationState.FREE
@@ -992,5 +1027,7 @@ class PageAllocator:
         Raises:
             ValueError: If ``epoch`` is negative.
         """
+        if not isinstance(epoch, int) or isinstance(epoch, bool):
+            raise TypeError("epoch must be an integer")
         if epoch < 0:
             raise ValueError("epoch must be non-negative")
