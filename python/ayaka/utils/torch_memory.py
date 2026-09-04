@@ -1,10 +1,12 @@
 from __future__ import annotations
- 
-from collections.abc import Iterator
+
+import os
+import re
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Final
- 
+
 from ayaka.utils.import_utils import CapabilityError
 from ayaka.utils.torch_utils import (
     cuda_available,
@@ -14,6 +16,7 @@ from ayaka.utils.torch_utils import (
     resolve_device,
     torch_dtype,
 )
+
 
 @dataclass(frozen=True, slots=True)
 class DeviceMemory:
@@ -81,7 +84,7 @@ def empty_cache() -> None:
         require_torch().cuda.empty_cache()
  
 @contextmanager
-def peak_memory_bytes(device: Any = None) -> Iterator[list[int]]:
+def peak_memory_bytes(device: Any = None) -> Generator[list[int]]:
     """Measure peak allocator usage across a block.
  
     Yields a one-element list that is filled on exit, so the value survives the
@@ -113,7 +116,7 @@ _MEMINFO: Final[str] = "/proc/meminfo"
 _CGROUP_V2_MAX: Final[str] = "/sys/fs/cgroup/memory.max"
 _CGROUP_V1_MAX: Final[str] = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 
-def _host_total_bytes() -> int | None:
+def _host_total_ram_bytes() -> int | None:
     """Total host RAM, honouring a cgroup limit when one applies.
  
     A container's ``MemTotal`` is the *host's*, not the container's, so a
@@ -143,8 +146,7 @@ def _host_total_bytes() -> int | None:
         if 0 < value < 2**62:
             limits.append(value)
     return min(limits) if limits else None
- 
- 
+
 def host_pinned_ceiling_bytes(
     *,
     requested_bytes: int | None = None,
@@ -169,7 +171,7 @@ def host_pinned_ceiling_bytes(
     >>> host_pinned_ceiling_bytes(requested_bytes=0)
     0
     """
-    total = _host_total_bytes()
+    total = _host_total_ram_bytes()
     if total is None:
         # Unknown host size: trust only what was explicitly asked for.
         return max(requested_bytes or 0, 0)
@@ -178,8 +180,30 @@ def host_pinned_ceiling_bytes(
     if requested_bytes is None:
         return system_ceiling
     return max(min(requested_bytes, system_ceiling), 0)
- 
- 
+
+def _numa_nodes() -> int: 
+    try:
+        entries = os.listdir("/sys/devices/system/node")
+    except OSError:
+        return 1
+    nodes = sum(1 for e in entries if re.fullmatch(r"node\d+", e))
+    return max(1, nodes)
+
+def _pci_numa_node(bus_id: str) -> int:
+    """Inspect PCI sysfs to find the NUMA affinity of the device."""
+    if not bus_id:
+        return -1
+    clean_bus = bus_id.lower().strip()
+    if not clean_bus.startswith("0000:"):
+        clean_bus = f"0000:{clean_bus}"
+    path = f"/sys/bus/pci/devices/{clean_bus}/numa_node"
+    try:
+        with open(path, encoding="ascii") as fh:
+            val = int(fh.read().strip())
+            return val if val >= 0 else -1
+    except (OSError, ValueError):
+        return -1
+
 def pinned_empty(
     shape: tuple[int, ...],
     dtype: Any,
