@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import enum
+from enum import IntEnum, StrEnum
 from typing import Final
+
 
 class DType(enum.Enum):
     """Internal data type enumeration for the execution runtime.
@@ -17,7 +19,7 @@ class DType(enum.Enum):
             and requires packing.
     """
 
-    # Floating Point Types 
+    # Floating Point Types
     FP64 = ("fp64", 64, False)
     FP32 = ("fp32", 32, False)
     FP16 = ("fp16", 16, False)
@@ -25,17 +27,17 @@ class DType(enum.Enum):
     FP8_E4M3 = ("fp8_e4m3", 8, False)
     FP8_E5M2 = ("fp8_e5m2", 8, False)
     FP4_E2M1 = ("fp4_e2m1", 4, True)
-    
-    # Integer & Quantized Types 
+
+    # Integer & Quantized Types
     INT64 = ("int64", 64, False)
     INT32 = ("int32", 32, False)
     INT8 = ("int8", 8, False)
     UINT8 = ("uint8", 8, False)
     INT4 = ("int4", 4, True)
 
-    # Boolean Type 
+    # Boolean Type
     BOOL = ("bool", 8, False)
-    
+
     def __init__(self, label: str, bits: int, sub_byte: bool) -> None:
         self.label: Final[str] = label
         self.bits: Final[int] = bits
@@ -111,7 +113,7 @@ class DType(enum.Enum):
 
     def __repr__(self) -> str:
         return f"DType.{self.name}"
-    
+
 class DeviceKind(enum.StrEnum):
     """Hardware target categories for storage and kernel execution.
 
@@ -284,3 +286,113 @@ class StreamRole(enum.StrEnum):
     P2P = "p2p"
     COMM = "comm"
     KV = "kv"
+
+class AttentionType(StrEnum):
+    """One value per KV-pool family.
+
+    A group declares one; a backend declares the set it serves
+    (``BackendInfo.supported_types``). Pool layout follows the type, so this is also what
+    ``KVCacheGeometry`` keys on -- one taxonomy, not two.
+    """
+
+    FULL = "full"  # uniform causal MHA/GQA over a paged K/V pool
+    SWA = "swa"  # sliding-window (optionally with sinks) over a paged K/V pool
+    MLA = "mla"  # latent-KV MLA: one latent row per token, absorbed kv_b
+    LINEAR = "linear"  # GDN / Mamba recurrent-state layers
+
+    @property
+    def backend_driven(self) -> bool:
+        """Whether this group constrains attention-backend selection.
+
+        LINEAR layers reach their kernels through the linear-state runtime, so a model
+        mixing GDN with GQA must not have its GQA backend narrowed by the GDN group.
+        """
+        return self is not AttentionType.LINEAR
+
+    @property
+    def is_paged_kv(self) -> bool:
+        return self in (AttentionType.FULL, AttentionType.SWA, AttentionType.MLA)
+
+class ForwardMode(IntEnum):
+    """What a forward is doing, as data rather than as ``max(query_len) == 1``.
+
+    A bool is not enough, concretely: a prompt that hits the prefix cache completely arrives
+    as a ONE-TOKEN prefill. It looks exactly like decode by query length, but the scheduler
+    has not staged decode-only addressing for it and it must not take the replay path.
+    """
+
+    IDLE = 0  # padding-only batch (graph warmup, rank sync)
+    PREFILL = 1  # fresh sequences, no cached prefix
+    EXTEND = 2  # partial prefix hit, or chunked prefill continuation
+    DECODE = 3  # one token per request
+    TARGET_VERIFY = 4  # uniform k-token query per request, tree or linear mask
+    DRAFT_EXTEND = 5  # draft model catching up after an accepted block
+
+    @property
+    def is_decode_like(self) -> bool:
+        """Uniform query length per request -> eligible for a decode-shaped kernel."""
+        return self in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
+
+    @property
+    def is_prefill_like(self) -> bool:
+        return self in (ForwardMode.PREFILL, ForwardMode.EXTEND, ForwardMode.DRAFT_EXTEND)
+
+    @property
+    def has_cached_prefix(self) -> bool:
+        """Whether ``computed_lens`` can be non-zero (i.e. the K/V loop must page)."""
+        return self is not ForwardMode.PREFILL
+
+class AttentionCudaGraphSupport(IntEnum):
+    """How much of a batch a backend can serve from inside a captured graph.
+
+    The graph runner reads this to decide replay eligibility; it does NOT probe the backend
+    or catch exceptions. Ordered, so ``support >= required`` is a valid check.
+    """
+
+    NEVER = 0  # e.g. a backend whose plan() allocates per step
+    PURE_DECODE = 1  # DECODE only (one query per request)
+    UNIFORM_QUERY = 2  # DECODE + TARGET_VERIFY (same query len for every request)
+    ALWAYS = 3  # any mode, including ragged prefill
+
+class KVCacheDtype(StrEnum):
+    """Storage dtype of the KV pool, independent of the model's compute dtype.
+
+    Deliberately NOT gated on compute capability. FP8 *storage* is bytes and works anywhere
+    the dtype exists; only FP8 *arithmetic* needs sm_89 (``torch_utils.supports_fp8`` says
+    exactly this). An FP8 KV cache on Ampere is legal and slower, not illegal -- the kernel
+    dequantize on load. Refusing it on arch would deny the memory saving to precisely the
+    cards that need it most.
+
+    Scales are per-layer scalars living on the pool and read as DEVICE tensors, so a
+    re-calibrated scale takes effect without recapturing the graph.
+    """
+
+    AUTO = "auto"  # same as the model dtype; no scale, no dequant
+    FP8_E4M3 = "fp8_e4m3"  # 1-4-3, no inf; the KV default (more mantissa)
+    FP8_E5M2 = "fp8_e5m2"  # 1-5-2, wider range, coarser
+
+    @property
+    def is_quantized(self) -> bool:
+        return self is not KVCacheDtype.AUTO
+
+    @property
+    def torch_dtype_name(self) -> str | None:
+        """Canonical name for ``torch_utils.torch_dtype``; None for AUTO."""
+        return {
+            KVCacheDtype.FP8_E4M3: "float8_e4m3fn",
+            KVCacheDtype.FP8_E5M2: "float8_e5m2",
+        }.get(self)
+
+    @property
+    def element_bytes(self) -> int | None:
+        """Bytes per element, or None for AUTO (the model dtype decides).
+
+        This is the number ``KVBudgetSpec.bytes_per_token_per_rank`` multiplies, which is
+        why the quantization choice must reach capacity planning and not just the kernel.
+        """
+        return 1 if self.is_quantized else None
+
+class MaskKind(StrEnum):
+    CAUSAL = "causal"
+    FULL = "full"  # bidirectional (encoder / embedding / reranker models)
+    SLIDING = "sliding"  # causal within a window
