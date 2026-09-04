@@ -19,7 +19,7 @@ from ayaka.exceptions import (
     InvariantViolationError,
 )
 from ayaka.handles import KVPageHandle, PhysicalPageId
-from ayaka.memory.meta import PageMetadata
+from ayaka.memory.metadata import PageMetadata
 from ayaka.memory.state import PageAllocationState
 
 
