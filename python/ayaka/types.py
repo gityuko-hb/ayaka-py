@@ -259,10 +259,12 @@ class KVLayoutKind(enum.StrEnum):
     Attributes:
         NHD: Shape [block_size, num_kv_heads, head_dim] (FlashInfer default).
         HND: Shape [num_kv_heads, block_size, head_dim] (vLLM / FlashAttention default).
+        NLD: Shape [(page, slot, latent_dim)] MLA latent and RoPE planes
     """
 
     NHD = "nhd"
     HND = "hnd"
+    NLD = "NLD"
 
 
 class StreamRole(enum.StrEnum):

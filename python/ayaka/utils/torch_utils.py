@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 from types import ModuleType
-from typing import Any, Final, Generator
+from typing import Any, Final
 
 from ayaka.utils.import_utils import CapabilityError, LazyModule
 
@@ -28,6 +28,7 @@ SM_ADA: Final[tuple[int, int]] = (8, 9)
 SM_HOPPER: Final[tuple[int, int]] = (9, 0)
 """TMA (``cp.async.bulk``), ``wgmma``, FP8 tensor cores."""
 
+
 @cache
 def torch_available() -> bool:
     """Whether PyTorch can actually be imported.
@@ -40,7 +41,7 @@ def torch_available() -> bool:
     True
     """
     try:
-        import torch as _torch
+        __import__("torch")
     except Exception:
         # Deliberately broad: a broken CUDA install raises OSError, a partial
         # wheel raises ImportError, and a version mismatch can raise RuntimeError
@@ -141,6 +142,7 @@ def device_count() -> int:
     """
     return require_torch().cuda.device_count() if cuda_available() else 0
 
+
 def resolve_device(device: Any = None, *, capability: str = "device") -> Any:
     """Normalize a device specification into a ``torch.device``.
 
@@ -208,6 +210,7 @@ def device_guard(device: Any) -> Generator[Any]:
         yield resolved
     finally:
         module.cuda.set_device(previous)
+
 
 @cache
 def compute_capability(index: int = 0) -> tuple[int, int] | None:
@@ -316,6 +319,20 @@ def device_profile(index: int = 0) -> DeviceProfile:
         multiprocessor_count=int(properties.multi_processor_count),
     )
 
+
+def dtype_name(dtype: Any) -> str:
+    """Return the normalized name of a dtype or dtype-like string.
+
+    Besides removing PyTorch's module prefix, normalization strips surrounding
+    whitespace and folds case so every dtype adapter shares one canonicalization
+    rule.
+
+    >>> dtype_name(" Torch.BFloat16 ")
+    'bfloat16'
+    """
+    return str(dtype).strip().lower().removeprefix("torch.")
+
+
 def has_dtype(name: str) -> bool:
     """Whether this torch build provides a dtype by name.
 
@@ -325,7 +342,7 @@ def has_dtype(name: str) -> bool:
     """
     if not torch_available():
         return False
-    return getattr(require_torch(), name.removeprefix("torch."), None) is not None
+    return getattr(require_torch(), dtype_name(name), None) is not None
 
 
 def torch_dtype(name: str, *, capability: str = "dtype") -> Any:
@@ -340,7 +357,7 @@ def torch_dtype(name: str, *, capability: str = "dtype") -> Any:
     module = require_torch(capability=capability)
     if isinstance(name, module.dtype):
         return name
-    resolved = getattr(module, str(name).removeprefix("torch."), None)
+    resolved = getattr(module, dtype_name(name), None)
     if not isinstance(resolved, module.dtype):
         raise CapabilityError(
             capability,
@@ -348,18 +365,6 @@ def torch_dtype(name: str, *, capability: str = "dtype") -> Any:
             remedy="upgrade torch, or choose a dtype this build supports",
         )
     return resolved
-
-
-def dtype_name(dtype: Any) -> str:
-    """Canonical name of a ``torch.dtype``.
-
-    ``str(torch.float16)`` is ``"torch.float16"``; this returns
-    ``"float16"``, which is the vocabulary configs and checkpoints use.
-
-    >>> dtype_name("torch.bfloat16")
-    'bfloat16'
-    """
-    return str(dtype).removeprefix("torch.")
 
 
 def dtype_bytes(dtype: Any) -> int:
@@ -371,6 +376,7 @@ def dtype_bytes(dtype: Any) -> int:
     module = require_torch(capability="dtype_bytes")
     resolved = torch_dtype(dtype) if not isinstance(dtype, module.dtype) else dtype
     return module.empty(0, dtype=resolved).element_size()
+
 
 def synchronize(device: Any = None) -> None:
     """Block until every kernel queued on ``device`` has completed.
@@ -415,6 +421,7 @@ def no_device_sync(*, strict: bool = True) -> Generator[None]:
         yield
     finally:
         setter(previous)
+
 
 def seed_everything(seed: int, *, deterministic_algorithms: bool = False) -> int:
     """Seed Python, NumPy (if present) and torch, returning the seed.
