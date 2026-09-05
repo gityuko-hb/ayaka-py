@@ -62,7 +62,7 @@ __all__ = [
     "Reservation",
     "Ticket",
     "TierAccount",
-    "TierSnapshot",
+    "TierAccountSnapshot",
 ]
 
 #: A CUDA context, the driver's own bookkeeping, cuBLAS/cuDNN handles and NCCL's
@@ -282,7 +282,18 @@ class _PendingOp:
 
 
 @dataclass(frozen=True, slots=True)
-class TierSnapshot:
+class TierAccountSnapshot:
+    """Byte accounting for one :class:`TierAccount` -- one allocatable tier.
+
+    One of these exists per :class:`~ayaka.types.MemoryTier` the ledger carries
+    (DEVICE, HOST_PINNED, HOST_PAGEABLE, DISK); :class:`LedgerSnapshot` holds
+    them keyed by tier. Every field is a byte count.
+
+    Not to be confused with
+    :class:`~ayaka.memory.tiering.HostTierSnapshot`, which counts *pages* in
+    the KV host-tier state machine rather than bytes against a capacity.
+    """
+
     tier: MemoryTier
     capacity_bytes: int
     committed_bytes: int
@@ -314,7 +325,7 @@ class TierSnapshot:
 @dataclass(frozen=True, slots=True)
 class LedgerSnapshot:
     device_index: int
-    tiers: dict[MemoryTier, TierSnapshot] = field(default_factory=dict)
+    tiers: dict[MemoryTier, TierAccountSnapshot] = field(default_factory=dict)
     charged_by_owner: dict[MemoryOwner, int] = field(default_factory=dict)
     pending_charged_by_owner: dict[MemoryOwner, int] = field(default_factory=dict)
     materialized_by_owner: dict[MemoryOwner, int] = field(default_factory=dict)
@@ -851,10 +862,10 @@ class MemoryLedger:
 
     def snapshot(self) -> LedgerSnapshot:
         with self._lock:
-            tiers: dict[MemoryTier, TierSnapshot] = {}
+            tiers: dict[MemoryTier, TierAccountSnapshot] = {}
             for tier, account in self._accounts.items():
                 entries = [r for r in self._entries.values() if r.tier is tier]
-                tiers[tier] = TierSnapshot(
+                tiers[tier] = TierAccountSnapshot(
                     tier=tier,
                     capacity_bytes=account.capacity_bytes,
                     committed_bytes=sum(r.capacity_charge_bytes for r in entries),

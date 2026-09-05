@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import RLock
 
@@ -18,10 +20,10 @@ class PageTableEntry:
     ``valid_tokens`` is the number of KV positions in the page that attention
     may read; non-tail committed pages must be full (equal to the page size).
     """
-    
+
     page: KVPageHandle
-    valid_tokens: int 
-    
+    valid_tokens: int
+
     def __post_init__(self) -> None:
         if self.valid_tokens <= 0:
             raise ValueError("a committed page-table entry must contain tokens")
@@ -33,13 +35,13 @@ class SequencePageTable:
     ``entries[i]`` covers logical token positions
     ``[i * page_size, (i + 1) * page_size)``; the final entry may be partial.
     """
-    
+
     entries: list[PageTableEntry] = field(default_factory=list)
-    
+
     def snapshot(self) -> tuple[PageTableEntry, ...]:
         """Return an immutable copy for cross-thread inspection."""
         return tuple(self.entries)
-    
+
     def validate(self, *, committed_tokens: int, page_size: int) -> None:
         """Verify the table is consistent with the committed token count.
 
@@ -90,7 +92,7 @@ class SequenceMemoryState:
     committed_tokens: int = 0
     page_table: SequencePageTable = field(default_factory=SequencePageTable)
     version: int = 0
-    
+
     pending_transaction_index: int | None = None
     """Open transaction index; at most one transaction per sequence at a time."""
     active_lease_index: int | None = None
@@ -101,7 +103,7 @@ class SequenceMemoryState:
     """Earliest epoch at which the deferred release may drop request refs."""
     blocked_until_epoch: int = 0
     """Sequence is blocked from new work until this epoch (failed steps)."""
-    
+
 @dataclass(frozen=True, slots=True)
 class SequenceMemorySnapshot:
     """Immutable scheduler-facing view of one sequence's KV state."""
@@ -184,6 +186,25 @@ class SequenceArena:
                 blocked_until_epoch=state.blocked_until_epoch,
             )
 
+    @contextmanager
+    def mutate(self, handle: SequenceHandle) -> Iterator[SequenceMemoryState]:
+        """Yield one sequence's mutable state while holding the arena lock.
+
+        This is the only supported way to mutate arena-owned state from
+        outside the arena. :meth:`_get_mutable` deliberately takes no lock --
+        it is the resolution step shared by the methods that already hold one
+        -- so calling it directly leaves the arena's own synchronisation
+        bypassed and makes this class thread-safe in name only.
+
+        The lock is re-entrant, so a caller already inside :meth:`mutate` (or
+        any other arena method) may nest further calls safely.
+
+        Raises:
+            InvalidHandleError: if the handle is stale or out of range.
+        """
+        with self._lock:
+            yield self._get_mutable(handle)
+
     def release(self, handle: SequenceHandle) -> None:
         """Recycle the slot; the caller must have emptied pages and tokens first.
 
@@ -209,7 +230,12 @@ class SequenceArena:
             return tuple(state.handle for state in self._states if state is not None)
 
     def _get_mutable(self, handle: SequenceHandle) -> SequenceMemoryState:
-        """Resolve a handle to its mutable state, rejecting stale generations."""
+        """Resolve a handle to its mutable state, rejecting stale generations.
+
+        Private and unsynchronised on purpose: every caller must already hold
+        ``_lock``. Code outside the arena wants :meth:`mutate`, which takes the
+        lock around exactly this resolution.
+        """
         if handle.index >= self._capacity:
             raise InvalidHandleError(f"sequence index {handle.index} is out of range")
         state = self._states[handle.index]

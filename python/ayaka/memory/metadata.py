@@ -2,7 +2,7 @@
 
 Split out of the protocol-level lifecycle enums on purpose: the enums are
 contract vocabulary that crosses into the scheduler, while ``PageMetadata`` is
-allocator-private state that nothing outside :mod:`ayaka.cache.block` may
+allocator-private state that nothing outside :mod:`ayaka.memory` may
 mutate.
 """
 
@@ -24,7 +24,7 @@ class PageMetadata:
     can only return to ``FREE`` with every counter at zero after its safe
     completion epoch. Only memory-manager methods may mutate these counters.
     """
-    
+
     generation: int
     """Generation of the current ownership lifetime; 0 means never used."""
     physical_id: PhysicalPageId
@@ -67,7 +67,7 @@ class PageMetadata:
             and self.reservation_refs == 0
             and self.cache_refs > 0
         )
-        
+
     @property
     def can_mutate(self) -> bool:
         """Directly writing a new token is permitted only if it is neither shared nor pinned."""
@@ -87,7 +87,7 @@ class PageMetadata:
             + self.reservation_refs
             + self.pin_refs
         )
-        
+
     @property
     def total_refs(self) -> int:
         """Every ref dimension; must be zero before the page can be freed."""
@@ -97,17 +97,17 @@ class PageMetadata:
     def is_shared(self) -> bool:
         """True when more than one durable owner (request or cache) exists."""
         return self.request_refs + self.cache_refs > 1
-    
+
     def pin(self) -> None:
         """Lock page, prevent LRU eviction and disable in-place mutation."""
         self.pin_refs += 1
-        
-    def unpin(self) -> None: 
+
+    def unpin(self) -> None:
         """Unlock page"""
         if self.pin_refs <= 0:
             raise ValueError(f"Page {self.physical_id} is not pinned.")
         self.pin_refs -= 1
-        
+
     def snapshot(self) -> PageMetadata:
         """Return a copy safe to inspect outside the allocator lock."""
         return replace(self)

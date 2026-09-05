@@ -53,6 +53,10 @@ class AllocatorSnapshot:
         shared_pages: Pages with more than one durable request/cache owner.
         inflight_pages: Pages with at least one launched execution step that
             may still access the page.
+        evictable_pages: Pages the prefix cache could actually release:
+            live, unpinned, cache-owned, and with no request or reservation
+            owner. A cached page a live sequence still references is *not*
+            counted, because dropping its cache reference frees nothing.
         reclaimed_pages_total: Cumulative number of pages returned to ``FREE``
             by deferred reclamation since allocator creation.
     """
@@ -71,6 +75,8 @@ class AllocatorSnapshot:
     """Pages explicitly locked in memory (pin_refs > 0)."""
     shared_pages: int
     inflight_pages: int
+    evictable_pages: int
+    """Cache-owned pages whose release would actually return capacity."""
     reclaimed_pages_total: int
 
 
@@ -133,7 +139,7 @@ class PageAllocator:
             raise ValueError("total_pages must be positive")
         if page_size <= 0:
             raise ValueError("page_size must be positive")
-        
+
         self._total_pages = total_pages
         self._page_size = page_size
         # Generation 0 marks pages as never allocated; allocate() bumps to 1.
@@ -621,7 +627,7 @@ class PageAllocator:
     def get_meta(self, handle: KVPageHandle) -> PageMetadata:
         """Return a detached metadata snapshot for a current page handle.
 
-        The returned :class:`~ayaka.kv.meta.PageMetadata` is a copy. Inspecting
+        The returned :class:`~ayaka.memory.metadata.PageMetadata` is a copy. Inspecting
         it does not require holding the allocator lock, and mutating the copy
         cannot mutate allocator state. The handle is validated while the lock
         is held before the copy is made.
@@ -655,6 +661,7 @@ class PageAllocator:
         with self._lock:
             free_c = reserved_c = live_c = reclaim_c = perm_c = 0
             req_owned = cache_owned = pinned_c = shared_c = inflight_c = 0
+            evictable_c = 0
 
             for meta in self._pages:
                 state = meta.allocation_state
@@ -679,6 +686,8 @@ class PageAllocator:
                     shared_c += 1
                 if meta.inflight_refs > 0:
                     inflight_c += 1
+                if meta.is_evictable:
+                    evictable_c += 1
 
             return AllocatorSnapshot(
                 total_pages=self._total_pages,
@@ -693,6 +702,7 @@ class PageAllocator:
                 pinned_pages=pinned_c,
                 shared_pages=shared_c,
                 inflight_pages=inflight_c,
+                evictable_pages=evictable_c,
                 reclaimed_pages_total=self._reclaimed_pages_total,
             )
 
@@ -736,7 +746,7 @@ class PageAllocator:
             ):
                 raise InvariantViolationError(
                     "reclaim heap does not uniquely cover every pending page"
-                )  
+                )
 
             for index, meta in enumerate(self._pages):
                 counts = (

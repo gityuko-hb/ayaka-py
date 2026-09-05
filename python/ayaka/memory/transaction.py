@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ayaka.exceptions import InvalidStateTransitionError, TransactionClosedError
 from ayaka.handles import (
     KVPageHandle,
     KVReservationHandle,
@@ -125,3 +126,45 @@ class LeaseRecord:
     transaction: MemoryTransactionHandle
     reservation_handles: tuple[KVReservationHandle, ...]
     state: LeaseState = LeaseState.PREPARED
+
+class LifecycleTransitions:
+    """Shared transaction/lease state machine for homogeneous and grouped KV.
+
+    Reservation payloads differ by layout, but legal state transitions do not.
+    Keeping them here prevents the two managers from silently drifting on
+    rollback, launch, completion, or failure behavior.
+    """
+
+    @staticmethod
+    def require_open(transaction: TransactionRecord) -> None:
+        if transaction.state is not TransactionState.OPEN:
+            raise TransactionClosedError(
+                f"transaction {transaction.handle} is not open"
+            )
+
+    @staticmethod
+    def prepare(transaction: TransactionRecord) -> None:
+        LifecycleTransitions.require_open(transaction)
+        transaction.state = TransactionState.PREPARED
+
+    @staticmethod
+    def rollback(transaction: TransactionRecord) -> None:
+        LifecycleTransitions.require_open(transaction)
+        transaction.state = TransactionState.ROLLED_BACK
+
+    @staticmethod
+    def require_lease(lease: LeaseRecord, expected: LeaseState) -> None:
+        if lease.state is not expected:
+            raise InvalidStateTransitionError(
+                f"lease {lease.handle} is {lease.state.name}, expected {expected.name}"
+            )
+
+    @staticmethod
+    def transition_lease(
+        lease: LeaseRecord,
+        *,
+        expected: LeaseState,
+        target: LeaseState,
+    ) -> None:
+        LifecycleTransitions.require_lease(lease, expected)
+        lease.state = target
