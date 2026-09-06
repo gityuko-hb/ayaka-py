@@ -6,19 +6,20 @@ from typing import Any, Protocol, runtime_checkable
 
 from ayaka.types import DeviceKind, DType
 
+
 @dataclass(frozen=True, slots=True)
 class DeviceRef:
     kind: DeviceKind = DeviceKind.CUDA
     index: int = 0
     uuid: str = ""
-    
+
     def __str__(self) -> str:
         return f"{self.kind}:{self.index}"
-    
+
     @property
     def is_cuda(self) -> bool:
         return self.kind is DeviceKind.CUDA
-    
+
 @dataclass(frozen=True, slots=True)
 class DeviceCapability:
     """What the planner is allowed to assume about a GPU.
@@ -36,7 +37,7 @@ class DeviceCapability:
       * ``registers_per_sm`` bounds occupancy; a kernel at 128 regs/thread caps
         at 512 threads/SM on 8.6.
     """
-    
+
     name: str = ""
     sm_major: int = 0
     sm_minor: int = 0
@@ -52,11 +53,11 @@ class DeviceCapability:
     supports_nvlink: bool = False
     pci_bus_id: str = ""
     numa_node: int = -1
-    
+
     @property
     def compute_capability(self) -> tuple[int, int]:
         return (self.sm_major, self.sm_minor)
-    
+
     def supports(self, dtype: DType) -> bool:
         cc = self.compute_capability
         if dtype in (DType.FP8_E4M3, DType.FP8_E5M2):
@@ -112,7 +113,7 @@ class LinkKind(enum.StrEnum):
     def supports_direct_p2p_dma(self) -> bool:
         """Whether the link supports zero-copy peer-to-peer CUDA IPC without host staging."""
         return self in (LinkKind.SELF, LinkKind.NVLINK, LinkKind.NVSWITCH, LinkKind.PCIE)
-    
+
 class CommOpType(enum.StrEnum):
     """Reduction operators for distributed collective communication primitives.
 
@@ -178,7 +179,7 @@ class DeviceGroup:
     def is_trivial(self) -> bool:
         """Single-rank group — every collective is identity.  The P0 path."""
         return self.size <= 1
-    
+
 class AsyncHandle(Protocol):
     """Returned by non-blocking collectives.  Deliberately minimal: the executor
     only ever needs to know whether it can proceed, and to force a join."""
@@ -187,7 +188,7 @@ class AsyncHandle(Protocol):
 
     def is_completed(self) -> bool: ...
 
-@runtime_checkable 
+@runtime_checkable
 class CommunicationBackend(Protocol):
     """NCCL / gloo / RDMA / MPI are interchangeable behind this.
 
@@ -199,10 +200,10 @@ class CommunicationBackend(Protocol):
     there is no ambient "current group", because an ambient group is exactly how
     TP and PP collectives get crossed under micro_batching.
     """
-    
-    @property 
+
+    @property
     def name(self) -> str: ...
-    
+
     def all_reduce(
         self,
         tensor: Any,
@@ -210,7 +211,7 @@ class CommunicationBackend(Protocol):
         op: CommOpType = CommOpType.SUM,
         async_op: bool = False,
     ) -> AsyncHandle | None: ...
-    
+
     def all_gather(
         self, output: Any, tensor: Any, group: DeviceGroup, async_op: bool = False
     ) -> AsyncHandle | None: ...
