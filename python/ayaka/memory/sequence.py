@@ -28,6 +28,24 @@ class PageTableEntry:
         if self.valid_tokens <= 0:
             raise ValueError("a committed page-table entry must contain tokens")
 
+@dataclass(frozen=True, slots=True)
+class GroupPageTableEntry:
+    """One committed logical block inside one cache group's page table.
+
+    ``logical_block`` is the block index *within the sequence* (shared across
+    groups); ``valid_tokens`` is the number of valid KV positions in the page.
+    """
+
+    logical_block: int
+    page: KVPageHandle
+    valid_tokens: int
+
+    def __post_init__(self) -> None:
+        if self.logical_block < 0:
+            raise ValueError("logical_block must be non-negative")
+        if self.valid_tokens <= 0:
+            raise ValueError("a group page-table entry must contain valid tokens")
+
 @dataclass(slots=True)
 class SequencePageTable:
     """Ordered committed page table of one sequence.
@@ -117,6 +135,51 @@ class SequenceMemorySnapshot:
     """True while the sequence participates in a transaction or lease."""
     release_requested: bool
     blocked_until_epoch: int
+
+@dataclass(slots=True)
+class GroupedSequenceMemoryState:
+    """Mutable per-sequence state; ``group_tables`` holds one table per group.
+
+    Mirrors ``SequenceMemoryState`` from the homogeneous manager: committed
+    tokens are authoritative, the version guards tentative plans, and the
+    pending transaction/lease indexes, release flag, and blocked epoch encode
+    the single-owner, deferred-release, and fail-after-launch rules.
+    """
+
+    handle: SequenceHandle
+    request_id: str
+    group_tables: dict[str, list[GroupPageTableEntry]]
+    committed_tokens: int = 0
+    version: int = 0
+    pending_transaction_index: int | None = None
+    active_lease_index: int | None = None
+    release_requested: bool = False
+    release_safe_epoch: int = 0
+    blocked_until_epoch: int = 0
+
+@dataclass(frozen=True, slots=True)
+class GroupedSequenceSnapshot:
+    """Immutable scheduler-facing view of one grouped sequence."""
+
+    handle: SequenceHandle
+    request_id: str
+    committed_tokens: int
+    version: int
+    group_page_tables: tuple[tuple[str, tuple[GroupPageTableEntry, ...]], ...]
+    busy: bool
+    release_requested: bool
+    blocked_until_epoch: int
+
+    def page_table_for(self, group_name: str) -> tuple[GroupPageTableEntry, ...]:
+        """Return one group's committed page table.
+
+        Raises:
+            KeyError: if ``group_name`` is not a configured group.
+        """
+        for name, entries in self.group_page_tables:
+            if name == group_name:
+                return entries
+        raise KeyError(group_name)
 
 class SequenceArena:
     """Fixed-capacity arena that rejects stale sequence handles.

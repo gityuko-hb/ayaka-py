@@ -41,6 +41,11 @@ class BaseKVStorageSpec(ABC):
 
     @property
     @abstractmethod
+    def compatibility_key(self) -> tuple[object, ...]:
+        """Stable identity for storage geometries that can share pages."""
+
+    @property
+    @abstractmethod
     def kind(self) -> KVStorageKind:
         """Physical cache-content family."""
 
@@ -162,6 +167,10 @@ class BaseKVStorageSpec(ABC):
             f"pages={self.capacity_pages} planes=[{planes}] "
             f"{self.bytes_per_token_per_layer} B/token/layer"
         )
+
+    def with_capacity_pages(self, capacity_pages: int) -> BaseKVStorageSpec: ...
+
+    def with_num_layers(self, num_layers: int) -> BaseKVStorageSpec: ...
 
 
 def _check_positive_inits(**values: int) -> None:

@@ -10,9 +10,9 @@ from ayaka.handles import (
     SequenceHandle,
     StepMemoryLeaseHandle,
 )
-from ayaka.memory.sequence import PageTableEntry
+from ayaka.memory.sequence import GroupPageTableEntry, PageTableEntry
 from ayaka.memory.state import LeaseState, ReservationFailure, TransactionState
-from ayaka.memory.views import KVWriteSlot
+from ayaka.memory.views import GroupKVWriteSlot, KVWriteSlot
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,3 +168,48 @@ class LifecycleTransitions:
     ) -> None:
         LifecycleTransitions.require_lease(lease, expected)
         lease.state = target
+
+@dataclass(slots=True)
+class GroupReservationPlan:
+    """Per-group portion of one reservation: table, pages, and write slots."""
+
+    group_name: str
+    planned_page_table: tuple[GroupPageTableEntry, ...]
+    allocated_pages: tuple[KVPageHandle, ...]
+    write_slots: tuple[GroupKVWriteSlot, ...]
+
+    @property
+    def touched_pages(self) -> tuple[KVPageHandle, ...]:
+        """Every page of this group the step may read or write."""
+        return tuple(entry.page for entry in self.planned_page_table)
+
+
+@dataclass(slots=True)
+class GroupedReservationRecord:
+    """Full reservation: baseline version/length plus per-group plans."""
+
+    handle: KVReservationHandle
+    sequence: SequenceHandle
+    base_sequence_version: int
+    base_committed_tokens: int
+    num_new_tokens: int
+    group_plans: tuple[GroupReservationPlan, ...]
+
+
+@dataclass(slots=True)
+class GroupedTransactionRecord:
+    """Open grouped transaction state."""
+
+    handle: MemoryTransactionHandle
+    state: TransactionState = TransactionState.OPEN
+    reservation_handles: list[KVReservationHandle] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class GroupedLeaseRecord:
+    """Prepared grouped lease: frozen reservations plus lease state."""
+
+    handle: StepMemoryLeaseHandle
+    transaction: MemoryTransactionHandle
+    reservation_handles: tuple[KVReservationHandle, ...]
+    state: LeaseState = LeaseState.PREPARED
