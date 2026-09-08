@@ -39,12 +39,11 @@ class ModelSourceConfig:
     """Where to get the model from, and under what rules."""
 
     model: str # local path or hub id
-    revision: str = "" 
     revision: str = ""  # branch, tag or commit sha; "" = whatever HEAD is
     tokenizer: str = ""  # defaults to `model`
     format: RequestedFormat = RequestedFormat.AUTO
     trust: TrustPolicy = TrustPolicy.STRICT
-    
+
     # Offline: never touch the network, resolve from the local hub cache only.
     offline: bool = False
 
@@ -76,7 +75,7 @@ class ModelSourceConfig:
     @property
     def allows_remote_code(self) -> bool:
         return self.trust is TrustPolicy.ALLOW_REMOTE_CODE
-    
+
     def looks_like_hub_id(self) -> bool:
         """A hub id is ``org/name`` with no path separators beyond the one.
 
