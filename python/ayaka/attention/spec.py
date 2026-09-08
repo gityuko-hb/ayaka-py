@@ -1,6 +1,6 @@
-
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -8,6 +8,7 @@ from ayaka.types import AttentionType, KVCacheDtype, KVLayoutKind, MaskKind
 
 if TYPE_CHECKING:
     pass
+
 
 @dataclass(frozen=True)
 class AttentionSpec:
@@ -22,18 +23,38 @@ class AttentionSpec:
     ``head_dim_qk`` and ``head_dim_vo`` differ for MLA (576 / 512), hence two fields.
     """
 
-    num_qo_heads: int # TP-local
-    num_kv_heads: int # TP-local (>= 1; replicated when num_kv_heads < tp_size)
+    num_qo_heads: int  # TP-local
+    num_kv_heads: int  # TP-local (>= 1; replicated when num_kv_heads < tp_size)
     head_dim_qk: int
     head_dim_vo: int
     sm_scale: float
     mask: MaskKind = MaskKind.CAUSAL
-    sliding_window: int | None = None # left context, inclusive of the query token
+    sliding_window: int | None = None  # left context, inclusive of the query token
     logits_soft_cap: float = 0.0  # 0.0 == disabled (Gemma-2 style tanh cap)
     has_sinks: bool = False  # per-head learned logit in the softmax denominator
 
     def __post_init__(self) -> None:
-        if self.num_kv_heads < 1 or self.num_qo_heads % self.num_kv_heads:
+        for name in ("num_qo_heads", "num_kv_heads", "head_dim_qk", "head_dim_vo"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.mask, MaskKind):
+            raise ValueError("mask must be a MaskKind")
+        for name, positive in (("sm_scale", True), ("logits_soft_cap", False)):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or (positive and value == 0)
+            ):
+                raise ValueError(
+                    f"{name} must be finite and {'positive' if positive else 'nonnegative'}"
+                )
+        if not isinstance(self.has_sinks, bool):
+            raise ValueError("has_sinks must be boolean")
+        if self.num_qo_heads % self.num_kv_heads:
             raise ValueError(
                 f"num_qo_heads ({self.num_qo_heads}) must be a positive multiple of "
                 f"num_kv_heads ({self.num_kv_heads})"
@@ -43,7 +64,11 @@ class AttentionSpec:
                 "sliding_window and MaskKind.SLIDING must be set together "
                 f"(window={self.sliding_window}, mask={self.mask})"
             )
-        if self.sliding_window is not None and self.sliding_window < 1:
+        if self.sliding_window is not None and (
+            isinstance(self.sliding_window, bool)
+            or not isinstance(self.sliding_window, int)
+            or self.sliding_window < 1
+        ):
             raise ValueError(f"sliding_window must be >= 1, got {self.sliding_window}")
 
     @property
@@ -79,12 +104,32 @@ class AttentionGroupSpec:
     mla: MLAExtras | None = None
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.group_id, bool)
+            or not isinstance(self.group_id, int)
+            or self.group_id < 0
+        ):
+            raise ValueError("group_id must be a nonnegative integer")
+        if (
+            not isinstance(self.layer_ids, tuple)
+            or any(isinstance(i, bool) or not isinstance(i, int) or i < 0 for i in self.layer_ids)
+            or len(set(self.layer_ids)) != len(self.layer_ids)
+        ):
+            raise ValueError("layer_ids must be a tuple of unique nonnegative integers")
+        if (
+            not isinstance(self.attn_type, AttentionType)
+            or not isinstance(self.spec, AttentionSpec)
+            or not isinstance(self.kv_layout, KVLayoutKind)
+            or not isinstance(self.kv_cache_dtype, KVCacheDtype)
+        ):
+            raise ValueError("attention group fields must use the canonical Ayaka types")
+        if isinstance(self.page_size, bool) or not isinstance(self.page_size, int):
+            raise ValueError("page_size must be an integer")
         if not self.layer_ids:
             raise ValueError(f"attention group {self.group_id} has no layers")
         if self.page_size < 1 or (self.page_size & (self.page_size - 1)):
             raise ValueError(
-                f"page_size must be a power of two, got {self.page_size} "
-                f"(group {self.group_id})"
+                f"page_size must be a power of two, got {self.page_size} (group {self.group_id})"
             )
         if self.attn_type is AttentionType.MLA:
             if self.mla is None:
@@ -109,6 +154,7 @@ class AttentionGroupSpec:
                 f"group {self.group_id} carries MLAExtras but is {self.attn_type.value}"
             )
 
+
 @dataclass(frozen=True)
 class MLAExtras:
     """Latent-KV geometry, present exactly when ``AttnType.MLA``.
@@ -122,6 +168,12 @@ class MLAExtras:
 
     kv_lora_rank: int  # 512 for DeepSeek-V3
     qk_rope_head_dim: int  # 64 for DeepSeek-V3
+
+    def __post_init__(self) -> None:
+        for name in ("kv_lora_rank", "qk_rope_head_dim"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
 
     @property
     def latent_dim(self) -> int:

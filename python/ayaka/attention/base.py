@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
     from .ports import PagedKVCache
 
+
 class BaseAttentionBackend(ABC):
     """Kernel execution for one attention group.
 
@@ -94,6 +95,7 @@ class BaseAttentionBackend(ABC):
         if self.group.attn_type is AttentionType.MLA:
             return s.head_dim_qk * element  # one latent row, one head, no separate V
         return (s.head_dim_qk + s.head_dim_vo) * s.num_kv_heads * element
+
 
 @runtime_checkable
 class MLAAttentionBackend(Protocol):
