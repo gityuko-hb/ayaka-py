@@ -55,6 +55,8 @@ class LeaseState(Enum):
     """Lease is frozen but no GPU work has been launched."""
     IN_FLIGHT = auto()
     """A GPU step may read or write the leased pages."""
+    COMMITTED = auto()
+    """KV progress is published; execution ownership is still held."""
     COMPLETED = auto()
     """Terminal: the step succeeded and KV metadata was published."""
     ABORTED = auto()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, field
 
 from ayaka.exceptions import InvalidStateTransitionError, TransactionClosedError
@@ -27,6 +28,7 @@ class ReservationResult:
     handed out. ``attached_prefix_tokens`` reports how many leading tokens came
     from a reused cache prefix.
     """
+
     ok: bool
     handle: KVReservationHandle | None
     required_pages: int
@@ -95,6 +97,8 @@ class ReservationRecord:
     """Newly reserved pages; rolled back, committed, or abandoned with the step."""
     acquired_prefix_pages: tuple[KVPageHandle, ...]
     """Tentative request refs on cache pages; released on rollback/failure."""
+    committed: bool = field(default=False, init=False)
+    """Whether tentative refs have transferred into committed sequence tables."""
     write_slots: tuple[KVWriteSlot, ...]
     """One slot per written token, mapping logical position to flat slot."""
 
@@ -126,6 +130,7 @@ class LeaseRecord:
     transaction: MemoryTransactionHandle
     reservation_handles: tuple[KVReservationHandle, ...]
     state: LeaseState = LeaseState.PREPARED
+
 
 class LifecycleTransitions:
     """Shared transaction/lease state machine for homogeneous and grouped KV.
@@ -169,6 +174,7 @@ class LifecycleTransitions:
         LifecycleTransitions.require_lease(lease, expected)
         lease.state = target
 
+
 @dataclass(slots=True)
 class GroupReservationPlan:
     """Per-group portion of one reservation: table, pages, and write slots."""
@@ -194,22 +200,69 @@ class GroupedReservationRecord:
     base_committed_tokens: int
     num_new_tokens: int
     group_plans: tuple[GroupReservationPlan, ...]
+    committed: bool = field(default=False, init=False)
 
 
-@dataclass(slots=True)
-class GroupedTransactionRecord:
-    """Open grouped transaction state."""
-
-    handle: MemoryTransactionHandle
-    state: TransactionState = TransactionState.OPEN
-    reservation_handles: list[KVReservationHandle] = field(default_factory=list)
+# Compatibility imports share the exact lifecycle records.
+GroupedTransactionRecord = TransactionRecord
+GroupedLeaseRecord = LeaseRecord
 
 
-@dataclass(slots=True)
-class GroupedLeaseRecord:
-    """Prepared grouped lease: frozen reservations plus lease state."""
+class TransactionOrchestrator:
+    """Common prepare/rollback ordering with manager-specific strategy hooks.
 
-    handle: StepMemoryLeaseHandle
-    transaction: MemoryTransactionHandle
-    reservation_handles: tuple[KVReservationHandle, ...]
-    state: LeaseState = LeaseState.PREPARED
+    Callers hold their manager lock. Validation may fail and is rolled back
+    before any lease is published. Activation and undo hooks only mutate
+    already-validated host metadata; they must not enqueue device work.
+    If activation fails part way through, deactivate restores transaction
+    ownership before rollback releases reservations. Cleanup hooks must not fail.
+    """
+
+    @staticmethod
+    def prepare(
+        transaction: TransactionRecord,
+        lease_handle: StepMemoryLeaseHandle,
+        *,
+        validate: Callable[[], None],
+        activate: Callable[[LeaseRecord], None],
+        deactivate: Callable[[LeaseRecord], None],
+        rollback: Callable[[], None],
+        transactions: MutableMapping[int, TransactionRecord],
+        leases: MutableMapping[int, LeaseRecord],
+    ) -> StepMemoryLeaseHandle:
+        LifecycleTransitions.require_open(transaction)
+        try:
+            if not transaction.reservation_handles:
+                raise InvalidStateTransitionError("cannot prepare an empty transaction")
+            validate()
+        except BaseException:
+            rollback()
+            raise
+        lease = LeaseRecord(
+            lease_handle, transaction.handle, tuple(transaction.reservation_handles)
+        )
+        try:
+            leases[lease_handle.index] = lease
+            activate(lease)
+        except BaseException:
+            deactivate(lease)
+            leases.pop(lease_handle.index, None)
+            rollback()
+            raise
+        LifecycleTransitions.prepare(transaction)
+        transactions.pop(transaction.handle.index)
+        return lease_handle
+
+    @staticmethod
+    def rollback(
+        transaction: TransactionRecord,
+        *,
+        undo: Callable[[], None],
+        finish: Callable[[], None],
+        transactions: MutableMapping[int, TransactionRecord],
+    ) -> None:
+        LifecycleTransitions.require_open(transaction)
+        undo()
+        LifecycleTransitions.rollback(transaction)
+        transactions.pop(transaction.handle.index)
+        finish()

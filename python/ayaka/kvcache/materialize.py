@@ -24,7 +24,7 @@ class KVStorageLease:
     CUDA completion ordering and are intentionally not used.
     """
 
-    __slots__ = ("_closed", "_charged_bytes", "_ledger", "_lock", "_storage", "label")
+    __slots__ = ("_closed", "_charged_bytes", "_ledger", "_lock", "_storage", "_pins", "label")
 
     def __init__(
         self,
@@ -40,6 +40,7 @@ class KVStorageLease:
         self._charged_bytes = charged_bytes
         self._closed = False
         self._lock = Lock()
+        self._pins = 0
 
     @property
     def storage(self) -> KVStorage:
@@ -68,16 +69,37 @@ class KVStorageLease:
         """
         return self._charged_bytes
 
+    @property
+    def ledger(self) -> MemoryLedger:
+        """The single accounting authority for this physical slab."""
+        return self._ledger
+
+    @property
+    def pin_count(self) -> int:
+        with self._lock:
+            return self._pins
+
+    def pin(self) -> KVStoragePin:
+        """Keep the slab alive while a logical manager owns any page or lease."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot pin closed KV storage")
+            self._pins += 1
+            return KVStoragePin(self)
+
     def close(self) -> None:
+        """Close only after every owner released its pin; idempotent."""
         with self._lock:
             if self._closed:
                 return
+            if self._pins:
+                raise RuntimeError("KV storage is pinned by a live logical manager")
             storage = self._storage
             assert storage is not None
-            released = self._ledger.release(self.label)
-            if released is None:
+            if self._ledger.get(self.label) is None:
                 raise RuntimeError(f"ledger claim {self.label!r} disappeared before storage close")
             storage.close()
+            self._ledger.release(self.label)
             self._storage = None
             self._closed = True
 
@@ -86,6 +108,21 @@ class KVStorageLease:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+class KVStoragePin:
+    """Explicit, idempotent lifetime hold. No finalizer guesses device completion."""
+
+    def __init__(self, lease: KVStorageLease) -> None:
+        self._lease = lease
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lease._lock:
+            if self._closed:
+                return
+            self._lease._pins -= 1
+            self._closed = True
 
 
 def materialize_kv_storage(
@@ -110,7 +147,7 @@ def materialize_kv_storage(
         spec: Planned geometry. Must be the spec the capacity planner produced.
         ledger: Owner of the device capacity account.
         label: Unique ledger claim label.
-        device: ``"cuda"`` or ``"cuda:N"``; other values need a custom factory.
+        device: ``"cuda"`` or ``"cuda:N"``; CPU is supported for host diagnostics.
         device_index: Defaults to the ledger's device.
         zero_initialize: Fill the slab instead of leaving it uninitialized.
         alignment_bytes: Per-allocation alignment used for the charge.
@@ -156,7 +193,7 @@ def materialize_kv_storage(
         reserved_bytes=charged_bytes,
         backed_bytes=charged_bytes,
         charged_bytes=charged_bytes,
-        tier=MemoryTier.DEVICE,
+        tier=(MemoryTier.HOST_PAGEABLE if resolved_device == "cpu" else MemoryTier.DEVICE),
         device_index=resolved_index,
     )
     ticket = ledger.reserve(reservation)
@@ -217,6 +254,8 @@ def _compute_capability(device_type: str, device_index: int) -> tuple[int, int] 
 
 def _resolve_device(device: str, *, device_index: int, custom_factory: bool) -> str:
     normalized = str(device).strip().lower()
+    if normalized == "cpu":
+        return "cpu"
     if normalized == "cuda":
         return f"cuda:{device_index}"
     if normalized.startswith("cuda:"):

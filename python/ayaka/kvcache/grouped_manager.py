@@ -10,7 +10,6 @@ from ayaka.exceptions import (
     InvariantViolationError,
     SequenceBusyError,
     SequenceCapacityError,
-    TransactionClosedError,
 )
 from ayaka.handles import (
     KVPageHandle,
@@ -53,7 +52,6 @@ from ayaka.memory.state import (
     PageAllocationState,
     ReleaseStatus,
     ReservationFailure,
-    TransactionState,
 )
 from ayaka.memory.transaction import (
     GroupedLeaseRecord as _LeaseRecord,
@@ -68,7 +66,9 @@ from ayaka.memory.transaction import (
     GroupReservationPlan as _GroupReservationPlan,
 )
 from ayaka.memory.transaction import (
+    LifecycleTransitions,
     ReservationResult,
+    TransactionOrchestrator,
 )
 from ayaka.memory.views import (
     GroupedExecutionMemoryView,
@@ -364,8 +364,7 @@ class KVCacheGroupManager:
 
         with self._lock:
             tx = self._get_transaction(transaction)
-            if tx.state is not TransactionState.OPEN:
-                raise TransactionClosedError(f"transaction {transaction} is not open")
+            LifecycleTransitions.require_open(tx)
             if prefix_match is not None:
                 return ReservationResult.failure(ReservationFailure.PREFIX_NOT_RESIDENT)
             if not isinstance(num_new_tokens, int) or isinstance(num_new_tokens, bool):
@@ -475,58 +474,51 @@ class KVCacheGroupManager:
             tx = self._get_transaction(transaction)
             self._rollback_transaction_locked(tx)
 
-    def prepare_step(
-        self,
-        transaction: MemoryTransactionHandle,
-    ) -> StepMemoryLeaseHandle:
-        """Freeze a valid grouped plan into an execution lease.
-
-        Validates every sequence's state against its reservation baseline and
-        rolls the transaction back when anything changed or release was
-        requested.
-        """
+    def prepare_step(self, transaction: MemoryTransactionHandle) -> StepMemoryLeaseHandle:
+        """Freeze ownership without publishing KV; invalid plans roll back."""
         with self._lock:
             tx = self._get_transaction(transaction)
-            if not tx.reservation_handles:
-                raise InvalidStateTransitionError("cannot prepare an empty transaction")
-            records = [self._get_reservation(handle) for handle in tx.reservation_handles]
-            for record in records:
-                state = self._get_sequence_state(record.sequence)
-                if state.release_requested:
-                    self._rollback_transaction_locked(tx)
-                    raise InvalidStateTransitionError(
-                        "a release was requested while the transaction was open"
-                    )
-                if (
-                    state.pending_transaction_index != transaction.index
-                    or state.active_lease_index is not None
-                    or state.version != record.base_sequence_version
-                    or state.committed_tokens != record.base_committed_tokens
-                ):
-                    self._rollback_transaction_locked(tx)
-                    raise InvalidStateTransitionError(
-                        "sequence changed while the group plan was tentative"
-                    )
+            records = [self._get_reservation(h) for h in tx.reservation_handles]
+
+            def validate() -> None:
+                for record in records:
+                    state = self._get_sequence_state(record.sequence)
+                    if (
+                        state.release_requested
+                        or state.pending_transaction_index != transaction.index
+                        or state.active_lease_index is not None
+                        or state.version != record.base_sequence_version
+                        or state.committed_tokens != record.base_committed_tokens
+                    ):
+                        raise InvalidStateTransitionError(
+                            "sequence changed while the plan was tentative"
+                        )
+
+            def activate(lease: _LeaseRecord) -> None:
+                for record in records:
+                    state = self._get_sequence_state(record.sequence)
+                    state.pending_transaction_index = None
+                    state.active_lease_index = lease.handle.index
+
+            def deactivate(lease: _LeaseRecord) -> None:
+                for record in records:
+                    state = self._get_sequence_state(record.sequence)
+                    if state.active_lease_index == lease.handle.index:
+                        state.active_lease_index = None
+                        state.pending_transaction_index = transaction.index
 
             index = self._next_lease_index
             self._next_lease_index += 1
-            lease_handle = StepMemoryLeaseHandle(
-                index=index,
-                generation=1,
-                step_id=transaction.step_id,
+            return TransactionOrchestrator.prepare(
+                tx,
+                StepMemoryLeaseHandle(index=index, generation=1, step_id=transaction.step_id),
+                validate=validate,
+                activate=activate,
+                deactivate=deactivate,
+                rollback=lambda: self._rollback_transaction_locked(tx),
+                transactions=self._transactions,
+                leases=self._leases,
             )
-            self._leases[index] = _LeaseRecord(
-                handle=lease_handle,
-                transaction=transaction,
-                reservation_handles=tuple(tx.reservation_handles),
-            )
-            for record in records:
-                state = self._get_sequence_state(record.sequence)
-                state.pending_transaction_index = None
-                state.active_lease_index = index
-            tx.state = TransactionState.PREPARED
-            self._transactions.pop(transaction.index)
-            return lease_handle
 
     def build_execution_view(
         self,
@@ -611,6 +603,16 @@ class KVCacheGroupManager:
                 sequences=tuple(sequence_views),
             )
 
+    def validate_execution_view(self, view: GroupedExecutionMemoryView) -> None:
+        """Reject stale lease, sequence versions, and changed physical metadata."""
+        with self._lock:
+            lease = self._get_lease(view.lease)
+            LifecycleTransitions.require_lease(lease, LeaseState.PREPARED)
+            records = [self._get_reservation(h) for h in lease.reservation_handles]
+            self._validate_lease_sequences(lease, records)
+            if self.build_execution_view(view.lease) != view:
+                raise InvalidStateTransitionError("execution memory view changed")
+
     def mark_step_in_flight(self, lease_handle: StepMemoryLeaseHandle) -> None:
         """Acquire transient ownership in every touched group before launch.
 
@@ -622,42 +624,43 @@ class KVCacheGroupManager:
         """
         with self._lock:
             lease = self._get_lease(lease_handle)
-            if lease.state is not LeaseState.PREPARED:
-                raise InvalidStateTransitionError("only a prepared step can be launched")
-            for runtime in self._group_runtimes:
-                runtime.allocator.mark_inflight(
-                    self._lease_touched_pages(lease, runtime.descriptor.name)
-                )
-            lease.state = LeaseState.IN_FLIGHT
+            LifecycleTransitions.require_lease(lease, LeaseState.PREPARED)
+            marked = []
+            try:
+                for runtime in self._group_runtimes:
+                    pages = self._lease_touched_pages(lease, runtime.descriptor.name)
+                    runtime.allocator.mark_inflight(pages)
+                    marked.append((runtime.allocator, pages))
+            except BaseException:
+                for allocator, pages in reversed(marked):
+                    allocator.unmark_inflight(pages)
+                raise
+            LifecycleTransitions.transition_lease(
+                lease, expected=LeaseState.PREPARED, target=LeaseState.IN_FLIGHT
+            )
 
-    def complete_step(
+    def commit_step(
         self,
         lease_handle: StepMemoryLeaseHandle,
         *,
         written_tokens: Mapping[KVReservationHandle, int] | None = None,
     ) -> None:
-        """Publish KV metadata after a successful grouped execution step.
+        """Publish completed KV while retaining all execution refs and busy markers.
 
-        Commits each group's reserved pages to LIVE, publishes valid-token
-        counts, advances sequence committed length/version, releases in-flight
-        ownership, and finally prunes pages the group's retention policy no
-        longer needs (staging them for deferred free).
-
-        Args:
-            lease_handle: An IN_FLIGHT lease.
-            written_tokens: Optional per-reservation written-token report.
-
-        Raises:
-            InvalidStateTransitionError: if the lease is not IN_FLIGHT or the
-                written-token report disagrees with the plan.
+        The caller must have proof that all writes succeeded. Retirement is
+        separate; a committed lease continues to prevent page/sequence reuse.
         """
         with self._lock:
             lease = self._get_lease(lease_handle)
-            if lease.state is not LeaseState.IN_FLIGHT:
-                raise InvalidStateTransitionError("step must be in flight before completion")
+            LifecycleTransitions.require_lease(lease, LeaseState.IN_FLIGHT)
             records = [self._get_reservation(handle) for handle in lease.reservation_handles]
             self._validate_written_counts(records, written_tokens)
             self._validate_lease_sequences(lease, records)
+
+            for runtime in self._group_runtimes:
+                for page in self._lease_touched_pages(lease, runtime.descriptor.name):
+                    if runtime.allocator.get_meta(page).inflight_refs <= 0:
+                        raise InvariantViolationError("lease page has no in-flight ownership")
 
             # Commit new pages per group (RESERVED -> LIVE).
             for runtime in self._group_runtimes:
@@ -678,11 +681,6 @@ class KVCacheGroupManager:
                         runtime.allocator.set_valid_tokens(entry.page, entry.valid_tokens)
                 state.committed_tokens = final_tokens
                 state.version += 1
-
-            for runtime in self._group_runtimes:
-                runtime.allocator.unmark_inflight(
-                    self._lease_touched_pages(lease, runtime.descriptor.name)
-                )
 
             # Retention pruning per group: blocks outside the live window drop
             # their request refs and enter deferred free at the current epoch.
@@ -709,9 +707,44 @@ class KVCacheGroupManager:
                                 safe_epoch=self.current_epoch,
                             )
                     state.group_tables[plan.group_name] = retained_entries
-                state.active_lease_index = None
-            lease.state = LeaseState.COMPLETED
+                record.committed = True
+            LifecycleTransitions.transition_lease(
+                lease, expected=LeaseState.IN_FLIGHT, target=LeaseState.COMMITTED
+            )
+
+    def retire_step(self, lease_handle: StepMemoryLeaseHandle) -> None:
+        """Retire a COMMITTED lease after every consumer's last use.
+
+        This is a host ownership operation, not a device synchronization.
+        The caller is responsible for completion proof.
+        """
+        with self._lock:
+            lease = self._get_lease(lease_handle)
+            LifecycleTransitions.require_lease(lease, LeaseState.COMMITTED)
+            for runtime in self._group_runtimes:
+                runtime.allocator.unmark_inflight(
+                    self._lease_touched_pages(lease, runtime.descriptor.name)
+                )
+            for handle in lease.reservation_handles:
+                record = self._get_reservation(handle)
+                self._get_sequence_state(record.sequence).active_lease_index = None
+            LifecycleTransitions.transition_lease(
+                lease,
+                expected=LeaseState.COMMITTED,
+                target=LeaseState.COMPLETED,
+            )
             self._finish_lease_locked(lease)
+
+    def complete_step(
+        self,
+        lease_handle: StepMemoryLeaseHandle,
+        *,
+        written_tokens: Mapping[KVReservationHandle, int] | None = None,
+    ) -> None:
+        """Compatibility API: commit and retire after proven whole-step completion."""
+        with self._lock:
+            self.commit_step(lease_handle, written_tokens=written_tokens)
+            self.retire_step(lease_handle)
 
     def abort_prepared_step(self, lease_handle: StepMemoryLeaseHandle) -> None:
         """Cancel a grouped step before launch; reservations roll back.
@@ -735,7 +768,9 @@ class KVCacheGroupManager:
                         plan.allocated_pages
                     )
                 self._get_sequence_state(record.sequence).active_lease_index = None
-            lease.state = LeaseState.ABORTED
+            LifecycleTransitions.transition_lease(
+                lease, expected=LeaseState.PREPARED, target=LeaseState.ABORTED
+            )
             self._finish_lease_locked(lease)
 
     def fail_in_flight_step(
@@ -762,8 +797,7 @@ class KVCacheGroupManager:
             raise ValueError("safe_epoch cannot precede the completed epoch")
         with self._lock:
             lease = self._get_lease(lease_handle)
-            if lease.state is not LeaseState.IN_FLIGHT:
-                raise InvalidStateTransitionError("only an in-flight step can fail in flight")
+            LifecycleTransitions.require_lease(lease, LeaseState.IN_FLIGHT)
             records = [self._get_reservation(handle) for handle in lease.reservation_handles]
             for runtime in self._group_runtimes:
                 new_pages = tuple(
@@ -782,7 +816,9 @@ class KVCacheGroupManager:
                 state.active_lease_index = None
                 state.blocked_until_epoch = max(state.blocked_until_epoch, safe_epoch)
                 state.version += 1
-            lease.state = LeaseState.FAILED
+            LifecycleTransitions.transition_lease(
+                lease, expected=LeaseState.IN_FLIGHT, target=LeaseState.FAILED
+            )
             self._finish_lease_locked(lease, failure_safe_epoch=safe_epoch)
 
     def release_sequence(
@@ -1109,6 +1145,7 @@ class KVCacheGroupManager:
                 reserved = {
                     page
                     for record in self._reservations.values()
+                    if not record.committed
                     for plan in record.group_plans
                     if plan.group_name == runtime.descriptor.name
                     for page in plan.allocated_pages
@@ -1181,35 +1218,37 @@ class KVCacheGroupManager:
         )
 
     def _rollback_transaction_locked(self, tx: _TransactionRecord) -> None:
-        """Undo an OPEN grouped transaction under lock.
-
-        Rolls back every group's allocations, clears sequence
-        pending-transaction markers, drops reservation records, and honors any
-        deferred release request that arrived meanwhile.
-        """
-        if tx.state is not TransactionState.OPEN:
-            raise TransactionClosedError(f"transaction {tx.handle} is not open")
+        """Undo layout-specific reservations through the shared transaction flow."""
         affected = []
-        for reservation_handle in tx.reservation_handles:
-            record = self._get_reservation(reservation_handle)
-            for plan in record.group_plans:
-                self._runtime_by_name[plan.group_name].allocator.rollback_reserved(
-                    plan.allocated_pages
-                )
-            state = self._get_sequence_state(record.sequence)
-            if state.pending_transaction_index == tx.handle.index:
-                state.pending_transaction_index = None
-            affected.append(record.sequence)
-            self._reservations.pop(reservation_handle.index)
-        tx.state = TransactionState.ROLLED_BACK
-        self._transactions.pop(tx.handle.index)
-        for sequence in affected:
-            state = self._get_sequence_state(sequence)
-            if state.release_requested:
-                self._release_sequence_locked(
-                    sequence,
-                    safe_epoch=state.release_safe_epoch,
-                )
+
+        def undo() -> None:
+            for reservation_handle in tx.reservation_handles:
+                record = self._get_reservation(reservation_handle)
+                for plan in record.group_plans:
+                    self._runtime_by_name[plan.group_name].allocator.rollback_reserved(
+                        plan.allocated_pages
+                    )
+                state = self._get_sequence_state(record.sequence)
+                if state.pending_transaction_index == tx.handle.index:
+                    state.pending_transaction_index = None
+                affected.append(record.sequence)
+                self._reservations.pop(reservation_handle.index)
+
+        def finish() -> None:
+            for sequence in affected:
+                state = self._get_sequence_state(sequence)
+                if state.release_requested:
+                    self._release_sequence_locked(
+                        sequence,
+                        safe_epoch=state.release_safe_epoch,
+                    )
+
+        TransactionOrchestrator.rollback(
+            tx,
+            undo=undo,
+            finish=finish,
+            transactions=self._transactions,
+        )
 
     def _finish_lease_locked(
         self,

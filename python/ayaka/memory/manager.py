@@ -12,18 +12,67 @@ from contextlib import ExitStack
 from math import ceil
 from threading import RLock
 
-from ayaka.exceptions import InvalidHandleError, InvalidStateTransitionError, InvariantViolationError, SequenceBusyError, StorageUnavailableError
-from ayaka.handles import KVPageHandle, KVReservationHandle, MemoryTransactionHandle, PrefixHandle, PrefixMatchHandle, SequenceHandle, StepMemoryLeaseHandle
+from ayaka.exceptions import (
+    InvalidHandleError,
+    InvalidStateTransitionError,
+    InvariantViolationError,
+    SequenceBusyError,
+    StorageUnavailableError,
+)
+from ayaka.handles import (
+    KVPageHandle,
+    KVReservationHandle,
+    MemoryTransactionHandle,
+    PrefixHandle,
+    PrefixMatchHandle,
+    SequenceHandle,
+    StepMemoryLeaseHandle,
+)
 from ayaka.memory.allocator import PageAllocator
-from ayaka.memory.pressure import MemoryPressureMetrics, MemoryPressureResult, PreemptionStatus, PressureAction, PressureStatus, SequencePreemptionResult
+from ayaka.memory.pressure import (
+    MemoryPressureMetrics,
+    MemoryPressureResult,
+    PreemptionStatus,
+    PressureAction,
+    PressureStatus,
+    SequencePreemptionResult,
+)
 from ayaka.memory.sequence import PageTableEntry, SequenceArena, SequenceMemorySnapshot
 from ayaka.memory.state import LeaseState, PageAllocationState, ReleaseStatus, ReservationFailure
-from ayaka.memory.tiering import HostKVStorage, HostTierSnapshot, PromotedBlock, TierManager, TieringConfig, TransferEngine, build_transfer_engine
-from ayaka.memory.transaction import LeaseRecord, LifecycleTransitions, ReservationRecord, ReservationResult, TransactionRecord
-from ayaka.memory.views import CacheView, ExecutionMemoryView, KVWriteSlot, LeakReport, MemorySnapshot, SequenceCacheView, SequenceExecutionView
-from ayaka.prefix.identity import PrefixBlockIdentity, PrefixCacheContext, build_prefix_block_identities
+from ayaka.memory.tiering import (
+    HostKVStorage,
+    HostTierSnapshot,
+    PromotedBlock,
+    TieringConfig,
+    TierManager,
+    TransferEngine,
+    build_transfer_engine,
+)
+from ayaka.memory.transaction import (
+    LeaseRecord,
+    LifecycleTransitions,
+    ReservationRecord,
+    ReservationResult,
+    TransactionOrchestrator,
+    TransactionRecord,
+)
+from ayaka.memory.views import (
+    CacheView,
+    ExecutionMemoryView,
+    KVWriteSlot,
+    LeakReport,
+    MemorySnapshot,
+    SequenceCacheView,
+    SequenceExecutionView,
+)
+from ayaka.prefix.identity import (
+    PrefixBlockIdentity,
+    PrefixCacheContext,
+    build_prefix_block_identities,
+)
 from ayaka.prefix.interface import CachedBlockInfo, PrefixLookupResult, PrefixMatch
 from ayaka.prefix.store import RadixPagePrefixCache
+
 
 class RuntimeMemoryManager:
     """Owns sequence KV blocks from reservation through safe reclamation.
@@ -37,7 +86,7 @@ class RuntimeMemoryManager:
     plan) -> ``prepare_step`` (freezes a lease) -> ``mark_step_in_flight`` ->
     ``complete_step`` / ``abort_prepared_step`` / ``fail_in_flight_step``.
     """
-    
+
     def __init__(
         self,
         *,
@@ -62,7 +111,7 @@ class RuntimeMemoryManager:
         self.allocator = PageAllocator(total_pages=total_pages, page_size=page_size)
         self.sequences = SequenceArena(max_sequences)
         # One permanent padding page backs graph-padding writes; it is never
-        # returned to the free pool 
+        # returned to the free pool
         self.padding_page = self.allocator.reserve_permanent_page()
         self.prefix_cache = RadixPagePrefixCache(
             allocator=self.allocator,
@@ -71,7 +120,7 @@ class RuntimeMemoryManager:
         self.storage = storage
         self._validate_storage(storage, total_pages=total_pages, page_size=page_size)
         self.host_storage = host_storage
-        
+
         # Tiering is strictly opt-in: with no config the manager keeps the
         # GPU-only code path, allocations included.
         self._tier = self._build_tier(
@@ -79,7 +128,7 @@ class RuntimeMemoryManager:
             host_storage=host_storage,
             transfer_engine=transfer_engine,
         )
-        
+
         self._transactions: dict[int, TransactionRecord] = {}
         self._reservations: dict[int, ReservationRecord] = {}
         self._leases: dict[int, LeaseRecord] = {}
@@ -97,7 +146,7 @@ class RuntimeMemoryManager:
         self._pressure_prefix_eviction_progress_total = 0
         self._pressure_preemptions_total = 0
         self._lock = RLock()
-        
+
     def _build_tier(
         self,
         config: TieringConfig | None,
@@ -1069,75 +1118,51 @@ class RuntimeMemoryManager:
             tx = self._get_transaction(transaction)
             self._rollback_transaction_locked(tx)
 
-    def prepare_step(
-        self,
-        transaction: MemoryTransactionHandle,
-    ) -> StepMemoryLeaseHandle:
-        """Freeze a valid plan and return an execution lease.
-
-        This commits reservation ownership, not token validity. New KV becomes
-        committed only through :meth:`complete_step` after execution succeeds.
-        Preparing rejects and rolls back if any sequence changed or had a
-        release requested while the plan was tentative.
-
-        Args:
-            transaction: Open transaction to freeze.
-
-        Returns:
-            An opaque lease handle for launch/complete/abort/fail calls.
-
-        Raises:
-            InvalidStateTransitionError: for an empty transaction or changed
-                sequence state (the transaction is rolled back in that case).
-        """
-
+    def prepare_step(self, transaction: MemoryTransactionHandle) -> StepMemoryLeaseHandle:
+        """Freeze ownership without publishing KV; invalid plans roll back."""
         with self._lock:
             tx = self._get_transaction(transaction)
-            if not tx.reservation_handles:
-                raise InvalidStateTransitionError("cannot prepare an empty transaction")
+            records = [self._get_reservation(h) for h in tx.reservation_handles]
 
-            records = [self._get_reservation(handle) for handle in tx.reservation_handles]
-            for record in records:
-                with self.sequences.mutate(record.sequence) as state:
-                    if state.release_requested:
-                        self._rollback_transaction_locked(tx)
-                        raise InvalidStateTransitionError(
-                            "a release was requested while the transaction was open"
-                        )
-                    if (
-                        state.pending_transaction_index != transaction.index
-                        or state.active_lease_index is not None
-                        or state.version != record.base_sequence_version
-                        or state.committed_tokens != record.base_committed_tokens
-                    ):
-                        self._rollback_transaction_locked(tx)
-                        raise InvalidStateTransitionError(
-                            "sequence state changed while the memory plan was tentative"
-                        )
+            def validate() -> None:
+                for record in records:
+                    with self.sequences.mutate(record.sequence) as state:
+                        if (
+                            state.release_requested
+                            or state.pending_transaction_index != transaction.index
+                            or state.active_lease_index is not None
+                            or state.version != record.base_sequence_version
+                            or state.committed_tokens != record.base_committed_tokens
+                        ):
+                            raise InvalidStateTransitionError(
+                                "sequence changed while the plan was tentative"
+                            )
 
-            lease_index = self._next_lease_index
+            def activate(lease: LeaseRecord) -> None:
+                for record in records:
+                    with self.sequences.mutate(record.sequence) as state:
+                        state.pending_transaction_index = None
+                        state.active_lease_index = lease.handle.index
+
+            def deactivate(lease: LeaseRecord) -> None:
+                for record in records:
+                    with self.sequences.mutate(record.sequence) as state:
+                        if state.active_lease_index == lease.handle.index:
+                            state.active_lease_index = None
+                            state.pending_transaction_index = transaction.index
+
+            index = self._next_lease_index
             self._next_lease_index += 1
-            lease_handle = StepMemoryLeaseHandle(
-                index=lease_index,
-                generation=1,
-                step_id=transaction.step_id,
+            return TransactionOrchestrator.prepare(
+                tx,
+                StepMemoryLeaseHandle(index=index, generation=1, step_id=transaction.step_id),
+                validate=validate,
+                activate=activate,
+                deactivate=deactivate,
+                rollback=lambda: self._rollback_transaction_locked(tx),
+                transactions=self._transactions,
+                leases=self._leases,
             )
-            lease = LeaseRecord(
-                handle=lease_handle,
-                transaction=transaction,
-                reservation_handles=tuple(tx.reservation_handles),
-            )
-            self._leases[lease_index] = lease
-            # Move each sequence from pending-transaction to active-lease so a
-            # concurrent release is deferred rather than executed.
-            for record in records:
-                with self.sequences.mutate(record.sequence) as state:
-                    state.pending_transaction_index = None
-                    state.active_lease_index = lease_index
-
-            LifecycleTransitions.prepare(tx)
-            self._transactions.pop(transaction.index)
-            return lease_handle
 
     def build_execution_view(
         self,
@@ -1185,6 +1210,16 @@ class RuntimeMemoryManager:
                 padding_slot=self.padding_slot,
             )
 
+    def validate_execution_view(self, view: ExecutionMemoryView) -> None:
+        """Reject stale lease, sequence versions, and changed physical metadata."""
+        with self._lock:
+            lease = self._get_lease(view.lease)
+            LifecycleTransitions.require_lease(lease, LeaseState.PREPARED)
+            records = [self._get_reservation(h) for h in lease.reservation_handles]
+            self._validate_lease_sequences(lease, records)
+            if self.build_execution_view(view.lease) != view:
+                raise InvalidStateTransitionError("execution memory view changed")
+
     def mark_step_in_flight(self, lease_handle: StepMemoryLeaseHandle) -> None:
         """Acquire transient ownership over every page the step may touch.
 
@@ -1208,26 +1243,16 @@ class RuntimeMemoryManager:
                 target=LeaseState.IN_FLIGHT,
             )
 
-    def complete_step(
+    def commit_step(
         self,
         lease_handle: StepMemoryLeaseHandle,
         *,
         written_tokens: Mapping[KVReservationHandle, int] | None = None,
     ) -> None:
-        """Publish KV metadata after a successfully completed execution step.
+        """Publish completed KV while retaining all execution refs and busy markers.
 
-        Converts newly reserved pages to request-owned LIVE pages, publishes
-        committed page-table token counts, advances sequence committed
-        length/version, and releases in-flight ownership.
-
-        Args:
-            lease_handle: An IN_FLIGHT lease.
-            written_tokens: Optional per-reservation written-token report; must
-                cover every reservation and match its reserved count.
-
-        Raises:
-            InvalidStateTransitionError: if the lease is not IN_FLIGHT or the
-                written-token report disagrees with the plan.
+        The caller must have proof that all writes succeeded. Retirement is
+        separate; a committed lease continues to prevent page/sequence reuse.
         """
 
         with self._lock:
@@ -1254,17 +1279,46 @@ class RuntimeMemoryManager:
                     state.committed_tokens = record.execution_base_tokens + record.num_new_tokens
                     state.version += 1
 
-            self.allocator.unmark_inflight(touched_pages)
             for record in records:
-                with self.sequences.mutate(record.sequence) as state:
-                    state.active_lease_index = None
+                record.committed = True
 
             LifecycleTransitions.transition_lease(
                 lease,
                 expected=LeaseState.IN_FLIGHT,
+                target=LeaseState.COMMITTED,
+            )
+
+    def retire_step(self, lease_handle: StepMemoryLeaseHandle) -> None:
+        """Retire a COMMITTED lease after every consumer's last use.
+
+        This is a host ownership operation, not a device synchronization.
+        The caller is responsible for completion proof.
+        """
+        with self._lock:
+            lease = self._get_lease(lease_handle)
+            LifecycleTransitions.require_lease(lease, LeaseState.COMMITTED)
+            self.allocator.unmark_inflight(self._lease_touched_pages(lease))
+            for handle in lease.reservation_handles:
+                record = self._get_reservation(handle)
+                with self.sequences.mutate(record.sequence) as state:
+                    state.active_lease_index = None
+            LifecycleTransitions.transition_lease(
+                lease,
+                expected=LeaseState.COMMITTED,
                 target=LeaseState.COMPLETED,
             )
             self._finish_lease_locked(lease)
+
+    def complete_step(
+        self,
+        lease_handle: StepMemoryLeaseHandle,
+        *,
+        written_tokens: Mapping[KVReservationHandle, int] | None = None,
+    ) -> None:
+        """Compatibility API: commit and retire after proven whole-step completion."""
+        with self._lock:
+            self.commit_step(lease_handle, written_tokens=written_tokens)
+            self.retire_step(lease_handle)
 
     def abort_prepared_step(self, lease_handle: StepMemoryLeaseHandle) -> None:
         """Cancel a prepared step before any GPU work is launched.
@@ -1520,7 +1574,9 @@ class RuntimeMemoryManager:
                             self._get_reservation(res).sequence == handle
                             for res in lease.reservation_handles
                         ):
-                            raise InvariantViolationError("sequence points to a missing active lease")
+                            raise InvariantViolationError(
+                                "sequence points to a missing active lease"
+                            )
 
             for record in self._reservations.values():
                 if record.attached_prefix_tokens != (
@@ -1529,7 +1585,7 @@ class RuntimeMemoryManager:
                     raise InvariantViolationError(
                         "reservation prefix refs disagree with its logical attachment"
                     )
-                for page in record.acquired_prefix_pages:
+                for page in () if record.committed else record.acquired_prefix_pages:
                     meta = self.allocator.get_meta(page)
                     if meta.allocation_state is not PageAllocationState.LIVE:
                         raise InvariantViolationError(
@@ -1552,7 +1608,10 @@ class RuntimeMemoryManager:
                     )
 
             reserved_pages = {
-                page for record in self._reservations.values() for page in record.allocated_pages
+                page
+                for record in self._reservations.values()
+                if not record.committed
+                for page in record.allocated_pages
             }
             if self._tier is not None:
                 # Promotion destinations are reservations the tier owns
@@ -1648,33 +1707,35 @@ class RuntimeMemoryManager:
         return planned, tuple(write_slots)
 
     def _rollback_transaction_locked(self, tx: TransactionRecord) -> None:
-        """Undo an OPEN transaction under lock (shared by rollback and prepare).
-
-        Rolls back reserved pages, releases tentative prefix refs, clears the
-        sequence pending-transaction marker, drops the reservation records, and
-        then honors any deferred release request that arrived meanwhile.
-        """
-        LifecycleTransitions.require_open(tx)
+        """Undo layout-specific reservations through the shared transaction flow."""
         affected_sequences: list[SequenceHandle] = []
-        for reservation_handle in tx.reservation_handles:
-            record = self._get_reservation(reservation_handle)
-            self.allocator.rollback_reserved(record.allocated_pages)
-            self._release_tentative_prefix_pages(record.acquired_prefix_pages)
-            with self.sequences.mutate(record.sequence) as state:
-                if state.pending_transaction_index == tx.handle.index:
-                    state.pending_transaction_index = None
-                affected_sequences.append(record.sequence)
-                self._reservations.pop(reservation_handle.index)
-        LifecycleTransitions.rollback(tx)
-        self._transactions.pop(tx.handle.index)
 
-        for sequence in affected_sequences:
-            with self.sequences.mutate(sequence) as state:
-                if state.release_requested:
-                    self._release_sequence_locked(
-                        sequence,
-                        safe_epoch=state.release_safe_epoch,
-                    )
+        def undo() -> None:
+            for reservation_handle in tx.reservation_handles:
+                record = self._get_reservation(reservation_handle)
+                self.allocator.rollback_reserved(record.allocated_pages)
+                self._release_tentative_prefix_pages(record.acquired_prefix_pages)
+                with self.sequences.mutate(record.sequence) as state:
+                    if state.pending_transaction_index == tx.handle.index:
+                        state.pending_transaction_index = None
+                    affected_sequences.append(record.sequence)
+                    self._reservations.pop(reservation_handle.index)
+
+        def finish() -> None:
+            for sequence in affected_sequences:
+                with self.sequences.mutate(sequence) as state:
+                    if state.release_requested:
+                        self._release_sequence_locked(
+                            sequence,
+                            safe_epoch=state.release_safe_epoch,
+                        )
+
+        TransactionOrchestrator.rollback(
+            tx,
+            undo=undo,
+            finish=finish,
+            transactions=self._transactions,
+        )
 
     def _finish_lease_locked(
         self,

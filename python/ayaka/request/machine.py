@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterator
+from itertools import count
 
 from ayaka.request.states import (
     RUNNING_STATES,
@@ -11,8 +12,17 @@ from ayaka.request.states import (
     legal_targets,
 )
 from ayaka.utils.timing import Clock, RequestTiming
+from ayaka.utils.validation import require_int
 
 _DEFAULT_HISTORY = 16
+_REQUEST_EPOCHS = count(1)
+# Process-local incarnations. A restarted/distributed worker needs its own
+# worker generation as well; that protocol belongs to the runtime.
+
+
+def next_request_epoch() -> int:
+    """Allocate an incarnation never reused within this process."""
+    return next(_REQUEST_EPOCHS)
 
 
 class IllegalTransition(RuntimeError):
@@ -39,6 +49,8 @@ class RequestStateMachine:
         "failure_reason",
         "max_retries",
         "num_cached_tokens",
+        "num_prompt_tokens",
+        "sequence_epoch",
         "num_computed_tokens",
         "preemption_count",
         "request_id",
@@ -63,6 +75,8 @@ class RequestStateMachine:
         self._history: deque[tuple[RequestState, int]] = deque(
             [(RequestState.CREATED, initial_ns)], maxlen=history_size
         )
+        self.num_prompt_tokens = 0
+        self.sequence_epoch = next_request_epoch()
         self.num_computed_tokens = 0
         self.num_cached_tokens = 0
         self.preemption_count = 0
@@ -141,12 +155,21 @@ class RequestStateMachine:
             # Recompute preemption drops the KV, so the prefill progress is gone.
             # Leaving this stale is how a resumed request writes its second
             # prefill on top of block indices it no longer owns.
-            self.num_computed_tokens = self.num_cached_tokens
+            self.num_cached_tokens = 0
+            self.num_computed_tokens = 0
         elif dst is RequestState.SWAPPED:
             self.swap_count += 1  # KV survives in host memory; progress is kept
         elif dst is RequestState.RETRYING:
             self.retry_count += 1
 
+        if dst in (
+            RequestState.PREEMPTED,
+            RequestState.SWAPPED,
+            RequestState.RETRYING,
+            RequestState.CANCELLED,
+            RequestState.FAILED,
+        ):
+            self.sequence_epoch = next_request_epoch()
         return src
 
     # The engine loop calls these instead of naming states, so the scheduler
@@ -158,14 +181,18 @@ class RequestStateMachine:
         self.transition(RequestState.TOKENIZING)
 
     def on_tokenized(self, num_prompt_tokens: int) -> None:
-        if num_prompt_tokens < 1:
-            raise ValueError(f"{self.request_id}: tokenizer produced 0 tokens")
+        require_int(num_prompt_tokens, "num_prompt_tokens", minimum=1)
         self.transition(RequestState.CACHE_LOOKUP)
+        self.num_prompt_tokens = num_prompt_tokens
 
     def on_cache_looked_up(self, num_cached_tokens: int = 0) -> None:
+        """Accept already validated/acquired prefix progress, not a raw lookup."""
+        require_int(num_cached_tokens, "num_cached_tokens")
+        if num_cached_tokens > self.num_prompt_tokens + self.num_generated_tokens:
+            raise ValueError("cached progress exceeds known tokens")
+        self.transition(RequestState.WAITING)
         self.num_cached_tokens = num_cached_tokens
         self.num_computed_tokens = num_cached_tokens
-        self.transition(RequestState.WAITING)
 
     def on_admitted(self) -> None:
         self.transition(RequestState.ADMITTED)
@@ -173,24 +200,59 @@ class RequestStateMachine:
     def on_prefill_started(self) -> None:
         self.transition(RequestState.PREFILL)
 
+    def commit_computed_range(self, query_start: int, query_count: int) -> None:
+        """Credit a contiguous forward range after successful KV/state commit.
+
+        This low-level counter API does not prove completion. RequestLifecycle
+        additionally checks slice identity/version and its input snapshot.
+        Sampling is a separate operation and never advances this counter.
+        """
+        require_int(query_start, "query_start")
+        require_int(query_count, "query_count", minimum=1)
+        if self._state not in (
+            RequestState.PREFILL,
+            RequestState.DECODING,
+            RequestState.STREAMING,
+        ):
+            raise ValueError("forward progress requires an executing request")
+        if query_start != self.num_computed_tokens:
+            raise ValueError("forward range must start at computed progress")
+        if query_start + query_count > self.num_prompt_tokens + self.num_generated_tokens:
+            raise ValueError("forward range exceeds known tokens")
+        self.num_computed_tokens = query_start + query_count
+
     def on_prefill_chunk(self, num_tokens: int) -> None:
-        """A chunk of a chunked prefill.  Not a transition — the state is already
-        PREFILL and stays PREFILL."""
+        """Credit a completed prompt chunk; the request remains in PREFILL."""
         if self._state is not RequestState.PREFILL:
             raise IllegalTransition(self.request_id, self._state, RequestState.PREFILL)
-        self.num_computed_tokens += num_tokens
+        require_int(num_tokens, "num_tokens", minimum=1)
+        if self.num_computed_tokens + num_tokens > self.num_prompt_tokens:
+            raise ValueError("prefill chunk extends past the prompt")
+        self.commit_computed_range(self.num_computed_tokens, num_tokens)
 
     def on_decode_started(self) -> None:
+        if self.num_computed_tokens < self.num_prompt_tokens:
+            raise ValueError("decode cannot start before prompt computation completes")
         self.transition(RequestState.DECODING)
 
     def on_token_generated(self, count: int = 1) -> None:
-        """Also not a transition: a decode step that produces a token leaves the
-        request in DECODING.  STREAMING is entered only when a token is actually
-        handed to the client."""
+        """Publish a sample count without claiming KV for that new token.
+
+        Zero is an explicit no-op. P0 supports at most one sample from a
+        forward and requires every currently known token to be computed.
+        Lifecycle users publish the token ID through publish_sample instead
+        of updating this metric independently from their output buffer.
+        """
+        require_int(count, "count")
+        if count == 0:
+            return
+        if count != 1:
+            raise ValueError("P0 supports one sample per completed forward")
         if self._state not in (RequestState.DECODING, RequestState.STREAMING):
             raise IllegalTransition(self.request_id, self._state, RequestState.DECODING)
+        if self.num_computed_tokens != self.num_prompt_tokens + self.num_generated_tokens:
+            raise ValueError("sampling requires the completed known-token boundary")
         self.timing.num_output_tokens += count
-        self.num_computed_tokens += count
 
     def on_streamed(self, *, now_ns: int | None = None) -> None:
         ts = now_ns if now_ns is not None else self.clock.now().as_nanos()
@@ -205,22 +267,22 @@ class RequestStateMachine:
     def on_requeued(self) -> None:
         self.transition(RequestState.WAITING)
 
-    def on_finished(self) -> None:
-        self.transition(RequestState.FINISHED)
+    def on_finished(self, *, now_ns: int | None = None) -> None:
+        self.transition(RequestState.FINISHED, now_ns=now_ns)
 
-    def on_cancelled(self) -> None:
+    def on_cancelled(self, *, now_ns: int | None = None) -> None:
         """Idempotent by design: a cancel racing with completion is normal, and
         making the loser raise would turn a race into an error path."""
         self.cancel_requested = True
         if self.is_terminal:
             return
-        self.transition(RequestState.CANCELLED)
+        self.transition(RequestState.CANCELLED, now_ns=now_ns)
 
-    def on_failed(self, reason: str) -> None:
+    def on_failed(self, reason: str, *, now_ns: int | None = None) -> None:
         self.failure_reason = reason
         if self.is_terminal:
             return
-        self.transition(RequestState.FAILED)
+        self.transition(RequestState.FAILED, now_ns=now_ns)
 
     def on_error(self, reason: str) -> bool:
         """Transient failure.  Returns True if a retry was started, False if the

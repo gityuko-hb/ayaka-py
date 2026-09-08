@@ -2,7 +2,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from ayaka.handles import SequenceHandle
-from ayaka.memory.views import ExecutionMemoryView, GroupedExecutionMemoryView
+from ayaka.memory.views import (
+    ExecutionMemoryView,
+    GroupedExecutionMemoryView,
+    SequenceExecutionView,
+)
 from ayaka.plan import (
     CommunicationPlan,
     ExecutionPlan,
@@ -94,8 +98,10 @@ class RequestStepInput:
         require_int(self.max_output_tokens, "max_output_tokens", minimum=1)
         for token in self.known_tokens:
             require_int(token, "token id")
-        if not self.prompt_tokens <= len(self.known_tokens) <= (
-            self.prompt_tokens + self.max_output_tokens
+        if (
+            not self.prompt_tokens
+            <= len(self.known_tokens)
+            <= (self.prompt_tokens + self.max_output_tokens)
         ):
             raise ValueError("known token count disagrees with prompt/output limits")
         if self.computed_tokens > len(self.known_tokens):
@@ -114,7 +120,10 @@ class RequestStepInput:
         if scheduled.query_end > len(self.known_tokens):
             raise ValueError("slice extends beyond known tokens")
         if scheduled.phase is Phase.PREFILL:
-            if scheduled.query_start >= self.prompt_tokens or scheduled.query_end > self.prompt_tokens:
+            if (
+                scheduled.query_start >= self.prompt_tokens
+                or scheduled.query_end > self.prompt_tokens
+            ):
                 raise ValueError("prefill must stay within the prompt")
         elif scheduled.query_start < self.prompt_tokens:
             raise ValueError("decode cannot replace an unfinished prefill")
@@ -259,7 +268,8 @@ class BatchStepPlan:
     @property
     def positions(self) -> tuple[int, ...]:
         return tuple(
-            position for scheduled in self.slices
+            position
+            for scheduled in self.slices
             for position in range(scheduled.query_start, scheduled.query_end)
         )
 
@@ -307,7 +317,8 @@ class PreparedStep:
             ):
                 raise ValueError("KV reservation disagrees with scheduled range")
             slot_groups = (
-                (view.write_slots,) if isinstance(self.memory_view, ExecutionMemoryView)
+                (view.write_slots,)
+                if isinstance(view, SequenceExecutionView)
                 else tuple(group.write_slots for group in view.groups)
             )
             if not slot_groups:

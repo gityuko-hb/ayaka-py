@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from typing import NewType
 
 from ayaka.sampling.params import SamplingParams
+from ayaka.utils.validation import require_frozen, require_int, require_text
 
 RequestId = NewType("RequestId", str)
 SessionId = NewType("SessionId", str)
+
 
 @dataclass(frozen=True, slots=True)
 class StopCriteria:
@@ -23,6 +25,7 @@ class StopCriteria:
         if not 0 <= self.min_tokens <= self.max_tokens:
             raise ValueError("min_tokens must be in [0, max_tokens]")
 
+
 @dataclass(frozen=True, slots=True)
 class CacheHints:
     """Prefix-cache controls.
@@ -37,27 +40,32 @@ class CacheHints:
     store_kv: bool = True
     session_id: SessionId | None = None
 
+
 @dataclass(frozen=True, slots=True)
 class Request:
     """The Request IR itself."""
-    
+
     request_id: RequestId
     prompt_token_ids: tuple[int, ...]
     sampling: SamplingParams = field(default_factory=SamplingParams)
     stop: StopCriteria = field(default_factory=StopCriteria)
     cache: CacheHints = field(default_factory=CacheHints)
-    
+
     # Admission / scheduling inputs.  Higher priority is served first; the
     # scheduler breaks ties on arrival_ns so ordering is total and stable.
     priority: int = 0
     arrival_ns: int = 0
     deadline_ns: int | None = None
-    
+
     # Set at the API edge, carried unchanged to
     # every span the request produces.
     trace_id: str | None = None
-    
+
     def __post_init__(self) -> None:
+        require_frozen(self, "request")
+        require_text(self.request_id, "request_id")
+        for token in self.prompt_token_ids:
+            require_int(token, "prompt token id")
         if not self.prompt_token_ids:
             raise ValueError(f"{self.request_id}: empty prompt")
 
