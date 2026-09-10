@@ -13,7 +13,7 @@ from ayaka.handles import (
 )
 from ayaka.memory.sequence import GroupPageTableEntry, PageTableEntry
 from ayaka.memory.state import LeaseState, ReservationFailure, TransactionState
-from ayaka.memory.views import GroupKVWriteSlot, KVWriteSlot
+from ayaka.memory.views import GroupKVWriteSlot, KVPageCopy, KVWriteSlot
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +101,8 @@ class ReservationRecord:
     """Whether tentative refs have transferred into committed sequence tables."""
     write_slots: tuple[KVWriteSlot, ...]
     """One slot per written token, mapping logical position to flat slot."""
+    copies: tuple[KVPageCopy, ...] = ()
+    """Source refs stay in the old table until commit; the lease protects last use."""
 
     @property
     def execution_base_tokens(self) -> int:
@@ -110,7 +112,9 @@ class ReservationRecord:
     @property
     def touched_pages(self) -> tuple[KVPageHandle, ...]:
         """Every page the step may read or write (planned table pages)."""
-        return tuple(entry.page for entry in self.planned_page_table)
+        return tuple(entry.page for entry in self.planned_page_table) + tuple(
+            copy.source for copy in self.copies
+        )
 
 
 @dataclass(slots=True)
@@ -143,9 +147,7 @@ class LifecycleTransitions:
     @staticmethod
     def require_open(transaction: TransactionRecord) -> None:
         if transaction.state is not TransactionState.OPEN:
-            raise TransactionClosedError(
-                f"transaction {transaction.handle} is not open"
-            )
+            raise TransactionClosedError(f"transaction {transaction.handle} is not open")
 
     @staticmethod
     def prepare(transaction: TransactionRecord) -> None:
@@ -183,11 +185,14 @@ class GroupReservationPlan:
     planned_page_table: tuple[GroupPageTableEntry, ...]
     allocated_pages: tuple[KVPageHandle, ...]
     write_slots: tuple[GroupKVWriteSlot, ...]
+    copies: tuple[KVPageCopy, ...] = ()
 
     @property
     def touched_pages(self) -> tuple[KVPageHandle, ...]:
         """Every page of this group the step may read or write."""
-        return tuple(entry.page for entry in self.planned_page_table)
+        return tuple(entry.page for entry in self.planned_page_table) + tuple(
+            copy.source for copy in self.copies
+        )
 
 
 @dataclass(slots=True)

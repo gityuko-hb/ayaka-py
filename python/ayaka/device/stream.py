@@ -13,6 +13,7 @@ from ayaka.utils.torch_memory import peak_memory_bytes, pinned_empty
 
 __all__ = ["ROLE_PRIORITY", "StreamPool"]
 
+
 ROLE_PRIORITY: dict[StreamRole, int] = {
     StreamRole.COMPUTE: 0,
     StreamRole.H2D: 0,
@@ -21,7 +22,31 @@ ROLE_PRIORITY: dict[StreamRole, int] = {
     StreamRole.COMM: -2,
     StreamRole.KV: -1,
 }
+"""Hardware stream priority offsets mapped to execution roles.
 
+Values correspond to relative offsets applied to the platform's default priority level
+(in CUDA priority semantics, lower/negative values indicate higher execution priority).
+
+Attributes:
+    StreamRole.COMM (-2): Highest execution priority. Allocated to inter-device and
+        inter-node distributed collective communications (e.g., NCCL AllReduce,
+        ReduceScatter). Prioritizing this stream minimizes cluster-wide rank skew,
+        straggler stalls, and network tail latency.
+    StreamRole.KV (-1): High execution priority. Dedicated to memory-management
+        tasks within PagedAttention and chunked KV-cache allocation (such as block
+        swapping, defragmentation, and cache staging) to ensure cache availability
+        before attention kernel dispatch.
+    StreamRole.COMPUTE (0): Default execution priority. Serves compute-heavy SM-bound
+        operations (e.g., dense GEMMs, attention forward passes, layer projections).
+        Lower priority relative to COMM and KV prevents compute tasks from starving
+        latency-sensitive synchronization.
+    StreamRole.H2D (0): Default execution priority. Handles asynchronous Host-to-Device
+        DMA copies for input batch feeding and dynamic weight staging.
+    StreamRole.D2H (0): Default execution priority. Handles asynchronous Device-to-Host
+        DMA copies for sampled token offloading and telemetry collection.
+    StreamRole.P2P (0): Default execution priority. Direct GPU-to-GPU peer memory
+        transfers across local interconnects (PCIe / NVLink) without host staging.
+"""
 
 class StreamPool:
     __slots__ = ("_backend", "_closed", "_events", "_index", "_priority_range", "_streams")

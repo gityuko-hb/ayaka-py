@@ -29,6 +29,7 @@ class KVWriteSlot:
     flat_slot: int
     """Linear storage slot address for the write."""
 
+
 @dataclass(frozen=True, slots=True)
 class GroupKVWriteSlot:
     """One kernel-facing write target for one token in one group.
@@ -48,9 +49,11 @@ class GroupKVWriteSlot:
     flat_slot: int
     """Linear slot address within this group's storage."""
 
+
 @dataclass(frozen=True, slots=True)
 class SequenceExecutionView:
     """Per-sequence portion of an execution lease, ready for batch building."""
+
     sequence: SequenceHandle
     reservation: KVReservationHandle
     base_committed_tokens: int
@@ -61,6 +64,17 @@ class SequenceExecutionView:
     """Physical page IDs per logical block, in logical-block order."""
     write_slots: tuple[KVWriteSlot, ...]
     """One slot per reserved token in logical-position order."""
+
+
+@dataclass(frozen=True, slots=True)
+class KVPageCopy:
+    """Immutable COW copy under the enclosing lease, before any destination writer."""
+
+    source: KVPageHandle
+    destination: KVPageHandle
+    valid_tokens: int
+    group_name: str = "default"
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionMemoryView:
@@ -74,6 +88,8 @@ class ExecutionMemoryView:
     """Physical page reserved for graph-padding writes; never a live page."""
     padding_slot: int
     """Flat slot address of the padding page's first position."""
+    copies: tuple[KVPageCopy, ...] = ()
+
 
 @dataclass(frozen=True, slots=True)
 class KVCacheGroupExecutionView:
@@ -121,6 +137,7 @@ class GroupedExecutionMemoryView:
     step_id: int
     lease: StepMemoryLeaseHandle
     sequences: tuple[GroupedSequenceExecutionView, ...]
+    copies: tuple[KVPageCopy, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,7 +153,6 @@ class SequenceCacheView:
     """Physical page IDs for the same blocks; the kernel-facing page table."""
 
 
-
 @dataclass(frozen=True, slots=True)
 class CacheView:
     """Read-only attention contract for a set of sequences."""
@@ -146,6 +162,7 @@ class CacheView:
     padding_page: int
     padding_slot: int
 
+
 @dataclass(frozen=True, slots=True)
 class MemorySnapshot:
     """Approximate scheduler-facing capacity feedback.
@@ -154,7 +171,6 @@ class MemorySnapshot:
     heuristic (e.g. ``immediately_available_tokens`` assumes the tail page
     fills entirely). Actual allocations are always validated transitionally.
     """
-
 
     total_pages: int
     """All physical pages including the permanent padding page."""
@@ -208,6 +224,7 @@ class MemorySnapshot:
         """Pages instantly allocatable without reclaiming or evicting."""
         return self.free_pages
 
+
 @dataclass(frozen=True, slots=True)
 class LeakReport:
     """Full accounting report for deterministic leak detection.
@@ -238,6 +255,7 @@ class LeakReport:
             and self.snapshot.deferred_free_pages == 0
             and self.snapshot.free_pages == self.snapshot.usable_pages
         )
+
 
 @dataclass(frozen=True, slots=True)
 class KVCacheGroupSnapshot:

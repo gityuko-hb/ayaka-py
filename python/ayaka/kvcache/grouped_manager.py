@@ -78,9 +78,25 @@ from ayaka.memory.views import (
     GroupKVWriteSlot,
     KVCacheGroupExecutionView,
     KVCacheGroupSnapshot,
+    KVPageCopy,
 )
 from ayaka.prefix.identity import PrefixCacheContext
 from ayaka.prefix.interface import PrefixLookupResult
+from ayaka.utils.validation import require_int
+
+
+@dataclass(frozen=True, slots=True)
+class GroupedPrefixSnapshot:
+    """An all-group resident boundary, pinned until explicitly released.
+
+    Logical block indexes preserve retention gaps. This is a storage capability,
+    not a token/model identity check; the prefix publisher owns that check.
+    """
+
+    manager_id: int
+    snapshot_id: int
+    logical_position: int
+    groups: tuple[tuple[str, tuple[GroupPageTableEntry, ...]], ...]
 
 
 @dataclass(slots=True)
@@ -187,6 +203,8 @@ class KVCacheGroupManager:
         self._pressure_prefix_eviction_attempts_total = 0
         self._pressure_preemptions_total = 0
         self._lock = RLock()
+        self._prefix_snapshots: dict[int, GroupedPrefixSnapshot] = {}
+        self._next_snapshot = 0
 
     @property
     def current_epoch(self) -> int:
@@ -213,7 +231,7 @@ class KVCacheGroupManager:
     @property
     def prefix_capability(self) -> LayoutFeatureCapability:
         """Layout-level prefix capability of the configured groups."""
-        return prefix_cache_capability(self.cache_groups) # type: ignore
+        return prefix_cache_capability(self.cache_groups)  # type: ignore
 
     def _prefix_reuse_capability(self) -> LayoutFeatureCapability:
         """Report prefix reuse as unimplemented even for compatible layouts.
@@ -336,6 +354,161 @@ class KVCacheGroupManager:
             self._transactions[index] = _TransactionRecord(handle=handle)
             return handle
 
+    def pin_prefix(self, sequence: SequenceHandle, num_tokens: int) -> GroupedPrefixSnapshot:
+        """Pin a boundary only when all MHA groups retain the required positions.
+
+        Earlier boundaries are rejected if sliding retention has removed their
+        required history. An all-group pin is atomic, including failure in a
+        later group. Recurrent and non-MHA checkpoints need a separate contract.
+        """
+        require_int(num_tokens, "num_tokens", minimum=1)
+        with self._lock:
+            state = self._get_sequence_state(sequence)
+            if (
+                state.pending_transaction_index is not None
+                or state.active_lease_index is not None
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("grouped producer has not retired")
+            if num_tokens > state.committed_tokens:
+                raise ValueError("resume exceeds completed state")
+            groups = []
+            for runtime in self._group_runtimes:
+                descriptor = runtime.descriptor
+                if descriptor.storage_spec.kind.value != "mha":
+                    raise ValueError("grouped resume supports paged MHA state only")
+                size = descriptor.storage_spec.page_size
+                required = tuple(
+                    retained_page_range(
+                        descriptor.retention,
+                        layer_id=descriptor.layer_ids[0],
+                        sequence_length=num_tokens,
+                        page_size=size,
+                    )
+                )
+                table = {e.logical_block: e for e in state.group_tables[descriptor.name]}
+                entries = []
+                for block in required:
+                    entry = table.get(block)
+                    valid = min(size, num_tokens - block * size)
+                    if entry is None or entry.valid_tokens < valid:
+                        raise ValueError("no common valid resume boundary across retained groups")
+                    entries.append(GroupPageTableEntry(block, entry.page, valid))
+                groups.append((descriptor.name, tuple(entries)))
+            pinned = []
+            try:
+                for name, entries in groups:
+                    allocator = self._runtime_by_name[name].allocator
+                    for entry in entries:
+                        allocator.pin_page(entry.page)
+                        pinned.append((allocator, entry.page))
+            except BaseException:
+                for allocator, page in reversed(pinned):
+                    allocator.unpin_page(page, safe_epoch=self.current_epoch)
+                raise
+            self._next_snapshot += 1
+            snapshot = GroupedPrefixSnapshot(
+                id(self), self._next_snapshot, num_tokens, tuple(groups)
+            )
+            self._prefix_snapshots[snapshot.snapshot_id] = snapshot
+            return snapshot
+
+    def unpin_prefix(self, snapshot: GroupedPrefixSnapshot) -> None:
+        """Drop publisher pins after its final borrower; never flatten logical gaps."""
+        with self._lock:
+            if (
+                snapshot.manager_id != id(self)
+                or self._prefix_snapshots.get(snapshot.snapshot_id) is not snapshot
+            ):
+                raise ValueError("snapshot is expired or belongs to another grouped manager")
+            for name, entries in snapshot.groups:
+                allocator = self._runtime_by_name[name].allocator
+                for entry in entries:
+                    allocator.unpin_page(entry.page, safe_epoch=self.current_epoch)
+            del self._prefix_snapshots[snapshot.snapshot_id]
+            self.advance_epoch(self.current_epoch)
+
+    def attach_pinned_prefix(
+        self, sequence: SequenceHandle, snapshot: GroupedPrefixSnapshot
+    ) -> int:
+        """Acquire all group refs before publishing a common resident resume."""
+        with self._lock:
+            state = self._get_sequence_state(sequence)
+            if (
+                snapshot.manager_id != id(self)
+                or self._prefix_snapshots.get(snapshot.snapshot_id) is not snapshot
+            ):
+                raise ValueError("snapshot is expired or belongs to another grouped manager")
+            if state.committed_tokens or any(state.group_tables.values()):
+                raise ValueError("grouped resume requires an empty sequence")
+            if (
+                state.pending_transaction_index is not None
+                or state.active_lease_index is not None
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("grouped resume requires an idle sequence")
+            require_int(snapshot.logical_position, "resume position", minimum=1)
+            if snapshot.logical_position > self.max_sequence_tokens:
+                raise ValueError("resume exceeds sequence limit")
+            if tuple(name for name, _ in snapshot.groups) != tuple(self._runtime_by_name):
+                raise ValueError("resume must cover all groups in order")
+            for name, entries in snapshot.groups:
+                runtime = self._runtime_by_name[name]
+                descriptor = runtime.descriptor
+                size = descriptor.storage_spec.page_size
+                required = tuple(
+                    retained_page_range(
+                        descriptor.retention,
+                        layer_id=descriptor.layer_ids[0],
+                        sequence_length=snapshot.logical_position,
+                        page_size=size,
+                    )
+                )
+                if tuple(e.logical_block for e in entries) != required:
+                    raise ValueError("resume is missing retained logical blocks")
+                if len({e.page for e in entries}) != len(entries):
+                    raise ValueError("duplicate resume pages")
+                for entry in entries:
+                    meta = runtime.allocator.get_meta(entry.page)
+                    valid = min(size, snapshot.logical_position - entry.logical_block * size)
+                    if (
+                        not meta.is_pinned
+                        or meta.valid_tokens < valid
+                        or entry.valid_tokens != valid
+                    ):
+                        raise ValueError("resume generation or per-group validity changed")
+            acquired = []
+            try:
+                for name, entries in snapshot.groups:
+                    allocator = self._runtime_by_name[name].allocator
+                    for entry in entries:
+                        allocator.acquire_request_ref(entry.page)
+                        acquired.append((allocator, entry.page))
+            except BaseException:
+                for allocator, page in reversed(acquired):
+                    allocator.release_request_ref(page, safe_epoch=self.current_epoch)
+                raise
+            state.group_tables = {name: list(entries) for name, entries in snapshot.groups}
+            state.committed_tokens = snapshot.logical_position
+            state.version += 1
+            return snapshot.logical_position
+
+    def fork_sequence(
+        self, source: SequenceHandle, destination: SequenceHandle, *, num_tokens: int | None = None
+    ) -> int:
+        """Share an all-group resident checkpoint; future writers copy shared tails."""
+        with self._lock:
+            tokens = (
+                self.get_sequence(source).committed_tokens if num_tokens is None else num_tokens
+            )
+            snapshot = self.pin_prefix(source, tokens)
+            try:
+                return self.attach_pinned_prefix(destination, snapshot)
+            finally:
+                self.unpin_prefix(snapshot)
+
     def try_reserve(
         self,
         transaction: MemoryTransactionHandle,
@@ -404,6 +577,17 @@ class KVCacheGroupManager:
                     )
                 )
                 missing = tuple(block for block in write_blocks if block not in existing_blocks)
+                cow_blocks = tuple(
+                    entry.logical_block
+                    for entry in state.group_tables[runtime.descriptor.name]
+                    if entry.logical_block in write_blocks
+                    and entry.valid_tokens < page_size
+                    and (
+                        not runtime.allocator.get_meta(entry.page).can_mutate
+                        or runtime.allocator.get_meta(entry.page).valid_tokens != entry.valid_tokens
+                    )
+                )
+                missing = cow_blocks + missing
                 missing_by_group[runtime.descriptor.name] = missing
             required_pages = sum(len(pages) for pages in missing_by_group.values())
             # Pre-flight capacity check: fail before allocating anywhere.
@@ -601,6 +785,12 @@ class KVCacheGroupManager:
                 step_id=lease_handle.step_id,
                 lease=lease_handle,
                 sequences=tuple(sequence_views),
+                copies=tuple(
+                    copy
+                    for h in lease.reservation_handles
+                    for plan in self._get_reservation(h).group_plans
+                    for copy in plan.copies
+                ),
             )
 
     def validate_execution_view(self, view: GroupedExecutionMemoryView) -> None:
@@ -707,6 +897,10 @@ class KVCacheGroupManager:
                                 safe_epoch=self.current_epoch,
                             )
                     state.group_tables[plan.group_name] = retained_entries
+                    for copy in plan.copies:
+                        runtime.allocator.release_request_ref(
+                            copy.source, safe_epoch=self.current_epoch
+                        )
                 record.committed = True
             LifecycleTransitions.transition_lease(
                 lease, expected=LeaseState.IN_FLIGHT, target=LeaseState.COMMITTED
@@ -1109,7 +1303,7 @@ class KVCacheGroupManager:
                             raise InvariantViolationError(
                                 "group page table refers to a non-live page"
                             )
-                        if meta.valid_tokens != entry.valid_tokens:
+                        if meta.valid_tokens < entry.valid_tokens:
                             raise InvariantViolationError(
                                 "group page-table token count disagrees with allocator"
                             )
@@ -1180,6 +1374,12 @@ class KVCacheGroupManager:
         # Existing blocks keep their committed pages; missing blocks get the
         # newly reserved ones.
         page_by_block = {entry.logical_block: entry.page for entry in existing_entries}
+        prior = {entry.logical_block: entry for entry in existing_entries}
+        copies = tuple(
+            KVPageCopy(prior[block].page, page, prior[block].valid_tokens, runtime.descriptor.name)
+            for block, page in zip(missing_blocks, allocated_pages, strict=True)
+            if block in prior
+        )
         page_by_block.update(dict(zip(missing_blocks, allocated_pages, strict=True)))
         page_size = runtime.descriptor.storage_spec.page_size
         write_slots = []
@@ -1215,6 +1415,7 @@ class KVCacheGroupManager:
             planned_page_table=planned_entries,
             allocated_pages=allocated_pages,
             write_slots=tuple(write_slots),
+            copies=copies,
         )
 
     def _rollback_transaction_locked(self, tx: _TransactionRecord) -> None:

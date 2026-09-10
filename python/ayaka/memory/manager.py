@@ -37,7 +37,12 @@ from ayaka.memory.pressure import (
     PressureStatus,
     SequencePreemptionResult,
 )
-from ayaka.memory.sequence import PageTableEntry, SequenceArena, SequenceMemorySnapshot
+from ayaka.memory.sequence import (
+    PageTableEntry,
+    SequenceArena,
+    SequenceMemorySnapshot,
+    SequencePageTable,
+)
 from ayaka.memory.state import LeaseState, PageAllocationState, ReleaseStatus, ReservationFailure
 from ayaka.memory.tiering import (
     HostKVStorage,
@@ -59,6 +64,7 @@ from ayaka.memory.transaction import (
 from ayaka.memory.views import (
     CacheView,
     ExecutionMemoryView,
+    KVPageCopy,
     KVWriteSlot,
     LeakReport,
     MemorySnapshot,
@@ -72,6 +78,7 @@ from ayaka.prefix.identity import (
 )
 from ayaka.prefix.interface import CachedBlockInfo, PrefixLookupResult, PrefixMatch
 from ayaka.prefix.store import RadixPagePrefixCache
+from ayaka.utils.validation import require_int
 
 
 class RuntimeMemoryManager:
@@ -339,6 +346,103 @@ class RuntimeMemoryManager:
     def get_sequence(self, sequence: SequenceHandle) -> SequenceMemorySnapshot:
         """Return an immutable snapshot of a sequence's KV state."""
         return self.sequences.get(sequence)
+
+    def pin_prefix(self, sequence: SequenceHandle, num_tokens: int) -> tuple[PageTableEntry, ...]:
+        """Pin a completed prefix, including partial tails, without copying bytes.
+
+        The caller must unpin every returned entry exactly once. Pins freeze
+        source bytes: subsequent appends reserve COW destinations. A truncated
+        final entry deliberately exposes fewer positions than the physical page.
+        Busy producers cannot publish even when some layers have finished.
+        """
+        require_int(num_tokens, "num_tokens", minimum=1)
+        with self._lock:
+            state = self.get_sequence(sequence)
+            if (
+                state.busy
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("prefix producer has not retired successfully")
+            if num_tokens > state.committed_tokens:
+                raise ValueError("prefix exceeds completed KV")
+            entries = tuple(
+                PageTableEntry(entry.page, min(self.page_size, num_tokens - i * self.page_size))
+                for i, entry in enumerate(state.page_table[: ceil(num_tokens / self.page_size)])
+            )
+            acquired = []
+            try:
+                for entry in entries:
+                    self.allocator.pin_page(entry.page)
+                    acquired.append(entry)
+            except BaseException:
+                self.unpin_prefix(tuple(acquired))
+                raise
+            return entries
+
+    def unpin_prefix(self, entries: tuple[PageTableEntry, ...]) -> None:
+        """Release the publisher's pins; request/lease owners remain independent."""
+        with self._lock:
+            for entry in entries:
+                self.allocator.unpin_page(entry.page, safe_epoch=self.current_epoch)
+            self.allocator.advance_epoch(self.current_epoch)
+
+    def attach_pinned_prefix(
+        self, sequence: SequenceHandle, entries: tuple[PageTableEntry, ...]
+    ) -> int:
+        """Revalidate generations and acquire all refs before publishing a resume.
+
+        This operation accepts only pinned immutable resident pages from this
+        manager. It does not turn a raw token match into valid state. The caller
+        must validate model/context/token identity using its prefix registry.
+        """
+        with self._lock, self.sequences.mutate(sequence) as state:
+            if state.committed_tokens or state.page_table.entries:
+                raise InvalidStateTransitionError("resume requires an empty sequence")
+            if (
+                state.pending_transaction_index is not None
+                or state.active_lease_index is not None
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("resume requires an idle sequence")
+            tokens = sum(e.valid_tokens for e in entries)
+            SequencePageTable(list(entries)).validate(
+                committed_tokens=tokens, page_size=self.page_size
+            )
+            if self.max_sequence_tokens is not None and tokens > self.max_sequence_tokens:
+                raise ValueError("resume exceeds sequence limit")
+            for entry in entries:
+                meta = self.allocator.get_meta(entry.page)
+                if not meta.is_pinned or meta.valid_tokens < entry.valid_tokens:
+                    raise InvalidStateTransitionError("resume source is not immutable and valid")
+            acquired = []
+            try:
+                for entry in entries:
+                    self.allocator.acquire_request_ref(entry.page)
+                    acquired.append(entry.page)
+            except BaseException:
+                for page in reversed(acquired):
+                    self.allocator.release_request_ref(page, safe_epoch=self.current_epoch)
+                raise
+            state.page_table.entries = list(entries)
+            state.committed_tokens = tokens
+            state.version += 1
+            return tokens
+
+    def fork_sequence(
+        self, source: SequenceHandle, destination: SequenceHandle, *, num_tokens: int | None = None
+    ) -> int:
+        """Share completed pages, including a read-only tail; append uses COW."""
+        with self._lock:
+            tokens = (
+                self.get_sequence(source).committed_tokens if num_tokens is None else num_tokens
+            )
+            entries = self.pin_prefix(source, tokens)
+            try:
+                return self.attach_pinned_prefix(destination, entries)
+            finally:
+                self.unpin_prefix(entries)
 
     def cache_prefix(
         self,
@@ -1023,6 +1127,17 @@ class RuntimeMemoryManager:
                     attached_prefix_tokens // self.page_size
                 )
                 required_new_pages = required_total_pages - existing_page_count
+                old_entries = state.page_table.snapshot()
+                cow_tail = bool(
+                    old_entries
+                    and old_entries[-1].valid_tokens < self.page_size
+                    and (
+                        not self.allocator.get_meta(old_entries[-1].page).can_mutate
+                        or self.allocator.get_meta(old_entries[-1].page).valid_tokens
+                        != old_entries[-1].valid_tokens
+                    )
+                )
+                required_new_pages += int(cow_tail)
 
                 if (
                     self.max_sequence_tokens is not None and final_tokens > self.max_sequence_tokens
@@ -1066,9 +1181,18 @@ class RuntimeMemoryManager:
                     )
                     # Plan the full post-append table; the committed table is
                     # unchanged until execution succeeds.
+                    copies = ()
+                    append_pages = allocated
+                    if cow_tail:
+                        tail = old_entries[-1]
+                        copies = (KVPageCopy(tail.page, allocated[0], tail.valid_tokens),)
+                        old_entries = old_entries[:-1] + (
+                            PageTableEntry(allocated[0], tail.valid_tokens),
+                        )
+                        append_pages = allocated[1:]
                     planned_table, write_slots = self._plan_append(
-                        state.page_table.snapshot() + prefix_entries,
-                        allocated,
+                        old_entries + prefix_entries,
+                        append_pages,
                         base_committed_tokens=execution_base_tokens,
                         num_new_tokens=num_new_tokens,
                     )
@@ -1095,6 +1219,7 @@ class RuntimeMemoryManager:
                     allocated_pages=allocated,
                     acquired_prefix_pages=acquired_prefix_pages,
                     write_slots=write_slots,
+                    copies=copies,
                 )
                 self._reservations[index] = record
                 tx.reservation_handles.append(reservation_handle)
@@ -1208,6 +1333,11 @@ class RuntimeMemoryManager:
                 page_size=self.page_size,
                 padding_page=self.padding_physical_page,
                 padding_slot=self.padding_slot,
+                copies=tuple(
+                    copy
+                    for h in lease.reservation_handles
+                    for copy in self._get_reservation(h).copies
+                ),
             )
 
     def validate_execution_view(self, view: ExecutionMemoryView) -> None:
@@ -1278,6 +1408,9 @@ class RuntimeMemoryManager:
                     state.page_table.entries = list(record.planned_page_table)
                     state.committed_tokens = record.execution_base_tokens + record.num_new_tokens
                     state.version += 1
+
+                for copy in record.copies:
+                    self.allocator.release_request_ref(copy.source, safe_epoch=self.current_epoch)
 
             for record in records:
                 record.committed = True
@@ -1553,7 +1686,7 @@ class RuntimeMemoryManager:
                             raise InvariantViolationError(
                                 "committed page table refers to a non-live page"
                             )
-                        if meta.valid_tokens != entry.valid_tokens:
+                        if meta.valid_tokens < entry.valid_tokens:
                             raise InvariantViolationError(
                                 "page-table and allocator token counts disagree"
                             )

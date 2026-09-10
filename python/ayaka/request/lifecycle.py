@@ -20,6 +20,7 @@ from ayaka.utils.validation import require_int
 
 _MAX_RETRIES = 3
 
+
 class UnknownRequest(KeyError):
     """A report referenced a request the manager has never seen."""
 
@@ -352,19 +353,20 @@ _OUTCOME_STATE: dict[RequestOutcome, RequestState | None] = {
 class LifecycleManager:
     """Registry + the outcome→transition translation."""
 
-    __slots__ = ("_active", "_finished", "_last_step_id", "_max_retries")
+    __slots__ = ("_active", "_finished", "_last_step_id", "_max_retries", "_clock")
 
-    def __init__(self, *, max_retries: int = _MAX_RETRIES) -> None:
+    def __init__(self, *, max_retries: int = _MAX_RETRIES, clock: Clock | None = None) -> None:
         self._active: dict[str, RequestLifecycle] = {}
         self._finished: dict[str, RequestLifecycle] = {}
         self._max_retries = max_retries
         self._last_step_id = -1
+        self._clock = clock
 
     def create(self, request: Request) -> RequestLifecycle:
         rid = str(request.request_id)
         if rid in self._active or rid in self._finished:
             raise ValueError(f"duplicate request_id {rid!r}")
-        lc = RequestLifecycle(request, max_retries=self._max_retries)
+        lc = RequestLifecycle(request, max_retries=self._max_retries, clock=self._clock)
         self._active[rid] = lc
         return lc
 
@@ -502,7 +504,8 @@ class LifecycleManager:
             reaped = tuple(self._finished)
             self._finished.clear()
             return reaped
-        cutoff = time.monotonic_ns() - older_than_ns
+        now_ns = self._clock.now().as_nanos() if self._clock is not None else time.monotonic_ns()
+        cutoff = now_ns - older_than_ns
         reaped = tuple(
             rid for rid, lc in self._finished.items() if lc.machine.finished_ns <= cutoff
         )
