@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Any, cast
 
 import torch
 import triton
@@ -146,7 +147,7 @@ def _launch_rotary(
         positions.numel(),
         triton.cdiv(num_heads * embed_dim, _BLOCK_SIZE),
     )
-    _rotary_embedding_kernel[grid](
+    cast(Any, _rotary_embedding_kernel)[grid](
         positions,
         tensor,
         cos_sin_cache,

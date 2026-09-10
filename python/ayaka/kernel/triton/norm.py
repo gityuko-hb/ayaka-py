@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Any, cast
 
 import torch
 import triton
@@ -345,7 +346,7 @@ def _launch_rms_norm(
     if rows == 0:
         return output
     with torch.cuda.device(input.device):
-        _rms_norm_kernel[(rows,)](
+        cast(Any, _rms_norm_kernel)[(rows,)](
             input,
             weight,
             output,
@@ -402,7 +403,7 @@ def rms_norm_quant(
     if rows == 0:
         return output
     with torch.cuda.device(input.device):
-        _rms_norm_quant_kernel[(rows,)](
+        cast(Any, _rms_norm_quant_kernel)[(rows,)](
             input,
             weight,
             output,
@@ -438,7 +439,7 @@ def qk_rms_norm(
         return output
 
     with torch.cuda.device(input.device):
-        _qk_rms_norm_kernel[(batch_size * num_heads,)](
+        cast(Any, _qk_rms_norm_kernel)[(batch_size * num_heads,)](
             input,
             weight,
             output,
@@ -505,7 +506,7 @@ def _fused_add_impl(
     scale_ptr = quant_scale if quant_scale is not None else rstd
 
     with torch.cuda.device(input.device):
-        _fused_add_prepare_kernel[(rows,)](
+        cast(Any, _fused_add_prepare_kernel)[(rows,)](
             input,
             residual,
             scratch,
@@ -518,7 +519,7 @@ def _fused_add_impl(
             num_warps=_NUM_WARPS,
         )
         grid = (rows, triton.cdiv(d, _BLOCK_SIZE))
-        _fused_add_apply_kernel[grid](
+        cast(Any, _fused_add_apply_kernel)[grid](
             scratch,
             rstd,
             weight,
@@ -621,7 +622,7 @@ def layer_norm(
     beta_ptr = beta if beta is not None else weight
 
     with torch.cuda.device(input.device):
-        _layer_norm_kernel[(rows,)](
+        cast(Any, _layer_norm_kernel)[(rows,)](
             input,
             weight,
             beta_ptr,

@@ -1,16 +1,14 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.libdevice import tanh as _tanh
 
-try:
-    from triton.language.extra.libdevice import tanh
-except ModuleNotFoundError:  # NGC Triton packaging
-    try:
-        from triton.language.extra.cuda.libdevice import tanh
-    except ModuleNotFoundError:  # Triton 2.x compatibility
-        from triton.language.math import tanh
+# Triton's libdevice stubs also describe interpreter-only None results.
+tanh: Any = _tanh
 
 _ACT_SILU = 0
 _ACT_GELU = 1
@@ -115,7 +113,7 @@ def _act_and_mul(
     num_rows = input.numel() // last_dim
     grid = (num_rows, triton.cdiv(d, _BLOCK_SIZE))
     with torch.cuda.device(input.device):
-        _act_and_mul_kernel[grid](
+        cast(Any, _act_and_mul_kernel)[grid](
             input,
             output,
             d,
@@ -153,7 +151,7 @@ def gelu_quick(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Te
 
     grid = (triton.cdiv(input.numel(), _BLOCK_SIZE),)
     with torch.cuda.device(input.device):
-        _gelu_quick_kernel[grid](
+        cast(Any, _gelu_quick_kernel)[grid](
             input,
             output,
             input.numel(),
