@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ayaka.kernel.ops import custom_op
+
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _BLOCK_SIZE = 256
 _NUM_WARPS = 4
@@ -163,29 +165,70 @@ def _launch_rotary(
     )
 
 
-def rotary_embedding(
+def _apply_rotary_ref(
+    tensor: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_size: int,
+    is_neox: bool,
+) -> torch.Tensor:
+    rot_dim = cos_sin_cache.shape[1]
+    embed_dim = rot_dim // 2
+    flat_positions = positions.flatten()
+    num_tokens = flat_positions.numel()
+    num_heads = tensor.numel() // (num_tokens * head_size)
+
+    flat_tensor = tensor.view(num_tokens, num_heads, head_size)
+    cache = cos_sin_cache[flat_positions]
+    cos = cache[:, :embed_dim].unsqueeze(1).float()
+    sin = cache[:, embed_dim:rot_dim].unsqueeze(1).float()
+
+    if is_neox:
+        x = flat_tensor[..., :embed_dim].float()
+        y = flat_tensor[..., embed_dim:rot_dim].float()
+        out_x = (x * cos - y * sin).to(tensor.dtype)
+        out_y = (y * cos + x * sin).to(tensor.dtype)
+        flat_tensor[..., :embed_dim] = out_x
+        flat_tensor[..., embed_dim:rot_dim] = out_y
+    else:
+        x = flat_tensor[..., :rot_dim:2].float()
+        y = flat_tensor[..., 1:rot_dim:2].float()
+        out_x = (x * cos - y * sin).to(tensor.dtype)
+        out_y = (y * cos + x * sin).to(tensor.dtype)
+        flat_tensor[..., :rot_dim:2] = out_x
+        flat_tensor[..., 1:rot_dim:2] = out_y
+    return tensor
+
+
+def _rotary_embedding_inplace_ref(
     positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor | None,
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary embeddings in place.
+) -> None:
+    _apply_rotary_ref(query, positions, cos_sin_cache, head_size, is_neox)
+    if key is not None:
+        _apply_rotary_ref(key, positions, cos_sin_cache, head_size, is_neox)
 
-    Args:
-        positions: Contiguous int64 tensor shaped ``[tokens]`` or ``[batch, seq]``.
-        query: Query tensor with flattened or explicit head dimensions.
-        key: Optional key tensor using the same token dimensions.
-        head_size: Full head dimension.  Only the first ``rot_dim`` elements rotate.
-        cos_sin_cache: ``[max_position, rot_dim]`` with cosine then sine halves.
-        is_neox: ``True`` for split-half NeoX layout, ``False`` for GPT-J pairs.
 
-    Returns:
-        ``query`` when ``key`` is ``None``; otherwise ``(query, key)``.  Returned
-        tensors alias the inputs because the operation is in place.
-    """
-
+@custom_op(
+    namespace="ayaka",
+    name="rotary_embedding",
+    mutates_args=["query", "key"],
+    out_shape=None,
+    reference=_rotary_embedding_inplace_ref,
+    dispatch_key="CUDA",
+)
+def _rotary_embedding_impl(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
     _validate_positions(positions)
     if not isinstance(head_size, int) or head_size <= 0:
         raise ValueError("head_size must be a positive integer")
@@ -243,6 +286,39 @@ def rotary_embedding(
                 bool(is_neox),
             )
 
+    return None
+
+
+def rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary embeddings in place.
+
+    Args:
+        positions: Contiguous int64 tensor shaped ``[tokens]`` or ``[batch, seq]``.
+        query: Query tensor with flattened or explicit head dimensions.
+        key: Optional key tensor using the same token dimensions.
+        head_size: Full head dimension.  Only the first ``rot_dim`` elements rotate.
+        cos_sin_cache: ``[max_position, rot_dim]`` with cosine then sine halves.
+        is_neox: ``True`` for split-half NeoX layout, ``False`` for GPT-J pairs.
+
+    Returns:
+        ``query`` when ``key`` is ``None``; otherwise ``(query, key)``.  Returned
+        tensors alias the inputs because the operation is in place.
+    """
+    _rotary_embedding_impl(
+        positions,
+        query,
+        key,
+        head_size,
+        cos_sin_cache,
+        is_neox,
+    )
     if key is None:
         return query
     return query, key

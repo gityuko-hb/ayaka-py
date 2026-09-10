@@ -3,8 +3,11 @@ from __future__ import annotations
 from typing import Any, cast
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+from ayaka.kernel.ops import custom_op
 
 _SUPPORTED_INPUT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _BLOCK_SIZE = 256
@@ -362,6 +365,41 @@ def _launch_rms_norm(
     return output
 
 
+def _rms_norm_ref(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    variance = input.float().pow(2).mean(-1, keepdim=True)
+    res = (input.float() * torch.rsqrt(variance + eps) * weight.float()).to(input.dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
+    return res
+
+
+def _gemma_rms_norm_ref(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    variance = input.float().pow(2).mean(-1, keepdim=True)
+    res = (input.float() * torch.rsqrt(variance + eps) * (weight.float() + 1.0)).to(input.dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
+    return res
+
+
+@custom_op(
+    namespace="ayaka",
+    name="rms_norm",
+    out_shape="input",
+    reference=_rms_norm_ref,
+    dispatch_key="CUDA",
+)
 def rms_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -369,10 +407,16 @@ def rms_norm(
     eps: float = 1e-5,
 ) -> torch.Tensor:
     """Compute row-wise RMSNorm with CUDA-compatible FP32 accumulation."""
-
     return _launch_rms_norm(input, weight, out, eps, 0.0)
 
 
+@custom_op(
+    namespace="ayaka",
+    name="gemma_rms_norm",
+    out_shape="input",
+    reference=_gemma_rms_norm_ref,
+    dispatch_key="CUDA",
+)
 def gemma_rms_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -380,7 +424,6 @@ def gemma_rms_norm(
     eps: float = 1e-5,
 ) -> torch.Tensor:
     """Gemma RMSNorm: multiply by ``1 + weight`` after normalization."""
-
     return _launch_rms_norm(input, weight, out, eps, 1.0)
 
 
@@ -420,6 +463,27 @@ def rms_norm_quant(
     return output
 
 
+def _qk_rms_norm_ref(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    variance = input.float().pow(2).mean(-1, keepdim=True)
+    res = (input.float() * torch.rsqrt(variance + eps) * weight.float()).to(input.dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
+    return res
+
+
+@custom_op(
+    namespace="ayaka",
+    name="qk_rms_norm",
+    out_shape="input",
+    reference=_qk_rms_norm_ref,
+    dispatch_key="CUDA",
+)
 def qk_rms_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -536,6 +600,50 @@ def _fused_add_impl(
     return output if quantize else None
 
 
+def _fused_add_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return input, residual
+
+
+def _fused_add_rms_norm_ref(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    residual.add_(input)
+    variance = residual.float().pow(2).mean(-1, keepdim=True)
+    normed = (residual.float() * torch.rsqrt(variance + eps) * weight.float()).to(input.dtype)
+    input.copy_(normed)
+    return input, residual
+
+
+def _gemma_fused_add_rms_norm_ref(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    residual.add_(input)
+    variance = residual.float().pow(2).mean(-1, keepdim=True)
+    scale = weight.float() + 1.0
+    normed = (residual.float() * torch.rsqrt(variance + eps) * scale).to(input.dtype)
+    input.copy_(normed)
+    return input, residual
+
+
+@custom_op(
+    namespace="ayaka",
+    name="fused_add_rms_norm",
+    mutates_args=["input", "residual"],
+    fake_impl=_fused_add_fake,
+    reference=_fused_add_rms_norm_ref,
+    dispatch_key="CUDA",
+)
 def fused_add_rms_norm(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -543,7 +651,6 @@ def fused_add_rms_norm(
     eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """In-place ``residual = input + residual`` and ``input = RMSNorm(sum)``."""
-
     _fused_add_impl(
         input,
         residual,
@@ -556,6 +663,14 @@ def fused_add_rms_norm(
     return input, residual
 
 
+@custom_op(
+    namespace="ayaka",
+    name="gemma_fused_add_rms_norm",
+    mutates_args=["input", "residual"],
+    fake_impl=_fused_add_fake,
+    reference=_gemma_fused_add_rms_norm_ref,
+    dispatch_key="CUDA",
+)
 def gemma_fused_add_rms_norm(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -602,6 +717,33 @@ def fused_add_rms_norm_quant(
     return output
 
 
+def _layer_norm_ref(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    beta: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    res = F.layer_norm(
+        input.float(),
+        (input.shape[-1],),
+        weight=weight.float() if weight is not None else None,
+        bias=beta.float() if beta is not None else None,
+        eps=eps,
+    ).to(input.dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
+    return res
+
+
+@custom_op(
+    namespace="ayaka",
+    name="layer_norm",
+    out_shape="input",
+    reference=_layer_norm_ref,
+    dispatch_key="CUDA",
+)
 def layer_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
