@@ -19,12 +19,13 @@ __all__ = [
 class RequestState(enum.StrEnum):
     """Finite State Machine enumeration tracking an inference request's full lifecycle."""
 
-    # 10 Main Pipeline States 
+    # 10 Main Pipeline States
     CREATED = "created"
     """The request has been instantiated from the client payload but not yet validated."""
 
     VALIDATING = "validating"
-    """The request parameters (sampling parameters, max tokens, stop sequences) are being verified."""
+    """The request parameters
+    (sampling parameters, max tokens, stop sequences) are being verified."""
 
     TOKENIZING = "tokenizing"
     """Raw prompt strings are being encoded into token ID sequences."""
@@ -36,7 +37,8 @@ class RequestState(enum.StrEnum):
     """The request is queued in the scheduler, waiting for compute slots and KV block allocation."""
 
     ADMITTED = "admitted"
-    """KV blocks have been pinned in physical GPU memory, but no computation kernel has executed yet."""
+    """KV blocks have been pinned in physical GPU memory,
+        but no computation kernel has executed yet."""
 
     PREFILL = "prefill"
     """The engine is executing context prefill kernels over un-cached prompt tokens."""
@@ -48,35 +50,44 @@ class RequestState(enum.StrEnum):
     """The newly generated token is being pushed to the client stream (SSE / gRPC / WebSocket)."""
 
     FINISHED = "finished"
-    """Terminal state: generation completed successfully (hit stop sequence, EOS, or max token limits)."""
+    """Terminal state: generation completed successfully
+        (hit stop sequence, EOS, or max token limits)."""
 
-    # 9 Auxiliary & Scheduling States 
+    # 9 Auxiliary & Scheduling States
     WAITING_KV = "waiting_kv"
-    """The request passed admission criteria but is stalled waiting for local GPU KV blocks to free up."""
+    """The request passed admission criteria but is stalled
+        waiting for local GPU KV blocks to free up."""
 
     WAITING_REMOTE_KV = "waiting_remote_kv"
     """Stalled waiting for remote/disaggregated KV cache blocks to transfer across the network."""
 
     PREEMPTED = "preempted"
-    """Evicted under GPU memory pressure; KV blocks dropped. Re-admission requires full prompt recomputation."""
+    """Evicted under GPU memory pressure; KV blocks dropped.
+        Re-admission requires full prompt recomputation."""
 
     SWAPPED = "swapped"
-    """Evicted under GPU memory pressure; KV blocks swapped to host-pinned RAM. Re-admission requires H2D copy only."""
+    """Evicted under GPU memory pressure; KV blocks swapped to host-pinned RAM.
+        Re-admission requires H2D copy only."""
 
     PAUSED = "paused"
-    """Temporarily suspended due to client backpressure or rate limits; GPU KV blocks remain held."""
+    """Temporarily suspended due to client backpressure or rate limits;
+        GPU KV blocks remain held."""
 
     MIGRATING = "migrating"
-    """Active KV state is being transferred across ranks/nodes (Prefill-to-Decode disaggregation or rebalancing)."""
+    """Active KV state is being transferred across ranks/nodes
+        (Prefill-to-Decode disaggregation or rebalancing)."""
 
     RETRYING = "retrying"
-    """Transient engine error encountered; request is restarting from the admission queue or cache lookup."""
+    """Transient engine error encountered;
+    request is restarting from the admission queue or cache lookup."""
 
     CANCELLED = "cancelled"
-    """Terminal state: aborted early by client disconnect, timeout, or explicit cancellation signal."""
+    """Terminal state: aborted early by client disconnect, timeout,
+    or explicit cancellation signal."""
 
     FAILED = "failed"
-    """Terminal state: unrecoverable runtime failure (e.g., CUDA OOM, driver crash, model execution fault)."""
+    """Terminal state: unrecoverable runtime failure
+    (e.g., CUDA OOM, driver crash, model execution fault)."""
 
 
 MAIN_STATES: frozenset[RequestState] = frozenset(

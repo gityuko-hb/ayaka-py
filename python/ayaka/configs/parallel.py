@@ -11,7 +11,7 @@ class AllToAllBackend(enum.StrEnum):
     """
 
     AUTO = "auto"
-    """Automatically selects the optimal backend based on hardware topology and library availability."""
+    """Automatic select the optimal backend-base on hardware topology and library availability."""
 
     NCCL = "nccl"
     """NVIDIA Collective Communications Library.
@@ -37,5 +37,5 @@ class AllToAllBackend(enum.StrEnum):
 
     @property
     def supports_computation_overlap(self) -> bool:
-        """Whether the backend natively supports fine-grained communication-computation pipelining."""
+        """Whether the backend native supports fine-grained communication-computation pipelining."""
         return self in (AllToAllBackend.DEEPEP, AllToAllBackend.NVSHMEM)

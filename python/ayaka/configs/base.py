@@ -60,12 +60,12 @@ def _canonical(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _canonical(item) for key, item in sorted(value.items())}
     if isinstance(value, FrozenMapping):
-        return {key: _canonical(item) for key, item in value}
+        return {str(key): _canonical(item) for key, item in value}
     if bool(value) and isinstance(value, tuple) and all(
-        isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+        isinstance(item, tuple) and len(item) == 2 and type(item[0]) is str
         for item in value
     ):
-        return {key: _canonical(item) for key, item in value}
+        return {str(key): _canonical(item) for key, item in value}
     if isinstance(value, (tuple, list, set, frozenset)):
         return [_canonical(item) for item in value]
     return value

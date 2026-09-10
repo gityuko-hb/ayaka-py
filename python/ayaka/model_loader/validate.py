@@ -8,6 +8,7 @@ from ayaka.types import DType
 from ayaka.weights.plan import CheckpointManifest, ManifestEntry
 from ayaka.weights.spec import WeightSpec
 
+
 @dataclass(frozen=True, slots=True)
 class WeightMismatch:
     """One weight whose checkpoint entry disagrees with the expectation."""
@@ -21,18 +22,18 @@ class WeightMismatch:
         return (
             f"{self.name}: {self.reason} (expected {self.expected}, checkpoint has {self.actual})"
         )
-        
+
 @dataclass(frozen=True, slots=True)
 class WeightDiff:
     """Every disagreement between the model and the checkpoint, at once."""
-    
-    missing: tuple[str, ...] = () 
+
+    missing: tuple[str, ...] = ()
     unexpected: tuple[str, ...] = ()
     incompatible: tuple[WeightMismatch, ...] = ()
     bad_tied: tuple[WeightMismatch, ...] = ()
     matched: tuple[str, ...] = ()
     optional_absent: tuple[str, ...] = field(default=())
-    
+
     @property
     def ok(self) -> bool:
         return not (self.missing or self.unexpected or self.incompatible or self.bad_tied)
@@ -49,7 +50,7 @@ class WeightDiff:
         if self.optional_absent:
             parts.append(f"{len(self.optional_absent)} optional absent")
         return ", ".join(parts)
-    
+
     def report(self, *, limit: int = 8) -> str:
         """Human-readable, truncated per category rather than overall.
 
@@ -76,7 +77,7 @@ class WeightDiff:
             return
         where = f"{context}: " if context else ""
         raise WeightMismatchError(f"{where}checkpoint does not match the model\n{self.report()}")
-        
+
 def _dtype_compatible(expected: DType, actual: DType) -> bool:
     """Whether a checkpoint dtype can feed an expected one.
 
@@ -85,7 +86,7 @@ def _dtype_compatible(expected: DType, actual: DType) -> bool:
     checkpoint as bf16 without a convert is a five-order-of-magnitude error in
     every value, and it produces no shape complaint at all.
     """
-    
+
     if expected is actual:
         return True
     return actual is DType.FP32 and expected in (DType.BF16, DType.FP16)
@@ -98,13 +99,13 @@ def get_diff_weights(
     """Compare the model's expectation against what the checkpoint provides."""
     provided: dict[str, ManifestEntry] = {e.tensor_key: e for e in manifest.entries}
     expected_by_name = {w.name: w for w in expected}
-    
+
     missing: list[str] = []
     optional_absent: list[str] = []
     incompatible: list[WeightMismatch] = []
     bad_tied: list[WeightMismatch] = []
     matched: list[str] = []
-    
+
     for spec in expected:
         if spec.is_tied:
             # A tied weight must NOT be in the checkpoint — it shares storage
@@ -158,7 +159,7 @@ def get_diff_weights(
             )
         else:
             matched.append(spec.name)
-            
+
     # Tied names are legitimately absent from the checkpoint, so they must not
     # count towards `unexpected` in the reverse direction either.
     unexpected = sorted(set(provided) - set(expected_by_name))

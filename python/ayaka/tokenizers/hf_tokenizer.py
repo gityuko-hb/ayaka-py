@@ -63,13 +63,16 @@ _DEFAULT_PROBES: tuple[str, ...] = (
     # RTL writing systems and other character sets (Arabic, Cyrillic, Greek)
     "مرحبا بالعالم! Привет мир! Ελληνικά.",
 
-    # 4-byte UTF-8 characters, single emojis, and complex combinations (ZWJ sequences, Variation Selectors)
+    # 4-byte UTF-8 characters, single emojis, and complex combinations
+    # (ZWJ sequences, Variation Selectors)
     "Emoji 4-byte: 🚀 🦄 🔥 👨‍👩‍👧‍👦 🏳️‍🌈 → ⚡",
 
-    # Arithmetic, mathematical symbols, currency, and contractions (Contractions / Regex split rules)
+    # Arithmetic, mathematical symbols, currency, and contractions
+    # (Contractions / Regex split rules)
     "Prices: $1,234.56 or €99.99! They're, couldn't, isn't (π ≈ 3.14159 >= 0).",
 
-    # 8. Markup-style delimiter / simulated special token (handling the issue of special characters being swallowed)
+    # 8. Markup-style delimiter / simulated special token
+    # (handling the issue of special characters being swallowed)
     "<|im_start|>user\n<tag attr=\"val\">content</tag><|endoftext|>",
 
     # Zero-Width Space, Non-Breaking Space
@@ -206,7 +209,7 @@ class HfTokenizer:
 
     @classmethod
     def from_config(cls, config: TokenizerConfig) -> HfTokenizer:
-        """Construct an :class:`HfTokenizer` from a :class:`~ayaka.configs.tokenizer.TokenizerConfig`.
+        """Construct :class:`HfTokenizer` from a :class:`~ayaka.configs.tokenizer.TokenizerConfig`.
 
         Calls ``AutoTokenizer.from_pretrained`` with the parameters from
         *config* and wraps the result.  The ``mode`` field maps to
@@ -670,11 +673,12 @@ class HfTokenizer:
         """
         # Step 1: List bytes that have natural, printable Latin-1 glyphs.
         # Range 33..126 (ASCII printables, excluding space)
-        # Range 161..172 & 174..255 (Latin-1 supplement printables, excluding non-breaking space & soft hyphen)
+        # Range 161..172 & 174..255
+        # (Latin-1 supplement printables, excluding non-breaking space & soft hyphen)
         bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
         cs = bs[:]  # these bytes map 1:1 to their exact unicode code point
         n = 0
-        # Step 2: The remaining 70 non-printable/control bytes are shifted to U+0100 (256) and above.
+        # Step 2: The remaining 70 non-printable/control bytes are shifted to U+0100 (256) and above
         for b in range(256):
             if b not in bs:
                 bs.append(b)

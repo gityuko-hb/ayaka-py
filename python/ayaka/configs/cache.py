@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 
+
 class EvictionPolicy(enum.StrEnum):
     """Eviction strategies for physical KV-cache block managers and memory tiers.
 
@@ -9,24 +10,23 @@ class EvictionPolicy(enum.StrEnum):
     reclaiming blocks under GPU VRAM pressure or migrating blocks between
     :class:`MemoryTier` levels.
     """
-    
+
     LRU = "lru"
     """Least Recently Used: evicts blocks with the oldest access timestamp.
     Standard baseline for flat, unindex block allocators."""
-    
+
     LFU = "lfu"
     """Least Frequently Used: evicts blocks with the lowest total access counts.
     Protects long-lived, high-frequency system prompts."""
-    
+
     SLRU = "slru"
     """Segmented LRU: partitions memory into probationary and protected segments.
     Prevents cache pollution from large, single-use prompt bursts."""
-    
+
     PREFIX_AWARE = "prefix_aware"
     """Radix/Trie structure-aware eviction: evicts leaf nodes before branching roots.
     Maximizes prefix-sharing hit rates across concurrent conversational sessions."""
-    
-    
+
     COST_AWARE = "cost_aware"
     """Cost-sensitive eviction: factors in prompt recomputation FLOPs and PCIe transfer
     latencies to minimize overall token generation delay."""
@@ -34,7 +34,7 @@ class EvictionPolicy(enum.StrEnum):
     PRIORITY = "priority"
     """Strict priority-driven eviction: reclaims memory according to explicit request SLA
     classes and user-defined scheduling priorities."""
-    
+
     @property
     def requires_tree_metadata(self) -> bool:
         """Whether this policy requires Radix/Trie hierarchy metadata from the block table."""
@@ -44,17 +44,17 @@ class EvictionPolicy(enum.StrEnum):
     def requires_frequency_tracking(self) -> bool:
         """Whether the cache allocator must maintain hit-frequency counters."""
         return self in (EvictionPolicy.LFU, EvictionPolicy.SLRU)
-    
+
 class PrefixHashAlgorithm(enum.StrEnum):
     """Hashing algorithms for Radix Tree and prefix-caching block indexers.
 
     Prefix caching computes deterministic fingerprints over prompt token sequences,
     multimodal tokens, and adapter configurations to identify reusable KV blocks.
     """
-    
+
     SHA256 = "sha256"
     """Standard SHA-256 hash. Strong collision resistance for multi-tenant serving."""
-    
+
     CBOR_SHA256 = "cbor_sha256"
     """Deterministic CBOR serialization (RFC 8949) hashed with SHA-256.
     Ensures stable keys for composite metadata (token IDs + LoRA adapter + soft prompts)."""
@@ -83,7 +83,7 @@ class PrefixReuseMode(enum.StrEnum):
     """Enables prefix matching per KV-head group.
     Optimized for Grouped-Query Attention (GQA) and Multi-Query Attention (MQA),
     allowing partial reuse across head groups sharing identical context."""
-    
+
 class CacheLayerKind(enum.StrEnum):
     """Architectural classification of stateful layer caches in LLM backbones.
 
@@ -119,7 +119,8 @@ class CacheLayerKind(enum.StrEnum):
 
     @property
     def is_compressed_latent(self) -> bool:
-        """Whether the layer stores low-rank compressed latent representations rather than explicit KV heads."""
+        """Whether the layer stores low-rank compressed latent
+        representations rather than explicit KV heads."""
         return self is CacheLayerKind.MLA
 
     @property

@@ -61,18 +61,18 @@ class SafetensorsHeader:
 
     file_uri: str
     data_start: int # 8 + header_length
-    file_size: int 
+    file_size: int
     entries: tuple[ManifestEntry,...] = ()
     metadata: tuple[tuple[str, str], ...] = ()
-    
+
     @property
     def tensor_keys(self) -> frozenset[str]:
         return frozenset(e.tensor_key for e in self.entries)
-    
+
     @property
     def payload_bytes(self) -> int:
         return sum(e.nbytes for e in self.entries)
-    
+
 def _dtype(token: object, key: str) -> DType:
     """Convert a safetensors dtype token to Ayaka's normalized dtype.
 
@@ -96,7 +96,7 @@ def _dtype(token: object, key: str) -> DType:
     try:
         return _SAFETENSORS_DTYPES[token]
     except KeyError as exc:
-        # The only sub-byte dtype is int4, which has no unpacking path 
+        # The only sub-byte dtype is int4, which has no unpacking path
         #!TODO: Implement unpacking path for sub-byte dtypes
         if token in ("I4", "U4", "F4"):
             raise UnsupportedWeightFormatError(
@@ -105,7 +105,7 @@ def _dtype(token: object, key: str) -> DType:
         raise CheckpointCorruptError(
             f"{key}: unknown safetensors dtype {token!r}; known: {sorted(_SAFETENSORS_DTYPES)}"
         ) from exc
-        
+
 def _shape(raw: object, key: str) -> tuple[int, ...]:
     """Validate and normalize a safetensors tensor shape.
 
@@ -184,8 +184,8 @@ def parse_safetensors_header(
     corruption case in the test suite is a two-line construction rather than a
     file on disk.
     """
-    
-    try: 
+
+    try:
         decoded = raw_header.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise CheckpointCorruptError(f"{file_uri}: header is not valid UTF-8") from exc
@@ -194,12 +194,12 @@ def parse_safetensors_header(
     # a duplicated key, so `{"w": A, "w": B}` parses clean and one tensor
     # vanishes.  This is the only way to see it.
     seen: list[str] = []
-    
+
     def _pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         seen.extend(k for k, _ in pairs)
         return dict(pairs)
 
-    try: 
+    try:
         header = json.loads(decoded, object_pairs_hook=_pairs_hook)
     except json.JSONDecodeError as exc:
         raise CheckpointCorruptError(f"{file_uri}: header is not valid JSON: {exc}") from exc
@@ -207,7 +207,7 @@ def parse_safetensors_header(
         raise CheckpointCorruptError(
             f"{file_uri}: header is {type(header).__name__}, not an object"
         )
-    
+
     metadata: tuple[tuple[str, str], ...] = ()
     meta = header.pop("__metadata__", None)
     if isinstance(meta, dict):
@@ -238,7 +238,7 @@ def parse_safetensors_header(
             f"{file_uri}: duplicate tensor keys in header: {dupes} — json would have "
             "kept only the last and dropped the rest silently"
         )
-        
+
     # Build the manifest entries.  The offsets are checked against the file size
     # and for overlap in the manifest builder, not here.
     entries: list[ManifestEntry] = []
@@ -275,7 +275,7 @@ def parse_safetensors_header(
         )
     entries.sort(key=lambda e: e.byte_offset)
     prev: ManifestEntry | None = None
-    for entry in entries: 
+    for entry in entries:
         if prev is not None and entry.byte_offset < prev.end_offset:
             raise CheckpointCorruptError(
                 f"{file_uri}: {prev.tensor_key} [{prev.byte_offset}:"
@@ -283,7 +283,7 @@ def parse_safetensors_header(
                 f"[{entry.byte_offset}:{entry.end_offset})"
             )
         prev = entry
-    
+
     return SafetensorsHeader(
         file_uri=file_uri,
         data_start=data_start,

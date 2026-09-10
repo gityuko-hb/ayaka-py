@@ -30,12 +30,12 @@ class DeviceMemory:
     def driver_used(self) -> int:
         """Bytes the driver considers in use, by every process on the device."""
         return self.driver_total - self.driver_free
- 
+
     @property
     def allocator_overhead(self) -> int:
         """Reserved but unallocated: caching-allocator fragmentation."""
         return self.reserved - self.allocated
- 
+
     def describe(self) -> str:
         """One-line summary in MiB, for bring-up and pressure logs."""
         mib = 2**20
@@ -49,7 +49,7 @@ class DeviceMemory:
 
 def device_memory(device: Any = None) -> DeviceMemory:
     """Sample a device's memory at both levels.
- 
+
     Raises:
         CapabilityError: if the resolved device is not CUDA -- there is no
             equivalent for CPU, and returning zeros would let a caller
@@ -71,10 +71,10 @@ def device_memory(device: Any = None) -> DeviceMemory:
         allocated=int(module.cuda.memory_allocated(resolved.index)),
         reserved=int(module.cuda.memory_reserved(resolved.index)),
     )
-    
+
 def empty_cache() -> None:
     """Return the caching allocator's free segments to the driver.
- 
+
     Rarely the right call: it is synchronous, it destroys the reuse the
     allocator exists to provide, and the next allocation pays full driver cost.
     Legitimate uses are between phases (after weight loading, before KV
@@ -82,18 +82,18 @@ def empty_cache() -> None:
     """
     if cuda_available():
         require_torch().cuda.empty_cache()
- 
+
 @contextmanager
 def peak_memory_bytes(device: Any = None) -> Generator[list[int]]:
     """Measure peak allocator usage across a block.
- 
+
     Yields a one-element list that is filled on exit, so the value survives the
     ``with``::
- 
+
         with peak_memory_bytes() as peak:
             run_profiling_forward()
         activation_bytes = peak[0]
- 
+
     This is how the activation budget is measured during bootstrap profiling
     with a dummy KV cache -- the step that breaks the KV/activation
     bootstrap cycle. Resets the peak counter on entry, so nested use is not
@@ -111,14 +111,14 @@ def peak_memory_bytes(device: Any = None) -> Generator[list[int]]:
     finally:
         module.cuda.synchronize(index)
         result[0] = int(module.cuda.max_memory_allocated(index))
-        
+
 _MEMINFO: Final[str] = "/proc/meminfo"
 _CGROUP_V2_MAX: Final[str] = "/sys/fs/cgroup/memory.max"
 _CGROUP_V1_MAX: Final[str] = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 
 def _host_total_ram_bytes() -> int | None:
     """Total host RAM, honouring a cgroup limit when one applies.
- 
+
     A container's ``MemTotal`` is the *host's*, not the container's, so a
     pinned-memory ceiling computed from ``/proc/meminfo`` alone will happily
     exceed the cgroup limit and get the process OOM-killed by the kernel rather
@@ -154,20 +154,20 @@ def host_pinned_ceiling_bytes(
     reserve_bytes: int = 2 * 2**30,
 ) -> int:
     """Safe upper bound on page-locked host memory.
- 
+
     Pinned memory is not swappable: over-pinning does not degrade, it takes the
     kernel's reclaimable pool away and ends in an OOM kill that no Python
     handler sees. So the ceiling is the minimum of what the operator asked for
     and what the system can survive.
- 
+
     Args:
         requested_bytes: What the operator configured, if anything.
         fraction: Share of total host memory that may be pinned.
         reserve_bytes: Absolute floor left to the rest of the system.
- 
+
     Returns:
         The byte ceiling, never negative.
- 
+
     >>> host_pinned_ceiling_bytes(requested_bytes=0)
     0
     """
@@ -181,7 +181,7 @@ def host_pinned_ceiling_bytes(
         return system_ceiling
     return max(min(requested_bytes, system_ceiling), 0)
 
-def _numa_nodes() -> int: 
+def _numa_nodes() -> int:
     try:
         entries = os.listdir("/sys/devices/system/node")
     except OSError:
@@ -211,17 +211,17 @@ def pinned_empty(
     allow_pageable: bool = True,
 ) -> tuple[Any, bool]:
     """Allocate a host buffer, page-locked when possible.
- 
+
     Returns ``(tensor, pinned)``. The flag is the *actual* tier, not the
     request: a caller that charges a memory ledger must charge what it got, and
     a predicted tier is not a materialized one.
- 
+
     Args:
         shape: Tensor shape.
         dtype: Dtype or dtype name.
         allow_pageable: Fall back to ordinary host memory when pinning fails.
             Set False when only DMA-capable memory is acceptable.
- 
+
     Raises:
         CapabilityError: when pinning fails and ``allow_pageable`` is False.
     """

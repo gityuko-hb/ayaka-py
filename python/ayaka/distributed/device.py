@@ -80,7 +80,8 @@ class LinkKind(enum.StrEnum):
     """Intra-device memory access (local GPU-to-GPU memory transfer on the same device)."""
 
     NVLINK = "nvlink"
-    """Direct point-to-point NVLink bridge between two adjacent GPUs without an intervening switch."""
+    """Direct point-to-point NVLink bridge
+    between two adjacent GPUs without an intervening switch."""
 
     NVSWITCH = "nvswitch"
     """Multi-GPU switched NVLink fabric (e.g., DGX/HGX baseboards with full-bisection bandwidth)."""
@@ -89,7 +90,8 @@ class LinkKind(enum.StrEnum):
     """Intra-node Host PCIe bus or dedicated PCIe packet switch within the same CPU NUMA socket."""
 
     QPI = "qpi"
-    """Cross-socket host interconnect (Intel UPI/QPI, AMD Infinity Fabric) traversing NUMA domains."""
+    """Cross-socket host interconnect
+    (Intel UPI/QPI, AMD Infinity Fabric) traversing NUMA domains."""
 
     NETWORK = "network"
     """Inter-node network interface (InfiniBand, RoCE v2, standard Ethernet via RDMA/TCP)."""
@@ -144,7 +146,8 @@ class CommOpType(enum.StrEnum):
 
     @property
     def is_idempotent(self) -> bool:
-        """Whether applying this operator multiple times to identical inputs preserves values (e.g., max(x, x) == x)."""
+        """Whether applying this operator multiple times to identical inputs preserves values
+        (e.g., max(x, x) == x)."""
         return self in (CommOpType.MAX, CommOpType.MIN)
 
     @property

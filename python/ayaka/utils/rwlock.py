@@ -61,7 +61,8 @@ class RWLock:
         self._writer_task: asyncio.Task | None = None
         self._writer_depth: int = 0
 
-        # Save the list of tasks currently being read and the reentrant depth of each task: {Task: depth}
+        # Save the list of tasks currently being read and the reentrant depth of each task:
+        # {Task: depth}
         self._reader_tasks: dict[asyncio.Task, int] = {}
 
         # Number of writer tasks in the queue
@@ -210,7 +211,8 @@ class RWLock:
                 self._writer_depth += 1
                 return
 
-            # Deadlock warning: If a task currently acting as a Reader requests Writer status while other Readers are present.
+            # Deadlock warning: If a task currently acting as a
+            # Reader requests Writer status while other Readers are present.
             if current in self._reader_tasks:
                 raise RuntimeError(
                     "It is not possible to upgrade from Reader to Writer within the same task."

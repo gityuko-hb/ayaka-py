@@ -13,6 +13,7 @@ from ayaka.exceptions import CheckpointCorruptError
 from ayaka.weights.plan import FileReadPlan
 from ayaka.weights.spec import WeightSource
 
+
 def safe_pread(fd: int, size: int, offset: int) -> bytes:
     pread = getattr(os, "pread", None)
     if pread is not None:
@@ -57,7 +58,7 @@ class ReadResult:
                 f"{self.plan.file_uri}: read {len(self.data)} of {self.plan.nbytes} B at "
                 f"offset {self.plan.byte_offset} — short read, usually a truncated file"
             )
-            
+
 class BoundedCheckpointReader:
     """Executes read plans.  Owns file handles; owns no tensors.
 
@@ -82,7 +83,7 @@ class BoundedCheckpointReader:
         self._cancel = threading.Event()
         self._handles: dict[str, int] = {}
         self._lock = threading.Lock()
-        
+
     def __enter__(self) -> BoundedCheckpointReader:
         return self
 
@@ -97,7 +98,7 @@ class BoundedCheckpointReader:
         if exc is not None:
             self.cancel()
         self.close()
-        
+
     def cancel(self) -> None:
         """Cooperative.  Reads already in flight finish; queued ones do not start."""
         self._cancel.set()

@@ -55,7 +55,7 @@ class WeightTransform(enum.StrEnum):
     TRANSPOSE = "transpose"
     CAST = "cast"  # to the compute dtype, last, on the smallest tensor
     CONTIGUOUS = "contiguous"
-    
+
 TRANSFORM_ORDER: Final[tuple[WeightTransform, ...]] = (
     WeightTransform.DECODE,
     WeightTransform.SLICE,
@@ -80,7 +80,7 @@ class ManifestEntry:
     shape: tuple[int, ...]
     byte_offset: int
     nbytes: int
-    
+
     def __post_init__(self) -> None:
         if not self.tensor_key:
             raise CheckpointCorruptError("manifest entry with an empty tensor key")
@@ -103,7 +103,7 @@ class ManifestEntry:
     @property
     def end_offset(self) -> int:
         return self.byte_offset + self.nbytes
-    
+
 @dataclass(frozen=True, slots=True)
 class CheckpointManifest:
     """What the checkpoint provides.  Produced without reading a tensor payload.
@@ -250,7 +250,7 @@ class FileReadPlan:
         if self.is_contiguous or not self.stride_bytes:
             return self.nbytes
         return (self.run_count - 1) * self.stride_bytes + self.run_bytes
-    
+
 @dataclass(frozen=True, slots=True)
 class TensorSlice:
     """A half-open range along one dimension.  ``[start, stop)``.

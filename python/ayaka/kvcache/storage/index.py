@@ -44,7 +44,6 @@ from ayaka.kvcache.storage.dtypes import is_fp8_storage_dtype
 from ayaka.kvcache.storage.errors import SlotAddressError
 from ayaka.utils.torch_utils import dtype_name
 
-
 __all__ = [
     "SlotIndex",
     "host_index_buffer",

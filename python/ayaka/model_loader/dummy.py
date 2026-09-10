@@ -149,8 +149,8 @@ def write_sharded_checkpoint(
     """Write N shards plus the index that maps every tensor to its file.
 
     ``weight_map_override`` exists so a test can point a weight at
-    ``../../../etc/shadow`` without hand-writing the whole index — the dummy writer is not a security tool, 
-    it just needs to be able to simulate a weight that is not in the checkpoint.
+    ``../../../etc/shadow`` without hand-writing the whole index — the dummy writer is not a
+    security tool, it just needs to be able to simulate a weight that is not in the checkpoint.
     """
     root.mkdir(parents=True, exist_ok=True)
     weight_map: dict[str, str] = {}

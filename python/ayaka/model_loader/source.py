@@ -8,7 +8,6 @@ from pathlib import Path
 from ayaka.configs.model_source import ModelSourceConfig, RequestedFormat
 from ayaka.exceptions import CheckpointSecurityError, ModelLoadError
 from ayaka.weights.plan import CheckpointFormat
-from regex import P
 
 CONFIG_FILENAME = "config.json"
 INDEX_FILENAME = "model.safetensors.index.json"

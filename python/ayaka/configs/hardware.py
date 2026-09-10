@@ -1,26 +1,20 @@
 from __future__ import annotations
 
-import contextlib
 import os
-import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field, replace
-from typing import Final, TypedDict
 
+from ayaka.configs.base import ConfigMixin
 from ayaka.distributed.device import DeviceCapability, DeviceRef, LinkKind
 from ayaka.types import DeviceKind
-from ayaka.utils.torch_memory import (
-    _host_total_ram_bytes,
-    _numa_nodes,
-    _pci_numa_node
-)
 from ayaka.utils.nvml_utils import (
     get_driver_version,
     nvml_session,
     probe_device,
     probe_nvlink_matrix,
 )
+from ayaka.utils.torch_memory import _host_total_ram_bytes, _numa_nodes, _pci_numa_node
 
 CC_LIMITS: dict[tuple[int, int], dict[str, int]] = {
     # Pascal
@@ -51,7 +45,7 @@ CC_LIMITS: dict[tuple[int, int], dict[str, int]] = {
         max_threads_per_block=1024,
         max_blocks_per_sm=32,
     ),
-    # Volta 
+    # Volta
     # GV100 (Tesla V100, Titan V)
     (7, 0): dict(
         shared_per_block=96 << 10,
@@ -70,7 +64,7 @@ CC_LIMITS: dict[tuple[int, int], dict[str, int]] = {
         max_threads_per_block=1024,
         max_blocks_per_sm=32,
     ),
-    # Turing 
+    # Turing
     # TU102/104/106/116 (RTX 2080 Ti, Tesla T4)
     (7, 5): dict(
         shared_per_block=64 << 10,
@@ -80,7 +74,7 @@ CC_LIMITS: dict[tuple[int, int], dict[str, int]] = {
         max_threads_per_block=1024,
         max_blocks_per_sm=16,
     ),
-    # Ampere 
+    # Ampere
     # GA100 (A100, A30)
     (8, 0): dict(
         shared_per_block=163 << 10,
@@ -108,7 +102,7 @@ CC_LIMITS: dict[tuple[int, int], dict[str, int]] = {
         max_threads_per_block=1024,
         max_blocks_per_sm=16,
     ),
-    # Ada Lovelace 
+    # Ada Lovelace
     # AD102/103/104 (RTX 4090, L40, L40S, L4)
     (8, 9): dict(
         shared_per_block=99 << 10,
@@ -118,7 +112,7 @@ CC_LIMITS: dict[tuple[int, int], dict[str, int]] = {
         max_threads_per_block=1024,
         max_blocks_per_sm=24,
     ),
-    # Hopper 
+    # Hopper
     # GH100 (H100, H200, GH200)
     (9, 0): dict(
         shared_per_block=227 << 10,
@@ -191,9 +185,31 @@ def _fill_cc_limits(cap: DeviceCapability) -> DeviceCapability:
         max_threads_per_sm=cap.max_threads_per_sm or limits.get("max_threads_per_sm", 0),
         l2_bytes=cap.l2_bytes or _l2_for(cap.name),
     )
-    
+
 @dataclass(frozen=True, slots=True)
-class HardwareConfig:
+class HardwareConfig(ConfigMixin):
+    """Immutable hardware topology, device capabilities, and interconnect matrix.
+
+    Represents discovered or synthetic hardware configuration, including attached
+    accelerator devices, compute capabilities, host memory capacity, NUMA node layout,
+    CPU cores, and peer-to-peer / NVLink interconnect topology.
+
+    Attributes:
+        devices: Immutable tuple of attached hardware device references.
+        capabilities: Architectural capabilities corresponding 1:1 to :attr:`devices`.
+        host_ram_bytes: Total physical host system RAM in bytes.
+        numa_nodes: Number of NUMA memory nodes detected on the host.
+        cpu_count: Total count of logical CPU cores available to the process.
+        links: Square symmetric interconnect matrix over devices indicating link types
+            (e.g., :attr:`LinkKind.SELF`, :attr:`LinkKind.NVLINK`, :attr:`LinkKind.PCIE`).
+        driver_version: Installed NVIDIA display / kernel driver version string.
+        detected: Whether this configuration was probed from real hardware at runtime
+            (as opposed to synthetic or fallback configurations).
+        notes: Informational diagnostics from hardware probing.
+        peer_access: Square matrix indicating direct peer-to-peer memory access
+            between device pairs.
+    """
+
     devices: tuple[DeviceRef, ...] = ()
     capabilities: tuple[DeviceCapability, ...] = ()
     host_ram_bytes: int = 0
@@ -204,8 +220,9 @@ class HardwareConfig:
     detected: bool = False
     notes: tuple[str, ...] = field(default=(), compare=False)
     peer_access: tuple[tuple[bool | None, ...], ...] = ()
-    
+
     def __post_init__(self) -> None:
+        """Validate device-capability correspondence and interconnect symmetry."""
         if len(self.devices) != len(self.capabilities):
             raise ValueError("devices/capabilities length mismatch")
         if self.links:
@@ -221,24 +238,29 @@ class HardwareConfig:
 
     @property
     def num_devices(self) -> int:
+        """Total number of attached hardware devices."""
         return len(self.devices)
 
     @property
     def has_cuda(self) -> bool:
+        """Whether at least one CUDA accelerator device is present."""
         return any(d.kind is DeviceKind.CUDA for d in self.devices)
 
     def capability(self, index: int = 0) -> DeviceCapability:
+        """Return the device capability profile for the device at ``index``."""
         if not self.capabilities:
             raise RuntimeError("no device detected; pass a HardwareConfig explicitly")
         return self.capabilities[index]
 
     def link(self, src: int, dst: int) -> LinkKind:
+        """Return the interconnect link type between devices ``src`` and ``dst``."""
         if not self.links:
             return LinkKind.SELF if src == dst else LinkKind.PCIE
         return self.links[src][dst]
 
     @classmethod
     def cpu_only(cls, *, note: str = "") -> HardwareConfig:
+        """Construct a fallback CPU-only hardware configuration without CUDA devices."""
         return cls(
             host_ram_bytes=_host_total_ram_bytes() or 0,
             numa_nodes=_numa_nodes(),
@@ -249,6 +271,7 @@ class HardwareConfig:
 
     @classmethod
     def synthetic(cls, cap: DeviceCapability, count: int = 1) -> HardwareConfig:
+        """Construct a deterministic synthetic hardware configuration for testing."""
         cap = _fill_cc_limits(cap)
         devices = tuple(DeviceRef(kind=DeviceKind.CUDA, index=i) for i in range(count))
         links = tuple(
@@ -265,7 +288,7 @@ class HardwareConfig:
             detected=False,
             notes=("synthetic",),
         )
-        
+
 def _detect_via_pynvml() -> HardwareConfig | None:
     with nvml_session() as pynvml:
         if pynvml is None:

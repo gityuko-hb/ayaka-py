@@ -12,7 +12,7 @@ class StackedKVLayout(Protocol):
 
     def layer_cache(self, layer_index: int, /) -> Any:
         """Return ``[2, pages, page_size, num_kv_heads, head_dim]`` for one layer.
- 
+
         Index 0 is K and index 1 is V. The frozen ``attention_decode`` signature
         implies that convention without ever stating it, so it is stated here.
         """
@@ -21,7 +21,7 @@ class StackedKVLayout(Protocol):
 @runtime_checkable
 class KVStorage(Protocol):
     """Physical tensor allocation associated with one storage specification.
- 
+
     Implementations preallocate page-major tensors once and expose slot
     scatter / gather primitives. They never allocate or free pages -- that is
     the allocator's job -- and never see request identity.

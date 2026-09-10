@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -102,8 +102,14 @@ class EventPool:
         return event
 
     @contextmanager
-    def fence(self, src_stream: Any, dst_stream: Any, *, assert_async: bool = False) -> Iterator[Any]:
-        """Tạo device-side dependency. Nếu assert_async=True, kích hoạt no_device_sync để bắt lỗi sync ngầm."""
+    def fence(
+        self,
+        src_stream: Any,
+        dst_stream: Any, *,
+        assert_async: bool = False
+    ) -> Generator[Any]:
+        """Create a device-side dependency. If assert_async=True,
+        enable no_device_sync to catch implicit synchronization errors."""
         event = self.record_on(src_stream)
         try:
             if assert_async:

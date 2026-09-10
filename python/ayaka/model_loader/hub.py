@@ -48,7 +48,7 @@ class HubUnavailableError(ModelLoadError):
     that names the extra to install — an ``ImportError`` traceback from a
     transitive dependency tells the reader nothing about what to do next.
     """
-    
+
 class SnapshotDownloader(Protocol):
     """The one function this module needs from ``huggingface_hub``.
 
@@ -96,7 +96,7 @@ def hub_fetcher(
     must check the local filesystem first: constructing a fetcher has to be free
     so it can be passed in and never used.
     """
-    
+
     def fetch(model: str, revision: str) -> str:
         fn = download or _import_snapshot_download()
         rev = revision or None
@@ -114,13 +114,13 @@ def hub_fetcher(
                     allow_patterns=list(CONTROL_FILES),
                 )
             )
-            
+
             index = root / INDEX_FILENAME
             if index.is_file():
                 wanted = list(shard_filenames_from_index(index))
             else:
                 wanted = [SINGLE_FILENAME, "*.safetensors"]
-                
+
             # Pass two: exactly the weight files, and nothing else in the repo.
             root = Path(
                 fn(

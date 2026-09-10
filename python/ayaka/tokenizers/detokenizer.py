@@ -440,8 +440,8 @@ class SlowIncrementalDetokenizer(IncrementalDetokenizer):
         tail = list(prompt_token_ids[-(_WINDOW + 2) :])
         toks = tokenizer.convert_ids_to_tokens(tail, skip_special_tokens=self._skip)
         self._win: list[str] = [t if t is not None else "" for t in toks]
-        self._base = 0                                       # absolute token index of _win[0]
-        self._read_offset = len(self._win)                   # absolute index up to which prompt is primed
+        self._base = 0                        # absolute token index of _win[0]
+        self._read_offset = len(self._win)    # absolute index up to which prompt is primed
         self._prefix_offset = max(self._read_offset - _WINDOW, 0)  # look-back boundary for diffing
 
         # Slow (Python) tokenizers require separate handling of added tokens.

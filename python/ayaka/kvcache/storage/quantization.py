@@ -61,7 +61,7 @@ class QuantizationScheme(StrEnum):
 
     PER_HEAD = "per_head"
     """One scale per (layer, plane, head).
-    
+
     Declared as a typed axis so that adding it later is a change of value, not
     a change of shape in every signature. Currently rejected at construction --
     no kernel in Ayaka consumes a per-head scale vector yet, and accepting the
@@ -105,7 +105,8 @@ class KVQuantization:
 
     def __post_init__(self) -> None:
         if not isinstance(self.scheme, QuantizationScheme):
-            raise TypeError(f"scheme must be a QuantizationScheme, got {type(self.scheme).__name__}")
+            raise TypeError(
+                f"scheme must be a QuantizationScheme, got {type(self.scheme).__name__}")
         if self.scheme is QuantizationScheme.PER_HEAD:
             raise NotImplementedError(
                 "per-head KV scales are declared but not implemented: no Ayaka kernel "

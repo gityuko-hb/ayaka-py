@@ -33,7 +33,7 @@ class NvmlDeviceRaw:
     hbm_bytes: int
     uuid: str
     pci_bus_id: str
-    
+
 def nvml_available() -> bool:
     """Check if pynvml package is available in the environment without executing it."""
     return has_module("pynvml")
@@ -71,7 +71,7 @@ def get_driver_version(pynvml_mod: Any) -> str:
 def get_attribute_int(pynvml_mod: Any, handle: Any, attr_name: str) -> int:
     """Safely fetch an NVML device attribute; returns 0 on missing/failure."""
     try:
-        get = getattr(pynvml_mod, "nvmlDeviceGetAttribute")
+        get = pynvml_mod.nvmlDeviceGetAttribute
         attr = getattr(pynvml_mod, attr_name)
         return int(get(handle, attr))
     except Exception:
@@ -81,20 +81,23 @@ def get_attribute_int(pynvml_mod: Any, handle: Any, attr_name: str) -> int:
 def probe_device(pynvml_mod: Any, index: int, handle: Any) -> NvmlDeviceRaw:
     """Extract raw hardware metrics for a single GPU handle."""
     name_raw = pynvml_mod.nvmlDeviceGetName(handle)
-    name = name_raw.decode("utf-8", errors="replace") if isinstance(name_raw, bytes) else str(name_raw)
+    name = name_raw.decode("utf-8",
+        errors="replace") if isinstance(name_raw, bytes) else str(name_raw)
 
     major, minor = pynvml_mod.nvmlDeviceGetCudaComputeCapability(handle)
     mem = pynvml_mod.nvmlDeviceGetMemoryInfo(handle)
 
     try:
         uuid_raw = pynvml_mod.nvmlDeviceGetUUID(handle)
-        uuid = uuid_raw.decode("utf-8", errors="replace") if isinstance(uuid_raw, bytes) else str(uuid_raw)
+        uuid = uuid_raw.decode("utf-8",
+            errors="replace") if isinstance(uuid_raw, bytes) else str(uuid_raw)
     except Exception:
         uuid = ""
 
     try:
         pci = pynvml_mod.nvmlDeviceGetPciInfo(handle)
-        bus_id = pci.busId.decode("utf-8", errors="replace") if isinstance(pci.busId, bytes) else str(pci.busId)
+        bus_id = pci.busId.decode("utf-8",
+            errors="replace") if isinstance(pci.busId, bytes) else str(pci.busId)
     except Exception:
         bus_id = ""
 
@@ -118,9 +121,9 @@ def probe_nvlink_matrix(pynvml_mod: Any, handles: list[Any]) -> list[list[bool]]
     matrix = [[False] * n for _ in range(n)]
 
     try:
-        get_status = getattr(pynvml_mod, "nvmlDeviceGetP2PStatus")
-        nvlink_ok = getattr(pynvml_mod, "NVML_P2P_STATUS_OK")
-        cap = getattr(pynvml_mod, "NVML_P2P_CAPS_INDEX_NVLINK")
+        get_status = pynvml_mod.nvmlDeviceGetP2PStatus
+        nvlink_ok = pynvml_mod.NVML_P2P_STATUS_OK
+        cap = pynvml_mod.NVML_P2P_CAPS_INDEX_NVLINK
     except AttributeError:
         return matrix
 
