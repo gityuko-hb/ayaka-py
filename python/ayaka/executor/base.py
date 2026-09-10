@@ -1,3 +1,5 @@
+"""Nonblocking executor lifecycle; backend hooks enqueue but never free resources."""
+
 from __future__ import annotations
 
 import abc
@@ -14,6 +16,8 @@ from ayaka.executor.ticket import (
     TicketState,
     WorkState,
 )
+from ayaka.memory.ledger import MemoryLedger
+from ayaka.obs import RuntimeMetrics, RuntimeSnapshot
 from ayaka.sched.plan import PreparedStep
 from ayaka.utils.validation import require_int
 
@@ -25,13 +29,14 @@ class Executor(abc.ABC):
 
     A single engine thread serializes these methods and CompletionCoordinator.
     CancellationToken may be signalled from another thread. Backend hooks must
-    not re-enter the coordinator or mutate request lifecycle. No method waits
+    not re-enter the coordinator or mutate request lifecycles. No method waits
     or globally synchronizes a device. The former execute(plan) API is removed:
     a return from enqueue is not a completed step.
     """
 
-    def __init__(self, *, max_inflight: int = 8) -> None:
+    def __init__(self, *, max_inflight: int = 8, metrics: RuntimeMetrics | None = None) -> None:
         require_int(max_inflight, "max_inflight", minimum=1)
+        self.metrics = metrics or RuntimeMetrics()
         self._max_inflight = max_inflight
         self._executor_id = next(_EXECUTOR_IDS)
         self._ordinal = count(1)
@@ -87,7 +92,24 @@ class Executor(abc.ABC):
             del self._tickets[ticket.id]
             raise
         self._last_step = prepared.step.step_id
+        ticket._adopted_ns = self.metrics.now_ns()
+        self.metrics.increment("tickets_adopted")
         return ticket
+
+    def snapshot_metrics(self, *, ledger: MemoryLedger | None = None) -> RuntimeSnapshot:
+        """Read host gauges and optional ledger bytes; never polls GPU completion."""
+        return self.metrics.snapshot(self.tickets, ledger=ledger)
+
+    def _transition(self, ticket: ExecutionTicket, state: TicketState) -> None:
+        if state is TicketState.QUARANTINED and ticket.state is not state:
+            self.metrics.increment("quarantine_entries")
+        ticket._state = state
+        if (
+            state in (TicketState.DRAINING, TicketState.QUARANTINED)
+            and not ticket._host_failure
+            and ticket._drain_started_ns is None
+        ):
+            ticket._drain_started_ns = self.metrics.now_ns()
 
     def _require_owned(self, ticket: ExecutionTicket) -> None:
         if self._tickets.get(ticket.id) is not ticket:
@@ -133,7 +155,9 @@ class Executor(abc.ABC):
             if not isinstance(exc, Exception):
                 raise
             return
-        ticket._state = TicketState.SUBMITTED
+        self._transition(ticket, TicketState.SUBMITTED)
+        ticket._submitted_ns = self.metrics.now_ns()
+        self.metrics.increment("tickets_submitted")
         try:
             self._enqueue(ticket)
             if not ticket._fences:
@@ -141,7 +165,7 @@ class Executor(abc.ABC):
         except BaseException as exc:
             ticket._error = f"launch failed: {exc}"
             ticket._needs_drain = True
-            ticket._state = TicketState.DRAINING
+            self._transition(ticket, TicketState.DRAINING)
             if not isinstance(exc, Exception):
                 raise
 
@@ -170,7 +194,7 @@ class Executor(abc.ABC):
         if ticket.state is TicketState.ADOPTED:
             self._finish(ticket, TerminalStatus.CANCELLED)
         elif ticket.state is not TicketState.QUARANTINED:
-            ticket._state = TicketState.DRAINING
+            self._transition(ticket, TicketState.DRAINING)
 
     def quarantine(
         self, ticket: ExecutionTicket, error: str, *, host_failure: bool = False
@@ -178,8 +202,8 @@ class Executor(abc.ABC):
         """Retain ownership and stop admission; errors never imply quiescence."""
         self._require_owned(ticket)
         ticket._error = error
-        ticket._state = TicketState.QUARANTINED
         ticket._host_failure |= host_failure
+        self._transition(ticket, TicketState.QUARANTINED)
         ticket._needs_drain = not ticket._host_failure
 
     def drain(self, ticket: ExecutionTicket) -> None:
@@ -201,7 +225,8 @@ class Executor(abc.ABC):
     def _finish(self, ticket: ExecutionTicket, status: TerminalStatus) -> None:
         samples = ticket._samples if status is TerminalStatus.SUCCEEDED else ()
         ticket._terminal = TerminalOutcome(ticket.id, status, samples, ticket._error)
-        ticket._state = TicketState.COMPLETED
+        self.metrics.terminal(ticket)
+        self._transition(ticket, TicketState.COMPLETED)
 
     def _poll(self, ticket: ExecutionTicket) -> None:
         if ticket._host_failure or ticket.state in (TicketState.ADOPTED, TicketState.COMPLETED):
@@ -259,7 +284,10 @@ class Executor(abc.ABC):
         self._require_owned(ticket)
         if ticket.state is not TicketState.COMPLETED or not ticket._retirement_complete:
             raise ValueError("only settled terminal work can retire")
-        ticket._state = TicketState.RETIRED
+        self._transition(ticket, TicketState.RETIRED)
+        self.metrics.increment("tickets_retired")
+        if ticket.terminal is not None:
+            self.metrics.increment(f"retired_{ticket.terminal.status.value}")
         del self._tickets[ticket.id]
 
     def shutdown(self) -> bool:

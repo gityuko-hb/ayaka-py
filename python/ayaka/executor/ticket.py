@@ -1,3 +1,5 @@
+"""Torch-free ownership and completion contracts for asynchronous execution."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -20,68 +22,21 @@ class TicketId:
         require_int(self.executor, "executor", minimum=1)
         require_int(self.ordinal, "ordinal", minimum=1)
 
+
 class TicketState(StrEnum):
-    """Runtime lifecycle states of an ExecutionTicket within an Executor.
-
-    Reflects the ownership transfer and execution phase of a resource bundle,
-    tracking work from initial plan adoption through device execution to safe,
-    quiescent retirement.
-    """
-
     ADOPTED = "adopted"
-    """The ticket has atomically accepted ownership of both the PreparedStep
-    and its ExecutionResources bundle, but work has not yet been enqueued
-    to backend execution streams.
-    """
-
     SUBMITTED = "submitted"
-    """Resources have been marked for submission and operations are actively
-    enqueued on the device; completion fences are registered and awaiting
-    evaluation.
-    """
-
     DRAINING = "draining"
-    """Work is in-flight or partially submitted and must be drained to prove
-    hardware quiescence before completion. Triggered by cancellation,
-    submission faults, or executor shutdown.
-    """
-
     QUARANTINED = "quarantined"
-    """Fault-isolation state reached when ambiguous errors occur (e.g., host
-    exceptions, fence query failures, or non-quiescent device faults). The ticket
-    and its resource leases are frozen indefinitely to prevent use-after-free bugs,
-    halting new admissions.
-    """
-
     COMPLETED = "completed"
-    """Execution has reached verifiable hardware quiescence. A terminal outcome
-    has been authored and is ready for the completion coordinator to settle
-    (commit KV cache, publish sample tokens, or discard).
-    """
-
     RETIRED = "retired"
-    """Terminal lifecycle state. Logical commitments and physical resource leases
-    have been acknowledged and released via `retire()`. The ticket is pruned from
-    the executor's active registry.
-    """
+
 
 class WorkState(StrEnum):
-    """Physical execution state reported by a CompletionFence."""
-
     PENDING = "pending"
-    """The underlying backend work is actively running or scheduled in a device queue.
-    Cannot coexist with a quiescent status.
-    """
-
     SUCCEEDED = "succeeded"
-    """Work completed successfully on the device. By contract, must guarantee
-    that all associated memory operations have achieved hardware quiescence.
-    """
-
     FAILED = "failed"
-    """Work encountered a backend or device error. Requires an accompanying error
-    message; does not automatically guarantee that the hardware is quiescent.
-    """
+
 
 @dataclass(frozen=True, slots=True)
 class FenceResult:
@@ -101,10 +56,12 @@ class FenceResult:
         if self.state is WorkState.FAILED and not self.error:
             raise ValueError("a failed fence requires an error")
 
+
 class CompletionFence(Protocol):
     """Nonblocking query. Exceptions imply unknown completion, never safe release."""
 
     def query(self) -> FenceResult: ...
+
 
 class ExecutionResources(Protocol):
     """One exclusive bundle retained by a ticket until all consumers stop.
@@ -116,6 +73,10 @@ class ExecutionResources(Protocol):
     leases after logical publication/discard and is idempotent by ticket identity.
     discarded_sequences contains original generation-safe handles from this step;
     real resources release those requests behind their active KV lease.
+
+    P1 supplies only a fake implementation. Physical KV/workspace/staging
+    accounting and real allocator validation are implemented in P2. Exceptions
+    after adoption quarantine the bundle; callbacks are not blindly retried.
     """
 
     def adopt(self, ticket_id: TicketId, prepared: PreparedStep) -> None: ...
@@ -129,31 +90,12 @@ class ExecutionResources(Protocol):
         discarded_sequences: tuple[SequenceHandle, ...] = (),
     ) -> None: ...
 
+
 class TerminalStatus(StrEnum):
-    """Terminal completion status authored by an Executor for an ExecutionTicket.
-
-    Represents the final logical outcome of a quiescent unit of work, instructing
-    the CompletionCoordinator how to settle KV cache commits, deliver sampled tokens,
-    and transition request lifecycle.
-    """
-
     SUCCEEDED = "succeeded"
-    """The execution step completed successfully with all device operations quiescent.
-    Authorizes the coordinator to commit KV cache state versions and publish
-    generated token samples to participating requests.
-    """
-
     FAILED = "failed"
-    """Execution encountered an unrecoverable host, kernel, or hardware error.
-    Prohibits sample publication and directs the coordinator to discard computed
-    slices and fail active requests.
-    """
-
     CANCELLED = "cancelled"
-    """Execution was aborted before launch or drained mid-flight due to client
-    cancellation or executor shutdown. Discards generated outputs and triggers
-    clean resource retirement.
-    """
+
 
 @dataclass(frozen=True, slots=True)
 class TerminalOutcome:
@@ -172,6 +114,7 @@ class TerminalOutcome:
             require_int(sample, "sample token")
         if self.status is not TerminalStatus.SUCCEEDED and self.samples:
             raise ValueError("failed/cancelled work cannot publish samples")
+
 
 @dataclass(slots=True)
 class ExecutionTicket:
@@ -197,6 +140,10 @@ class ExecutionTicket:
     _settling: bool = False
     _retirement_complete: bool = False
     _execution_failed: bool = False
+    _adopted_ns: int = 0
+    _submitted_ns: int | None = None
+    _drain_started_ns: int | None = None
+    _terminal_ns: int | None = None
 
     @property
     def state(self) -> TicketState:

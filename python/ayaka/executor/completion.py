@@ -1,3 +1,5 @@
+"""Serialized, exactly-once logical completion and resource retirement for P1."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

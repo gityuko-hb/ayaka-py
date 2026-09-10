@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 
+from ayaka.attention.spec import AttentionGroupSpec
 from ayaka.types import (
     DType,
     KVLayoutKind,
@@ -10,6 +11,8 @@ from ayaka.types import (
     MemoryTier,
     StreamRole,
 )
+from ayaka.utils.validation import require_frozen, require_int, require_text
+
 
 #! Batch plan
 class TokenKind(enum.StrEnum):
@@ -17,8 +20,9 @@ class TokenKind(enum.StrEnum):
     EXTEND = "extend"  # continuation chunk (chunked prefill / prefix hit)
     DECODE = "decode"  # exactly one token per sequence
     SPEC_VERIFY = "spec_verify"  # k draft tokens verified in one pass
-    
-dataclass(frozen=True, slots=True)
+
+
+@dataclass(frozen=True, slots=True)
 class BatchEntry:
     """One sequence's slice of this step.
 
@@ -26,7 +30,7 @@ class BatchEntry:
     *logical* sequence (prompt + generated), i.e. the RoPE base offset.  It is
     NOT an index into any buffer — buffer placement is ``slot_offset``.
     """
-    
+
     request_id: str
     kind: TokenKind
     token_offset: int
@@ -36,10 +40,19 @@ class BatchEntry:
     seq_len_after: int  # sequence length once this step lands
 
     def __post_init__(self) -> None:
-        if self.num_tokens < 1:
-            raise ValueError(f"{self.request_id}: num_tokens must be >= 1")
+        require_text(self.request_id, "request_id")
+        if not isinstance(self.kind, TokenKind):
+            raise TypeError("kind must be TokenKind")
+        for name in ("token_offset", "num_cached_tokens", "slot_offset", "seq_len_after"):
+            require_int(getattr(self, name), name)
+        require_int(self.num_tokens, "num_tokens", minimum=1)
+        if self.seq_len_after != self.token_offset + self.num_tokens:
+            raise ValueError("seq_len_after must equal token_offset + num_tokens")
+        if self.num_cached_tokens > self.token_offset:
+            raise ValueError("cached prefix cannot extend past token_offset")
         if self.kind is TokenKind.DECODE and self.num_tokens != 1:
             raise ValueError(f"{self.request_id}: decode entry must carry exactly 1 token")
+
 
 @dataclass(frozen=True, slots=True)
 class BatchPlan:
@@ -54,11 +67,29 @@ class BatchPlan:
     is_pure_decode: bool  # gates the CUDA-graph path
 
     def __post_init__(self) -> None:
+        require_frozen(self, "batch")
+        for name in ("num_tokens", "padded_num_tokens", "num_seqs", "max_seq_len"):
+            require_int(getattr(self, name), name)
         if self.padded_num_tokens < self.num_tokens:
             raise ValueError("padded_num_tokens < num_tokens")
         if len(self.entries) != self.num_seqs:
             raise ValueError("num_seqs disagrees with len(entries)")
-        
+        if len({entry.request_id for entry in self.entries}) != self.num_seqs:
+            raise ValueError("a batch cannot contain a request twice")
+        offset = 0
+        for entry in self.entries:
+            if entry.slot_offset != offset:
+                raise ValueError("batch entries must cover contiguous packed rows")
+            offset += entry.num_tokens
+        if offset != self.num_tokens:
+            raise ValueError("num_tokens disagrees with batch entries")
+        if self.max_seq_len != max((e.seq_len_after for e in self.entries), default=0):
+            raise ValueError("max_seq_len disagrees with batch entries")
+        pure_decode = bool(self.entries) and all(e.kind is TokenKind.DECODE for e in self.entries)
+        if type(self.is_pure_decode) is not bool or self.is_pure_decode != pure_decode:
+            raise ValueError("is_pure_decode disagrees with explicit token kinds")
+
+
 #! ComputePlan
 @dataclass(frozen=True, slots=True)
 class ComputePlan:
@@ -72,7 +103,18 @@ class ComputePlan:
     num_micro_batches: int = 1
     enable_chunked_prefill: bool = True
     max_num_batched_tokens: int = 8192
-    
+
+    def __post_init__(self) -> None:
+        require_frozen(self, "compute")
+        if len(self.layer_range) != 2:
+            raise ValueError("layer_range must contain start and stop")
+        start, stop = self.layer_range
+        require_int(start, "layer start")
+        require_int(stop, "layer stop", minimum=start + 1)
+        require_int(self.num_micro_batches, "num_micro_batches", minimum=1)
+        require_int(self.max_num_batched_tokens, "max_num_batched_tokens", minimum=1)
+
+
 #! MemoryPlan
 @dataclass(frozen=True, slots=True)
 class WorkspaceRequest:
@@ -90,6 +132,9 @@ class WorkspaceRequest:
     alignment: int = 256
 
     def __post_init__(self) -> None:
+        require_text(self.name, "workspace name")
+        require_int(self.nbytes, "workspace nbytes")
+        require_int(self.alignment, "workspace alignment", minimum=1)
         if self.alignment & (self.alignment - 1):
             raise ValueError(f"{self.name}: alignment {self.alignment} is not a power of two")
 
@@ -97,41 +142,50 @@ class WorkspaceRequest:
 @dataclass(frozen=True, slots=True)
 class MemoryPlan:
     """Aggregate the workspace size and estimate the activation bytes required for the run."""
+
     workspaces: tuple[WorkspaceRequest, ...] = ()
     activation_bytes: int = 0
     peak_bytes_estimate: int = 0
 
+    def __post_init__(self) -> None:
+        require_frozen(self, "memory")
+        require_int(self.activation_bytes, "activation_bytes")
+        require_int(self.peak_bytes_estimate, "peak_bytes_estimate")
+        if len({w.name for w in self.workspaces}) != len(self.workspaces):
+            raise ValueError("workspace names must be unique")
+
     @property
     def workspace_bytes(self) -> int:
         return sum(w.nbytes for w in self.workspaces)
-    
+
+
 class MappingOpKind(enum.StrEnum):
     """Primitive memory operations on physical KV-cache block tables.
 
     Defines the discrete transactional operations supported by the virtual memory
     manager and block allocator across hierarchical :class:`MemoryTier` levels.
     """
-    
+
     APPEND = "append"  # bind fresh blocks to the tail of a sequence
     """Bind fresh, uninitialized physical memory blocks to the sequence tail."""
-    
+
     RELEASE = "release"  # drop refcount; eviction is a side effect of alloc
     """Decrement reference count on mapped blocks. Blocks with zero references
     become immediately reusable or eligible for cache eviction."""
     SHARE = "share"  # bump refcount on a prefix hit (full pages only)
     """Increment reference count on existing sealed prefix blocks for zero-copy
     multi-sequence KV cache reuse."""
-    
+
     COPY = "copy"  # materialism a private tail out of a sealed block
     """Perform Copy-on-Write (CoW) to materialize a private mutable block from
     a shared read-only block."""
-    
+
     PROMOTE = "promote"  # tier n → tier n-1
     """Migrate block data to a faster memory tier (e.g., Host RAM to GPU VRAM)."""
-    
+
     DEMOTE = "demote"  # tier n → tier n+1
     """Evict or offload block data to a slower memory tier (e.g., GPU VRAM to Host RAM/Disk)."""
-    
+
     @property
     def is_tier_migration(self) -> bool:
         """Whether this operation moves data across hierarchical storage tiers."""
@@ -146,7 +200,8 @@ class MappingOpKind(enum.StrEnum):
     def allocates_physical_memory(self) -> bool:
         """Whether this operation requires allocating a new physical block."""
         return self in (MappingOpKind.APPEND, MappingOpKind.COPY, MappingOpKind.PROMOTE)
-    
+
+
 @dataclass(frozen=True, slots=True)
 class MappingOp:
     kind: MappingOpKind
@@ -155,7 +210,8 @@ class MappingOp:
     src_tier: MemoryTier = MemoryTier.DEVICE
     dst_tier: MemoryTier = MemoryTier.DEVICE
     stream: StreamRole = StreamRole.KV
-    
+
+
 @dataclass(frozen=True, slots=True)
 class KVPlan:
     """Block tables plus the mapping deltas to apply at the batch boundary.
@@ -175,6 +231,7 @@ class KVPlan:
     max_blocks_per_seq: int = 0
     layout: KVLayoutKind = KVLayoutKind.NHD
 
+
 #! WeightResidencyPlan
 @dataclass(frozen=True, slots=True)
 class WeightResidency:
@@ -191,7 +248,8 @@ class WeightResidency:
     @property
     def needs_transfer(self) -> bool:
         return self.required_tier != self.current_tier
-    
+
+
 @dataclass(frozen=True, slots=True)
 class WeightResidencyPlan:
     """Per-step weight residency."""
@@ -202,13 +260,14 @@ class WeightResidencyPlan:
     @property
     def transfer_bytes(self) -> int:
         return sum(r.nbytes for r in self.residency if r.needs_transfer)
-    
+
+
 #! ParallelPlan
 @dataclass(frozen=True, slots=True)
 class ParallelPlan:
     """TP/PP/EP are execution strategies, never model architecture.
     Model code reads *nothing* from here — only ``ayaka.distributed`` does."""
-    
+
     tp_size: int = 1
     tp_rank: int = 0
     pp_size: int = 1
@@ -220,7 +279,7 @@ class ParallelPlan:
     cp_size: int = 1
     cp_rank: int = 0
     sp_enabled: bool = False
-    
+
     def __post_init__(self) -> None:
         for size, rank, name in (
             (self.tp_size, self.tp_rank, "tp"),
@@ -242,7 +301,8 @@ class ParallelPlan:
     def is_single_process(self) -> bool:
         """When true every collective in ``ayaka.distributed`` degrades to identity"""
         return self.world_size == 1 and self.ep_size == 1
-    
+
+
 #! CommunicationPlan
 class CommOpKind(enum.StrEnum):
     ALL_REDUCE = "all_reduce"
@@ -253,7 +313,7 @@ class CommOpKind(enum.StrEnum):
     SEND = "send"
     RECV = "recv"
     BARRIER = "barrier"
-    
+
 
 @dataclass(frozen=True, slots=True)
 class CommOp:
@@ -264,7 +324,8 @@ class CommOp:
     stream: StreamRole = StreamRole.COMM
     peer_rank: int | None = None  # SEND/RECV only
     layer_index: int | None = None  # anchor for overlap scheduling
-    
+
+
 @dataclass(frozen=True, slots=True)
 class CommunicationPlan:
     ops: tuple[CommOp, ...] = ()
@@ -273,7 +334,8 @@ class CommunicationPlan:
     @property
     def total_bytes(self) -> int:
         return sum(op.nbytes for op in self.ops)
-    
+
+
 #! KernelPlan
 @dataclass(frozen=True, slots=True)
 class KernelChoice:
@@ -297,12 +359,14 @@ class KernelPlan:
                 return c
         return None
 
+
 #! GraphPlan
 class GraphMode(enum.StrEnum):
     EAGER = "eager"
     CAPTURE = "capture"
     REPLAY = "replay"
-    
+
+
 @dataclass(frozen=True, slots=True)
 class GraphPlan:
     """CUDA-graph decision.  ``bucket`` is the padded batch size the graph was
@@ -312,6 +376,7 @@ class GraphPlan:
     mode: GraphMode = GraphMode.EAGER
     bucket: int = 0
     graph_key: str = ""
+
 
 #! SamplingPlan
 @dataclass(frozen=True, slots=True)
@@ -341,7 +406,7 @@ class SamplingPlan:
     all_greedy: bool = True
     any_penalty: bool = False
     custom_ops: tuple[str, ...] = ()
-    
+
     def __post_init__(self) -> None:
         if self.num_rows < 0 or self.num_mask_rows < 0:
             raise ValueError("sampling row counts must be non-negative")
@@ -364,50 +429,41 @@ class SamplingPlan:
         cryptic driver error inside a context manager.
         """
         return not self.custom_ops
-    
-#! ExecutionPlan
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionPlan:
-    """The whole step, decided.  Immutable and self-contained: an executor given
-    only this object and the model weights can run the step."""
-    
-    plan_id: str
-    step_id: int
-    batch: BatchPlan
-    compute: ComputePlan
-    memory: MemoryPlan
-    kv: KVPlan
-    weight_residency: WeightResidencyPlan = field(default_factory=WeightResidencyPlan)
-    parallel: ParallelPlan = field(default_factory=ParallelPlan)
-    communication: CommunicationPlan = field(default_factory=CommunicationPlan)
-    kernel: KernelPlan = field(default_factory=KernelPlan)
-    graph: GraphPlan = field(default_factory=GraphPlan)
-    sampling: SamplingPlan = field(default_factory=SamplingPlan)
+    """Resolved execution configuration shared by many iterations.
 
-    # the plan is the unit of tracing.
-    trace_ids: tuple[str, ...] = ()
-    created_ns: int = 0
+    plan_id names this exact model/weights/configuration revision. Callers
+    must issue a new identity when a resolved field changes. Dynamic batch,
+    memory, KV, communication, graph and sampling data now belong to
+    ayaka.sched.plan.BatchStepPlan and PreparedStep.
+
+    This intentionally replaces the former per-step constructor. Empty
+    attention groups support contract-only configuration; they do not assert
+    that a runnable model or attention backend exists.
+    """
+
+    plan_id: str
+    model_id: str
+    model_revision: str
+    weights_revision: str
+    compute: ComputePlan
+    parallel: ParallelPlan = field(default_factory=ParallelPlan)
+    kernel: KernelPlan = field(default_factory=KernelPlan)
+    attention_groups: tuple[AttentionGroupSpec, ...] = ()
 
     def __post_init__(self) -> None:
-        if len(self.kv.slot_mapping) != self.batch.num_tokens:
-            raise ValueError(
-                f"slot_mapping has {len(self.kv.slot_mapping)} entries, "
-                f"batch has {self.batch.num_tokens} tokens"
-            )
-        if len(self.kv.block_tables) != self.batch.num_seqs:
-            raise ValueError(
-                f"block_tables has {len(self.kv.block_tables)} rows, "
-                f"batch has {self.batch.num_seqs} sequences"
-            )
-        if self.graph.mode is GraphMode.REPLAY and not self.batch.is_pure_decode:
-            raise ValueError("graph replay requested for a non pure-decode batch")
-        if self.sampling.num_rows > self.batch.num_seqs:
-            raise ValueError(
-                f"sampling plans {self.sampling.num_rows} rows but the batch has "
-                f"{self.batch.num_seqs} sequences"
-            )
-        if self.graph.mode is GraphMode.REPLAY and not self.sampling.graph_capturable:
-            raise ValueError(
-                f"graph replay requested with custom ops {self.sampling.custom_ops}; "
-                "tier-2 ops are the slow path by design"
-            )
+        require_frozen(self, "execution plan")
+        for name in ("plan_id", "model_id", "model_revision", "weights_revision"):
+            require_text(getattr(self, name), name)
+        group_ids = [group.group_id for group in self.attention_groups]
+        layer_ids = [layer for group in self.attention_groups for layer in group.layer_ids]
+        if len(set(group_ids)) != len(group_ids) or len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("attention groups and their layer assignments must be unique")
+
+    @property
+    def execution_plan_id(self) -> str:
+        """Identity referenced by dynamic steps using this configuration."""
+        return self.plan_id

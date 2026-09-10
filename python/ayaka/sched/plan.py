@@ -1,3 +1,9 @@
+"""Immutable host contracts between request scheduling and execution.
+
+These values neither allocate resources nor prove device completion. Physical
+page snapshots become usable only while their execution lease is retained.
+"""
+
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -19,8 +25,14 @@ from ayaka.plan import (
 from ayaka.utils.validation import require_frozen, require_int, require_text
 
 __all__ = [
-    "BatchStepPlan", "DistributedStepIdentity", "KVRequirement", "Phase",
-    "PreparedStep", "RequestStepInput", "ScheduledSlice", "StepDependency",
+    "BatchStepPlan",
+    "DistributedStepIdentity",
+    "KVRequirement",
+    "Phase",
+    "PreparedStep",
+    "RequestStepInput",
+    "ScheduledSlice",
+    "StepDependency",
 ]
 
 
