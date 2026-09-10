@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from ayaka.configs.base import ConfigMixin
+
 if TYPE_CHECKING:
     from ayaka.configs.model_source import ModelSourceConfig
 
@@ -71,7 +73,7 @@ DetokBackend = Literal["auto", "stream", "window"]
 
 
 @dataclass(frozen=True, slots=True)
-class TokenizerConfig:
+class TokenizerConfig(ConfigMixin):
     """Immutable configuration for loading and operating a tokenizer.
 
     ``tokenizer`` is the only required field; it names the hub ID or local

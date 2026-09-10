@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
-
-from ayaka.configs.base import ConfigError, ConfigMixin
-from ayaka.configs.model import ArchitectureConfig
 
 
 class AllToAllBackend(enum.StrEnum):

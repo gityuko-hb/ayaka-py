@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
-from typing import Mapping
 
 class EvictionPolicy(enum.StrEnum):
     """Eviction strategies for physical KV-cache block managers and memory tiers.

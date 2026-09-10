@@ -4,57 +4,12 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass
 
+from ayaka.configs.scheduler import SchedulerConfig
 from ayaka.sched.plan import BatchStepPlan
-from ayaka.types import MemoryTier
 from ayaka.utils.validation import require_int
 
-
-@dataclass(frozen=True, slots=True)
-class SchedulerConfig:
-    """Engine-thread policy limits. Times are absolute monotonic nanoseconds.
-
-    ``iteration_ns`` limits predicted execution time, not a promised deadline.
-    Memory is charged by the shared ledger during reversible preparation; an
-    optional lower tier limit is checked before adoption. Transfer credits cover
-    metadata, model input/output copies and KV copies through ticket retirement.
-    ``max_bypass`` bounds successful scheduling opportunities before an older
-    runnable request takes precedence over ordinary decode priority.
-    """
-
-    max_tokens: int = 128
-    prefill_chunk: int = 64
-    max_batch_requests: int = 16
-    max_requests: int = 256
-    max_inflight: int = 1
-    max_bypass: int = 8
-    iteration_ns: int = 1_000_000_000
-    retry_ns: int = 1_000_000
-    transfer_bytes: int = 64 << 20
-    tier_limits: tuple[tuple[MemoryTier, int], ...] = ()
-
-    def __post_init__(self):
-        for name in (
-            "max_tokens",
-            "prefill_chunk",
-            "max_batch_requests",
-            "max_requests",
-            "max_inflight",
-            "max_bypass",
-            "iteration_ns",
-            "retry_ns",
-        ):
-            require_int(getattr(self, name), name, minimum=1)
-        require_int(self.transfer_bytes, "transfer_bytes")
-        if type(self.tier_limits) is not tuple:
-            raise TypeError("tier_limits must be an immutable tuple")
-        if len({tier for tier, _ in self.tier_limits}) != len(self.tier_limits):
-            raise ValueError("duplicate memory tier limit")
-        for tier, limit in self.tier_limits:
-            if not isinstance(tier, MemoryTier) or not tier.allocatable:
-                raise ValueError("invalid memory tier")
-            require_int(limit, "tier limit")
+__all__ = ["SchedulerConfig", "TimeEstimator"]
 
 
 class TimeEstimator:
