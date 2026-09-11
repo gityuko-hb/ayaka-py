@@ -32,6 +32,12 @@ _MIN_WORKSPACE = 256 * 1024 * 1024
 _WORKSPACE_SLACK = 32 * 1024 * 1024
 _MAX_HEAD_DIM = 256
 
+#: FlashInfer spells its layouts in uppercase; ``KVLayoutKind`` values are lowercase.
+_FLASHINFER_LAYOUT: dict[KVLayoutKind, str] = {
+    KVLayoutKind.NHD: "NHD",
+    KVLayoutKind.HND: "HND",
+}
+
 _FLASHINFER_REMEDY = 'pip install "flashinfer-python>=0.6,<0.7"'
 
 
@@ -153,12 +159,12 @@ class FlashInferMetadataBuilder(BaseAttentionMetadataBuilder):
         # Separate int workspaces: sharing one through private attributes saved 8 MiB and
         # coupled two wrappers that the graph path must be able to own independently.
         self._prefill = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            self._float_workspace, kv_layout=group.kv_layout.value, backend="fa2"
+            self._float_workspace, kv_layout=_FLASHINFER_LAYOUT[group.kv_layout], backend="fa2"
         )
         self._decode = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             self._float_workspace,
             use_tensor_cores=spec.gqa_group_size >= 4,
-            kv_layout=group.kv_layout.value,
+            kv_layout=_FLASHINFER_LAYOUT[group.kv_layout],
             backend="fa2",
         )
 
@@ -299,7 +305,7 @@ class FlashInferMetadataBuilder(BaseAttentionMetadataBuilder):
             # mutation of _backend is needed to pin the kernel family.
             wrapper = self._flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 self._float_workspace,
-                kv_layout=self.group.kv_layout.value,
+                kv_layout=_FLASHINFER_LAYOUT[self.group.kv_layout],
                 use_cuda_graph=True,
                 use_tensor_cores=self.spec.gqa_group_size >= 4,
                 paged_kv_indptr_buffer=self._graph_indptr[: bs + 1],
