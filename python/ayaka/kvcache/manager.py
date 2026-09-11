@@ -97,8 +97,8 @@ class LogicalKVManager:
             for requirement in step.kv_requirements:
                 if requirement.append_tokens != step.num_tokens:
                     raise ValueError("KV append requirement disagrees with packed token count")
-                if requirement.cow_pages or requirement.restore_bytes or requirement.growth_bytes:
-                    raise ValueError("P2 supports resident append with private tails only")
+                if requirement.restore_bytes or requirement.growth_bytes:
+                    raise ValueError("resident append/COW does not support restore or slab growth")
 
     def reserve(self, step: BatchStepPlan) -> MemoryView:
         """Atomically reserve all sequences/groups; prepare never commits progress."""

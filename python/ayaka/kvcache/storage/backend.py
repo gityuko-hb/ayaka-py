@@ -559,9 +559,10 @@ class PagedKVStorage:
         :meth:`write`, instead of re-validating the same addresses
         ``num_layers`` times.
 
-        Set ``validate=False`` only when ``slots`` is a device tensor the caller
-        built and knows to be in range: that path issues no ``.item()`` and is
-        therefore safe to capture into a CUDA graph.
+        ``validate=False`` issues no ``.item()`` but does not establish write
+        uniqueness. Such an index may be gathered, not passed to ``write``.
+        For graph writes use a host-validated prepared store such as the paged
+        decode adapter; do not fabricate a uniqueness flag for mutable indices.
         """
         self._check_open()
         return slot_index(

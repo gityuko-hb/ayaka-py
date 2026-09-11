@@ -399,6 +399,7 @@ def _gemma_rms_norm_ref(
     out_shape="input",
     reference=_rms_norm_ref,
     dispatch_key="CUDA",
+    mutates_args=["out"],
 )
 def rms_norm(
     input: torch.Tensor,
@@ -416,6 +417,7 @@ def rms_norm(
     out_shape="input",
     reference=_gemma_rms_norm_ref,
     dispatch_key="CUDA",
+    mutates_args=["out"],
 )
 def gemma_rms_norm(
     input: torch.Tensor,
@@ -483,6 +485,7 @@ def _qk_rms_norm_ref(
     out_shape="input",
     reference=_qk_rms_norm_ref,
     dispatch_key="CUDA",
+    mutates_args=["out"],
 )
 def qk_rms_norm(
     input: torch.Tensor,
@@ -743,6 +746,7 @@ def _layer_norm_ref(
     out_shape="input",
     reference=_layer_norm_ref,
     dispatch_key="CUDA",
+    mutates_args=["out"],
 )
 def layer_norm(
     input: torch.Tensor,

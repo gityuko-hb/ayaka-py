@@ -5,7 +5,7 @@ import functools
 import inspect
 import logging
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -281,6 +281,7 @@ def custom_op(
     name: str | None = None,
     namespace: str = "ayaka",
     mutates_args: list[str] | None = None,
+    returns_aliases: tuple[str, ...] = (),
     out_shape: int | str | None = None,
     out_dtype: torch.dtype | None = None,
     fake_impl: Callable[..., Any] | None = None,
@@ -303,6 +304,10 @@ def custom_op(
         out_shape: Position or name of the argument whose shape the
             output mirrors, used to synthesise a fake implementation.
             ``None`` means the op returns nothing.
+        returns_aliases: Names of mutated inputs returned as a tuple by the
+            Python API. The underlying dispatcher op returns nothing, keeping
+            aliasing outside the opaque compiler boundary. Optional ``out``
+            APIs automatically use separate functional and mutating ops.
         out_dtype: Override the fake output dtype, for ops whose output
             dtype differs from the mirrored input (fp8 in, bf16 out).
         fake_impl: A hand-written meta kernel, when `out_shape` cannot
@@ -330,18 +335,7 @@ def custom_op(
         if computed_args:
             registered_func = _reduce_signature(op_func, computed_args)
 
-        meta = fake_impl or _build_fake_impl(
-            registered_func, out_shape, out_dtype, resolved_name
-        )
-
-        _register(
-            op_name=resolved_name,
-            namespace=namespace,
-            op_func=registered_func,
-            mutates_args=mutates_args or [],
-            fake_impl=meta,
-            dispatch_key=dispatch_key,
-        )
+        meta = fake_impl or _build_fake_impl(registered_func, out_shape, out_dtype, resolved_name)
 
         handle = OpHandle(
             name=resolved_name,
@@ -350,6 +344,90 @@ def custom_op(
             reference=reference,
             mutates_args=mutates_args or [],
         )
+        mutations = mutates_args or []
+        signature = inspect.signature(registered_func)
+        optional_out = mutations == ["out"] and signature.parameters["out"].default is None
+        if returns_aliases and not set(returns_aliases).issubset(mutations):
+            raise ValueError("returned aliases must be declared mutated inputs")
+        if optional_out or returns_aliases:
+            import torch
+
+            annotations = inspect.get_annotations(registered_func, eval_str=True)
+            signature = signature.replace(
+                parameters=[
+                    param.replace(annotation=annotations.get(key, param.annotation))
+                    for key, param in signature.parameters.items()
+                ],
+                return_annotation=annotations.get("return", signature.return_annotation),
+            )
+            positions = {key: i for i, key in enumerate(signature.parameters)}
+
+            @functools.wraps(registered_func)
+            def void_impl(*args: Any, **kwargs: Any) -> None:
+                registered_func(*args, **kwargs)
+
+            void_impl.__signature__ = signature.replace(return_annotation=None)  # type: ignore[attr-defined]
+            void_impl.__annotations__ = {**annotations, "return": None}
+            void_name = resolved_name + "_out" if optional_out else resolved_name
+            _register(
+                op_name=void_name,
+                namespace=namespace,
+                op_func=void_impl,
+                mutates_args=mutations,
+                fake_impl=lambda *args, **kwargs: None,
+                dispatch_key=dispatch_key,
+            )
+            void_op = getattr(getattr(torch.ops, namespace), void_name)
+            if optional_out:
+                out_index = positions["out"]
+
+                @functools.wraps(registered_func)
+                def functional_impl(*args: Any, **kwargs: Any) -> Any:
+                    out = args[out_index] if len(args) > out_index else kwargs.get("out")
+                    if out is not None:
+                        raise ValueError("use the public OpHandle for out= dispatch")
+                    return registered_func(*args, **kwargs)
+
+                functional_impl.__signature__ = signature  # type: ignore[attr-defined]
+                functional_impl.__annotations__ = annotations
+                _register(
+                    op_name=resolved_name,
+                    namespace=namespace,
+                    op_func=functional_impl,
+                    mutates_args=[],
+                    fake_impl=meta,
+                    dispatch_key=dispatch_key,
+                )
+                functional_op = getattr(getattr(torch.ops, namespace), resolved_name)
+
+                def dispatch_out(*args: Any, **kwargs: Any) -> Any:
+                    out = args[out_index] if len(args) > out_index else kwargs.get("out")
+                    if out is None:
+                        return functional_op(*args, **kwargs)
+                    void_op(*args, **kwargs)
+                    return out
+
+                handle._dispatch = dispatch_out
+            else:
+                alias_positions = tuple((key, positions[key]) for key in returns_aliases)
+
+                def dispatch_aliases(*args: Any, **kwargs: Any) -> Any:
+                    void_op(*args, **kwargs)
+                    return tuple(
+                        args[index] if len(args) > index else kwargs[key]
+                        for key, index in alias_positions
+                    )
+
+                handle._dispatch = dispatch_aliases
+        else:
+            _register(
+                op_name=resolved_name,
+                namespace=namespace,
+                op_func=registered_func,
+                mutates_args=mutations,
+                fake_impl=meta,
+                dispatch_key=dispatch_key,
+            )
         _REGISTRY[resolved_name] = handle
         return handle
 
@@ -399,7 +477,7 @@ def registered_ops() -> dict[str, OpHandle]:
 
 
 @contextlib.contextmanager
-def force_reference(*names: str) -> Iterator[None]:
+def force_reference(*names: str) -> Generator[None]:
     """Route the named ops (or all of them) to their reference.
 
     ``with force_reference():`` covers everything; naming ops narrows it,

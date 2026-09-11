@@ -202,16 +202,13 @@ def _gelu_quick_ref(
         return out
     return res
 
-
-# --- Public Custom Ops ---
-
-
 @custom_op(
     namespace="ayaka",
     name="silu_and_mul",
     fake_impl=_act_and_mul_fake,
     reference=_silu_and_mul_ref,
     dispatch_key="CUDA",
+    mutates_args=["out"]
 )
 def silu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute ``silu(input[..., :d]) * input[..., d:]``."""
@@ -224,6 +221,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.
     fake_impl=_act_and_mul_fake,
     reference=_gelu_and_mul_ref,
     dispatch_key="CUDA",
+    mutates_args=["out"]
 )
 def gelu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute exact-erf GELU on the first half and multiply by the second."""
@@ -236,6 +234,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.
     fake_impl=_act_and_mul_fake,
     reference=_gelu_tanh_and_mul_ref,
     dispatch_key="CUDA",
+    mutates_args=["out"]
 )
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute tanh-approximate GELU on the first half and multiply by the second."""
@@ -248,6 +247,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> t
     out_shape="input",
     reference=_gelu_quick_ref,
     dispatch_key="CUDA",
+    mutates_args=["out"]
 )
 def gelu_quick(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute ``x * sigmoid(1.702 * x)`` without a multiply-gate input."""
