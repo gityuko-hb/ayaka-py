@@ -58,6 +58,13 @@ cuda = [
     "triton-windows>=3.7,<3.8; sys_platform == 'win32'",
 ]
 cpu = ["torch>=2.12"]
+# Paged-attention backends. Kept out of `cuda` on purpose: flash-attn is an sdist and a
+# multi-hour source build, so opting into "the CUDA extra" must not silently demand it.
+#   flashinfer: a pure-Python wheel (`py3-none-any`), but its kernels JIT-compile at first use.
+#   flash-attn: FA2 (sm80-sm89) from this sdist; FA3 (sm90) ships in the repo's hopper/ dir
+#               and is not on PyPI. No binary wheels exist, including on Windows.
+flashinfer = ["flashinfer-python>=0.6,<0.7"]
+flash-attn = ["flash-attn>=2.7,<3"]
 
 [project.scripts]
 ayaka = "ayaka.entrypoints.cli:main"
