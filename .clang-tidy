@@ -1,0 +1,3 @@
+Checks: "-*,bugprone-*,cppcoreguidelines-init-variables,modernize-use-nullptr,readability-braces-around-statements,readability-identifier-length"
+HeaderFilterRegex: "^(?!.*(third_party|include|csrc)).*$"
+ExcludeHeaderFilterRegex: ".*"

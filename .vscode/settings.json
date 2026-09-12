@@ -1,0 +1,38 @@
+{
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.configureArgs": [
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        "-DAYAKA_ENABLE_CUDA=${env:AYAKA_ENABLE_CUDA:-OFF}"
+    ],
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "clangd.arguments": [
+        "--background-index",
+        "--clang-tidy"
+    ],
+    "rust-analyzer.checkOnSave": true,
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "editor.formatOnSave": true,
+    "[cpp]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    },
+    "[c]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    },
+    "[cuda-cpp]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    },
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer"
+    },
+    "files.associations": {
+        "*.cu": "cuda-cpp",
+        "*.cuh": "cuda-cpp"
+    },
+    "git.ignoreLimitWarning": true,
+    "files.watcherExclude": {
+        "**/target/**": true,
+        "**/build/**": true,
+        "**/.git/**": true
+    }
+}
