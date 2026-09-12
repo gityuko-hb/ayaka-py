@@ -221,7 +221,7 @@ def _layer_norm_kernel(
         offsets = start + lanes
         mask = offsets < d
         x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(tl.float32)
-        diff = x - mean
+        diff = tl.where(mask, x - mean, 0.0)
         var_lanes += diff * diff
     variance = tl.sum(var_lanes, axis=0) / d
     rstd = tl.rsqrt(variance + eps)
@@ -643,6 +643,7 @@ def _gemma_fused_add_rms_norm_ref(
     namespace="ayaka",
     name="fused_add_rms_norm",
     mutates_args=["input", "residual"],
+    returns_aliases=("input", "residual"),
     fake_impl=_fused_add_fake,
     reference=_fused_add_rms_norm_ref,
     dispatch_key="CUDA",
@@ -670,6 +671,7 @@ def fused_add_rms_norm(
     namespace="ayaka",
     name="gemma_fused_add_rms_norm",
     mutates_args=["input", "residual"],
+    returns_aliases=("input", "residual"),
     fake_impl=_fused_add_fake,
     reference=_gemma_fused_add_rms_norm_ref,
     dispatch_key="CUDA",
