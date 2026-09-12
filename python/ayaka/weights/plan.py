@@ -26,6 +26,7 @@ class CheckpointFormat(enum.StrEnum):
     PYTORCH_BIN = "pytorch_bin"
     DUMMY = "dummy"
 
+
 class LoadState(enum.StrEnum):
     # Bootstrap state machine
 
@@ -39,6 +40,7 @@ class LoadState(enum.StrEnum):
     WEIGHTS_READY = "weights_ready"
     RUNTIME_READY = "runtime_ready"
     FAILED = "failed"
+
 
 class WeightTransform(enum.StrEnum):
     """One step of the materialization pipeline.
@@ -56,6 +58,7 @@ class WeightTransform(enum.StrEnum):
     CAST = "cast"  # to the compute dtype, last, on the smallest tensor
     CONTIGUOUS = "contiguous"
 
+
 TRANSFORM_ORDER: Final[tuple[WeightTransform, ...]] = (
     WeightTransform.DECODE,
     WeightTransform.SLICE,
@@ -64,6 +67,7 @@ TRANSFORM_ORDER: Final[tuple[WeightTransform, ...]] = (
     WeightTransform.CAST,
     WeightTransform.CONTIGUOUS,
 )
+
 
 @dataclass(frozen=True, slots=True)
 class ManifestEntry:
@@ -103,6 +107,7 @@ class ManifestEntry:
     @property
     def end_offset(self) -> int:
         return self.byte_offset + self.nbytes
+
 
 @dataclass(frozen=True, slots=True)
 class CheckpointManifest:
@@ -166,6 +171,7 @@ class CheckpointManifest:
                 return e
         return None
 
+
 @dataclass(frozen=True, slots=True)
 class WeightPlacement:
     """Which rank and which device own one shard.
@@ -216,7 +222,7 @@ class FileReadPlan:
     byte_offset: int
     nbytes: int
     run_bytes: int = 0  # 0 = one contiguous run of `nbytes`
-    stride_bytes: int = 0
+    stride_bytes: int = 0  # distance between run starts; >= run_bytes whenever strided
     run_count: int = 1
 
     def __post_init__(self) -> None:
@@ -231,10 +237,17 @@ class FileReadPlan:
                 raise ValueError(
                     f"{self.file_uri}: {self.run_count}×{self.run_bytes} != {self.nbytes}"
                 )
-            if self.stride_bytes and self.stride_bytes < self.run_bytes:
+            # No exceptions, not even stride 0: zero stride means the runs are
+            # packed back to back, which is a contiguous read wearing a
+            # costume — and the reader and span_bytes each guessed a different
+            # meaning for it.  Say contiguous (run_bytes=0) or say a real
+            # stride; packed strided runs are refused so planner and reader
+            # cannot silently disagree.
+            if self.stride_bytes < self.run_bytes:
                 raise ValueError(
                     f"{self.file_uri}: stride {self.stride_bytes} < run {self.run_bytes} — "
-                    "overlapping runs would read the same bytes twice"
+                    "overlapping runs would read the same bytes twice; use a contiguous "
+                    "read (run_bytes=0) for packed runs"
                 )
         elif self.run_count != 1:
             raise ValueError(f"{self.file_uri}: contiguous read cannot have run_count > 1")
@@ -250,6 +263,7 @@ class FileReadPlan:
         if self.is_contiguous or not self.stride_bytes:
             return self.nbytes
         return (self.run_count - 1) * self.stride_bytes + self.run_bytes
+
 
 @dataclass(frozen=True, slots=True)
 class TensorSlice:
@@ -651,9 +665,9 @@ class WeightLoadPlan:
                 )
         return h.hexdigest()
 
+
 @dataclass(frozen=True, slots=True)
 class ModelLoadReport:
-
     state: LoadState = LoadState.CREATED
     plan_digest: str = ""
     checkpoint_bytes: int = 0
