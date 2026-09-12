@@ -188,10 +188,21 @@ def resolve_source(
             )
         cache = hub_cache_dir(source.model, cache_dir=source.cache_dir)
         snapshot = _latest_snapshot(cache, source.revision)
-        if snapshot is None:
+        # A snapshot left half-fetched — pass one died mid-download — has a
+        # directory but no usable contents.  Trusting it turns "network hiccup,
+        # retry" into "no config.json", so an incomplete snapshot is treated
+        # exactly like no snapshot at all: fetch.
+        usable = snapshot is not None and (snapshot / CONFIG_FILENAME).is_file()
+        if snapshot is not None and not usable and source.offline:
+            raise SourceNotFoundError(
+                f"offline mode: local snapshot for {source.model!r} is incomplete "
+                f"(no {CONFIG_FILENAME} in {snapshot}) — re-fetch with network access"
+            )
+        if snapshot is None or not usable:
             if source.offline:
                 raise SourceNotFoundError(
-                    f"offline mode and no local snapshot for {source.model!r} (looked in {cache})"
+                    f"offline mode and no local snapshot for {source.model!r} "
+                    f"(looked in {cache})"
                 )
             if fetch_snapshot is None:
                 raise SourceNotFoundError(

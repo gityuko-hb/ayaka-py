@@ -86,27 +86,48 @@ class SnapshotDownloader(Protocol):
     ) -> str: ...
 
 
+# Windows winsock errors worth a retry.  10054 (connection reset) and 10038
+# ("not a socket" — reading a descriptor the reset already closed) travel in
+# pairs: the CDN cut the connection and the client then tripped over the
+# corpse.  10053/10060 are the same family (abort, timed out); 10037 is the
+# non-blocking connect collision that started this set.
+_TRANSIENT_WINERRORS = frozenset({10037, 10038, 10053, 10054, 10060})
+
+
 def _is_transient(exc: Exception) -> bool:
     """Whether a fetch failure is the kind a retry can fix.
 
-    Connection resets, read timeouts and Windows winsock races (10037,
-    WSAEALREADY — non-blocking connect colliding with one already in flight)
-    are transient.  A 404, a validation error or an auth refusal never becomes
-    true by waiting, so those propagate on the first attempt.
+    Connection resets, read timeouts, and Windows winsock races are transient.
+    A 404, a validation error or an auth refusal never becomes true by waiting,
+    so those propagate on the first attempt.  Name matching is a last resort
+    for urllib3/httpx wrapper exceptions that are not OSError subclasses:
+    huggingface_hub's ReadError ("operation on a socket that is already
+    closed") carries none of the usual words, so it is listed explicitly.
     """
     if isinstance(exc, (ConnectionError, TimeoutError)):
         return True
+    transient_oserror = False
     if isinstance(exc, OSError):
-        # BlockingIOError(10037) surfaces errno, not winerror, depending on how
-        # the socket layer raised; check both.
-        if getattr(exc, "winerror", None) == 10037 or exc.errno == 10037:
-            return True
-        return exc.errno in (errno.ECONNRESET, errno.ECONNABORTED, errno.ETIMEDOUT, errno.EAGAIN)
-    # requests' ConnectionError is an OSError subclass in practice, but some
-    # urllib3 wrappers are not; treat any exception whose type name mentions a
-    # connection or timeout as transient rather than importing urllib3 here.
+        winerror = getattr(exc, "winerror", None)
+        if winerror is not None and winerror in _TRANSIENT_WINERRORS:
+            transient_oserror = True
+        elif exc.errno in _TRANSIENT_WINERRORS:
+            transient_oserror = True
+        elif exc.errno in (errno.ECONNRESET, errno.ECONNABORTED, errno.ETIMEDOUT, errno.EAGAIN):
+            transient_oserror = True
+        # An OSError with no usable winerror/errno (huggingface_hub's
+        # IncompleteSnapshotError is a FileNotFoundError carrying the winsock
+        # code only in its message text) falls through to the name and message
+        # checks below instead of being refused on the type alone.
     name = type(exc).__name__.lower()
-    return "connection" in name or "timeout" in name
+    if any(word in name for word in ("connection", "timeout", "read", "reset", "incomplete")):
+        return True
+    # The winsock code can also surface only in the message text, wrapped by an
+    # exception type that is neither OSError nor carries errno — fall back to
+    # scanning it once.
+    if any(str(code) in str(exc) for code in _TRANSIENT_WINERRORS):
+        return True
+    return transient_oserror
 
 
 def _with_retry(operation: Callable[[], Path], *, model: str, revision: str) -> Path:
