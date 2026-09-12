@@ -154,7 +154,7 @@ def _silu_and_mul_ref(
     d = last_dim // 2
     x = input[..., :d].float()
     gate = input[..., d:].float()
-    res = (F.silu(x) * gate).to(input.dtype)
+    res = (F.silu(x).to(input.dtype).float() * gate).to(input.dtype)
     if out is not None:
         out.copy_(res)
         return out
@@ -169,7 +169,7 @@ def _gelu_and_mul_ref(
     d = last_dim // 2
     x = input[..., :d].float()
     gate = input[..., d:].float()
-    res = (F.gelu(x, approximate="none") * gate).to(input.dtype)
+    res = (F.gelu(x, approximate="none").to(input.dtype).float() * gate).to(input.dtype)
     if out is not None:
         out.copy_(res)
         return out
@@ -184,7 +184,7 @@ def _gelu_tanh_and_mul_ref(
     d = last_dim // 2
     x = input[..., :d].float()
     gate = input[..., d:].float()
-    res = (F.gelu(x, approximate="tanh") * gate).to(input.dtype)
+    res = (F.gelu(x, approximate="tanh").to(input.dtype).float() * gate).to(input.dtype)
     if out is not None:
         out.copy_(res)
         return out
@@ -202,13 +202,14 @@ def _gelu_quick_ref(
         return out
     return res
 
+
 @custom_op(
     namespace="ayaka",
     name="silu_and_mul",
     fake_impl=_act_and_mul_fake,
     reference=_silu_and_mul_ref,
     dispatch_key="CUDA",
-    mutates_args=["out"]
+    mutates_args=["out"],
 )
 def silu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute ``silu(input[..., :d]) * input[..., d:]``."""
@@ -221,7 +222,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.
     fake_impl=_act_and_mul_fake,
     reference=_gelu_and_mul_ref,
     dispatch_key="CUDA",
-    mutates_args=["out"]
+    mutates_args=["out"],
 )
 def gelu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute exact-erf GELU on the first half and multiply by the second."""
@@ -234,7 +235,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.
     fake_impl=_act_and_mul_fake,
     reference=_gelu_tanh_and_mul_ref,
     dispatch_key="CUDA",
-    mutates_args=["out"]
+    mutates_args=["out"],
 )
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute tanh-approximate GELU on the first half and multiply by the second."""
@@ -247,7 +248,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> t
     out_shape="input",
     reference=_gelu_quick_ref,
     dispatch_key="CUDA",
-    mutates_args=["out"]
+    mutates_args=["out"],
 )
 def gelu_quick(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute ``x * sigmoid(1.702 * x)`` without a multiply-gate input."""

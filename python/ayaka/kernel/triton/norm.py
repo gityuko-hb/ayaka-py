@@ -618,9 +618,10 @@ def _fused_add_rms_norm_ref(
     weight: torch.Tensor,
     eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    residual.add_(input)
-    variance = residual.float().pow(2).mean(-1, keepdim=True)
-    normed = (residual.float() * torch.rsqrt(variance + eps) * weight.float()).to(input.dtype)
+    summed = input.float() + residual.float()
+    variance = summed.pow(2).mean(-1, keepdim=True)
+    normed = (summed * torch.rsqrt(variance + eps) * weight.float()).to(input.dtype)
+    residual.copy_(summed)
     input.copy_(normed)
     return input, residual
 
@@ -631,10 +632,11 @@ def _gemma_fused_add_rms_norm_ref(
     weight: torch.Tensor,
     eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    residual.add_(input)
-    variance = residual.float().pow(2).mean(-1, keepdim=True)
+    summed = input.float() + residual.float()
+    variance = summed.pow(2).mean(-1, keepdim=True)
     scale = weight.float() + 1.0
-    normed = (residual.float() * torch.rsqrt(variance + eps) * scale).to(input.dtype)
+    normed = (summed * torch.rsqrt(variance + eps) * scale).to(input.dtype)
+    residual.copy_(summed)
     input.copy_(normed)
     return input, residual
 

@@ -12,6 +12,7 @@ _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _BLOCK_SIZE = 256
 _NUM_WARPS = 4
 
+
 @triton.jit
 def _rotary_embedding_kernel(
     positions_ptr,
@@ -176,7 +177,9 @@ def _apply_rotary_ref(
     embed_dim = rot_dim // 2
     flat_positions = positions.flatten()
     num_tokens = flat_positions.numel()
-    num_heads = tensor.numel() // (num_tokens * head_size)
+    num_heads = (
+        tensor.shape[-2] if tensor.ndim == positions.ndim + 2 else tensor.shape[-1] // head_size
+    )
 
     flat_tensor = tensor.view(num_tokens, num_heads, head_size)
     cache = cos_sin_cache[flat_positions]
@@ -322,4 +325,3 @@ def rotary_embedding(
     if key is None:
         return query
     return query, key
-
