@@ -1,9 +1,17 @@
+"""Executes read plans against local safetensors files.
+
+Failures are deterministic: :meth:`BoundedCheckpointReader.read_all` yields
+results in submission order, so a run that reports a bad read at plan index
+``k`` reports the same bad read at index ``k`` on every rerun and every rank —
+a load either fails identically everywhere or succeeds identically everywhere.
+"""
+
 from __future__ import annotations
 
 import mmap
 import os
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
@@ -13,13 +21,26 @@ from ayaka.exceptions import CheckpointCorruptError
 from ayaka.weights.plan import FileReadPlan
 from ayaka.weights.spec import WeightSource
 
+_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+
 
 def safe_pread(fd: int, size: int, offset: int) -> bytes:
+    """Read ``size`` bytes at ``offset`` without disturbing the file position.
+
+    The caller must own the fd exclusively — i.e. one fd per thread.  ``os.pread``
+    is atomic with respect to the file offset, but the Windows fallback below is
+    a ``lseek``/``read`` pair over a shared position and is only safe when no
+    other thread touches the same descriptor concurrently.
+    :class:`BoundedCheckpointReader` guarantees that with its per-thread fd
+    cache; sharing one fd across worker threads here would silently interleave
+    two threads' seek and read.
+    """
     pread = getattr(os, "pread", None)
     if pread is not None:
         return pread(fd, size, offset)
 
-    # Windows fallback: save current position, seek, read, restore
+    # Windows fallback (no os.pread): save position, seek, read, restore.  Safe
+    # only under the one-fd-per-thread discipline documented above.
     current = os.lseek(fd, 0, os.SEEK_CUR)
     try:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -35,6 +56,7 @@ def safe_pread(fd: int, size: int, offset: int) -> bytes:
     finally:
         os.lseek(fd, current, os.SEEK_SET)
 
+
 class ReaderCancelled(CheckpointCorruptError):
     """Raised in place of a read that never ran because the load was cancelled.
 
@@ -43,6 +65,7 @@ class ReaderCancelled(CheckpointCorruptError):
     distinguishable in a log — the second is usually a symptom of the first,
     somewhere else.
     """
+
 
 @dataclass(frozen=True, slots=True)
 class ReadResult:
@@ -59,6 +82,7 @@ class ReadResult:
                 f"offset {self.plan.byte_offset} — short read, usually a truncated file"
             )
 
+
 class BoundedCheckpointReader:
     """Executes read plans.  Owns file handles; owns no tensors.
 
@@ -67,7 +91,15 @@ class BoundedCheckpointReader:
     on the way out.
     """
 
-    __slots__ = ("_cancel", "_handles", "_lock", "_max_inflight", "_pool", "_use_mmap")
+    __slots__ = (
+        "_cancel",
+        "_local",
+        "_lock",
+        "_max_inflight",
+        "_pool",
+        "_thread_maps",
+        "_use_mmap",
+    )
 
     def __init__(self, *, workers: int = 4, max_inflight: int = 8, use_mmap: bool = False) -> None:
         if workers < 1:
@@ -81,7 +113,13 @@ class BoundedCheckpointReader:
         self._max_inflight = max_inflight
         self._use_mmap = use_mmap
         self._cancel = threading.Event()
-        self._handles: dict[str, int] = {}
+        # One fd per thread.  os.pread does not exist on Windows, so the read
+        # path falls back to lseek+read over the *file position* — a shared fd
+        # would let two workers interleave seek and read and silently read each
+        # other's bytes.  Each worker thread therefore opens its own descriptor;
+        # the registry below is what close() uses to release all of them.
+        self._local = threading.local()
+        self._thread_maps: list[dict[str, int]] = []
         self._lock = threading.Lock()
 
     def __enter__(self) -> BoundedCheckpointReader:
@@ -110,21 +148,28 @@ class BoundedCheckpointReader:
     def close(self) -> None:
         self._pool.shutdown(wait=True, cancel_futures=True)
         with self._lock:
-            for fd in self._handles.values():
-                with suppress(OSError):
-                    os.close(fd)
-            self._handles.clear()
+            for handles in self._thread_maps:
+                for fd in handles.values():
+                    with suppress(OSError):
+                        os.close(fd)
+                handles.clear()
+            self._thread_maps.clear()
 
     def _fd(self, uri: str) -> int:
-        with self._lock:
-            fd = self._handles.get(uri)
-            if fd is None:
-                try:
-                    fd = os.open(uri, os.O_RDONLY | os.O_BINARY if hasattr(os, "O_BINARY") else 0)
-                except OSError as exc:
-                    raise CheckpointCorruptError(f"{uri}: cannot open: {exc}") from exc
-                self._handles[uri] = fd
-            return fd
+        handles: dict[str, int] | None = getattr(self._local, "handles", None)
+        if handles is None:
+            handles = {}
+            self._local.handles = handles
+            with self._lock:
+                self._thread_maps.append(handles)
+        fd = handles.get(uri)
+        if fd is None:
+            try:
+                fd = os.open(uri, _OPEN_FLAGS)
+            except OSError as exc:
+                raise CheckpointCorruptError(f"{uri}: cannot open: {exc}") from exc
+            handles[uri] = fd
+        return fd
 
     def _read_one(self, plan: FileReadPlan) -> bytes:
         if self._cancel.is_set():
@@ -142,20 +187,40 @@ class BoundedCheckpointReader:
             if self._cancel.is_set():
                 raise ReaderCancelled(f"{plan.file_uri}: cancelled mid-strided-read")
             chunks.append(self._pread(fd, plan.file_uri, offset, plan.run_bytes))
-            offset += plan.stride_bytes or plan.run_bytes
+            offset += plan.stride_bytes
         return b"".join(chunks)
 
     def _pread(self, fd: int, uri: str, offset: int, nbytes: int) -> bytes:
+        out = bytearray(nbytes)
+        self._read_into(fd, uri, offset, memoryview(out))
+        return bytes(out)
+
+    def _read_into(self, fd: int, uri: str, offset: int, destination: memoryview) -> int:
+        """Fill ``destination`` completely from ``offset``, whatever it takes.
+
+        One dispatcher for both backends so ``readinto`` and the bytes-returning
+        ``_pread`` share a single code path — a fix applied to one cannot drift
+        from the other.
+        """
         if self._use_mmap:
-            return self._mmap_read(fd, uri, offset, nbytes)
-        out = bytearray()
-        remaining = nbytes
+            self._mmap_into(fd, uri, offset, destination)
+            return len(destination)
+        return self._pread_into(fd, uri, offset, destination)
+
+    def _pread_into(self, fd: int, uri: str, offset: int, destination: memoryview) -> int:
+        """pread directly into the caller's buffer, in bounded chunks.
+
+        ``os.pread`` may return fewer bytes than asked on any platform; the
+        loop is not defensive padding, it is the documented contract, and
+        skipping it produces a short buffer that only shows up as garbage
+        weights on large files.  Each chunk is copied into the destination and
+        released, so the transient allocation stays at chunk size instead of a
+        second full copy of the tensor.
+        """
+        filled = 0
+        remaining = len(destination)
         pos = offset
         while remaining:
-            # os.pread may return fewer bytes than asked on any platform; the
-            # loop is not defensive padding, it is the documented contract, and
-            # skipping it produces a short buffer that only shows up as garbage
-            # weights on large files.
             try:
                 chunk = safe_pread(fd, remaining, pos)
             except OSError as exc:
@@ -164,26 +229,28 @@ class BoundedCheckpointReader:
                 raise CheckpointCorruptError(
                     f"{uri}: EOF at offset {pos} with {remaining} B still expected"
                 )
-            out += chunk
+            destination[filled : filled + len(chunk)] = chunk
+            filled += len(chunk)
             pos += len(chunk)
             remaining -= len(chunk)
-        return bytes(out)
+        return filled
 
-    def _mmap_read(self, fd: int, uri: str, offset: int, nbytes: int) -> bytes:
+    def _mmap_into(self, fd: int, uri: str, offset: int, destination: memoryview) -> None:
         # ALLOCATION_GRANULARITY is the mmap page size on all platforms, and mmap() requires
         # the offset to be page-aligned.  The read window is expanded to the nearest page boundary
         # and the returned slice is adjusted to the requested offset.
+        nbytes = len(destination)
         page = mmap.ALLOCATIONGRANULARITY
         base = (offset // page) * page
         span = (offset - base) + nbytes
         try:
             with mmap.mmap(fd, span, offset=base, access=mmap.ACCESS_READ) as mapped:
                 start = offset - base
-                return bytes(mapped[start : start + nbytes])
+                destination[:] = mapped[start : start + nbytes]
         except (OSError, ValueError) as exc:
             raise CheckpointCorruptError(f"{uri}: mmap failed at {offset}: {exc}") from exc
 
-    def read_all(self, plans: Sequence[FileReadPlan]) -> Iterator[ReadResult]:
+    def read_all(self, plans: Sequence[FileReadPlan]) -> Generator[ReadResult]:
         """Yield results in submission order, never more than ``max_inflight`` live.
 
         Submission order rather than completion order because the transform and
@@ -230,17 +297,13 @@ class BoundedCheckpointReader:
 
         ``readinto`` rather than ``read`` because a reader that returns bytes
         allocates them, and then two objects own the staging budget while only
-        one is counted against it.
+        one is counted against it.  The bytes land in ``destination`` directly —
+        mmap slices into the view in one copy, pread fills it in bounded
+        chunks — with no full-size intermediate buffer.
         """
         nbytes = len(destination)
         if nbytes == 0:
             return 0
         if self._cancel.is_set():
             raise ReaderCancelled(f"{source.uri}: load cancelled before this read started")
-        data = self._pread(self._fd(source.uri), source.uri, offset, nbytes)
-        if len(data) != nbytes:  # pragma: no cover - _pread raises first
-            raise CheckpointCorruptError(
-                f"{source.uri}: filled {len(data)} of {nbytes} B at offset {offset}"
-            )
-        destination[:] = data
-        return nbytes
+        return self._read_into(self._fd(source.uri), source.uri, offset, destination)

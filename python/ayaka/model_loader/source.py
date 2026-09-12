@@ -19,17 +19,25 @@ def hub_cache_dir(model: str, *, cache_dir: str = "") -> Path:
 
     Layout knowledge only; nothing here touches the network or requires
     ``huggingface_hub`` to be installed.
+
+    Note: ids are slash-separated but the cache flattens ``/`` to ``--``, so
+    ``"a/b"`` and the (unusual) literal id ``"a--b"`` share one directory.  The
+    Hub itself has this same aliasing, so fixing it here would disagree with
+    where ``snapshot_download`` puts the files; documented rather than fixed.
     """
     base = Path(cache_dir or os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
     if base.name != "hub":
         base = base / "hub"
     return base / ("models--" + model.replace("/", "--"))
 
+
 # Returns the local snapshot directory for a hub id.
 SnapshotFetcher = Callable[[str, str], str]
 
+
 class SourceNotFoundError(ModelLoadError):
     """Nothing at the requested path, and no local hub snapshot for the id."""
+
 
 @dataclass(frozen=True, slots=True)
 class ResolvedSource:
@@ -79,6 +87,7 @@ def safe_join(root: Path, relative: str) -> Path:
         ) from exc
     return resolved
 
+
 def _latest_snapshot(cache: Path, revision: str) -> Path | None:
     snapshots = cache / "snapshots"
     if not snapshots.is_dir():
@@ -89,12 +98,26 @@ def _latest_snapshot(cache: Path, revision: str) -> Path | None:
             return exact
         ref = cache / "refs" / revision
         if ref.is_file():
-            sha = ref.read_text().strip()
+            sha = ref.read_text(encoding="utf-8").strip()
             if (snapshots / sha).is_dir():
                 return snapshots / sha
         return None
-    candidates = sorted(p for p in snapshots.iterdir() if p.is_dir())
-    return candidates[-1] if candidates else None
+    # Newest download wins, not the lexicographically-largest hash: snapshot
+    # dirs are named for commit shas, so name order is arbitrary.  mtime is
+    # the only signal of "the one the user downloaded last"; the name breaks
+    # ties so the choice stays deterministic across identical mtimes.
+    candidates: list[tuple[int, str, Path]] = []
+    for p in snapshots.iterdir():
+        if not p.is_dir():
+            continue
+        try:
+            mtime = p.stat().st_mtime_ns
+        except OSError:
+            continue  # vanished between iterdir and stat; not a candidate
+        candidates.append((mtime, p.name, p))
+    candidates.sort(key=lambda t: (t[0], t[1]))
+    return candidates[-1][2] if candidates else None
+
 
 def _classify(root: Path, requested: RequestedFormat) -> tuple[CheckpointFormat, Path | None]:
     """Decide the format from what is on disk, honouring an explicit request.
@@ -123,6 +146,7 @@ def _classify(root: Path, requested: RequestedFormat) -> tuple[CheckpointFormat,
         f"{SINGLE_FILENAME} or *.safetensors"
     )
 
+
 def resolve_source(
     source: ModelSourceConfig,
     *,
@@ -132,15 +156,16 @@ def resolve_source(
 
     A local directory named ``org/name`` beats a hub lookup for the same string.
     The reverse order is how a typo silently downloads a stranger's model.
-    """
-    if source.reproducible and not source.revision:
-        raise CheckpointSecurityError(
-            "reproducible mode needs a pinned revision; a floating ref resolves "
-            "to different bytes on different days"
-        )
 
+    Reproducible mode is satisfied by any local path without a revision — the
+    bytes on disk are already pinned and cannot move the way a floating ref
+    can.  A hub id must resolve to the exact commit the revision names: the
+    snapshot directory in the cache is named for the commit it holds, so a
+    branch or tag that floats to different bytes next week is refused here
+    rather than silently reused.
+    """
     path = Path(source.model).expanduser()
-    root: Path | None = None
+    single_file: Path | None = None
     revision = source.revision
 
     if path.is_dir():
@@ -148,18 +173,19 @@ def resolve_source(
         revision = ""  # a directory has no revision; do not claim one
     elif path.is_file() and path.suffix == ".safetensors":
         # A single file, addressed directly.  The root is its parent, and only
-        # this one file is in scope — globbing the parent would silently pull in
-        # every other checkpoint sitting in the same downloads folder.
-        resolved = path.resolve()
-        config = resolved.parent / CONFIG_FILENAME
-        return ResolvedSource(
-            root=str(resolved.parent),
-            format=CheckpointFormat.SAFETENSORS,
-            config_path=str(config),
-            weight_files=(str(resolved),),
-            revision="",
-        )
+        # this one file is in scope — globbing the parent would silently pull
+        # in every other checkpoint sitting in the same downloads folder, and
+        # the parent's index (if any) describes whatever multi-shard
+        # checkpoint lives there, not this file.
+        single_file = path.resolve()
+        root = single_file.parent
+        revision = ""
     else:
+        if source.reproducible and not source.revision:
+            raise CheckpointSecurityError(
+                "reproducible mode needs a pinned revision; a floating ref resolves "
+                "to different bytes on different days"
+            )
         cache = hub_cache_dir(source.model, cache_dir=source.cache_dir)
         snapshot = _latest_snapshot(cache, source.revision)
         if snapshot is None:
@@ -175,20 +201,30 @@ def resolve_source(
             snapshot = Path(fetch_snapshot(source.model, source.revision)).resolve()
         root = snapshot.resolve()
         revision = source.revision or root.name
+        # Strict reproducibility for hub ids: the snapshot directory is named
+        # for the commit it contains, so the resolved revision must *be* that
+        # commit.  "main" pins nothing — next week's "main" is different bytes.
+        if source.reproducible and revision != root.name:
+            raise CheckpointSecurityError(
+                f"reproducible mode asked for revision {source.revision!r}, which "
+                f"resolves to commit {root.name!r}; a branch or tag is not a pin — "
+                "pass the commit sha"
+            )
 
-    if source.reproducible and revision != source.revision:
-        raise CheckpointSecurityError(
-            f"reproducible mode asked for revision {source.revision!r} but resolved to {revision!r}"
-        )
-
-    fmt, index = _classify(root, source.format)
+    if single_file is None:
+        fmt, index = _classify(root, source.format)
+    else:
+        fmt, index = CheckpointFormat.SAFETENSORS, None
     config = root / CONFIG_FILENAME
     if not config.is_file() and fmt is not CheckpointFormat.DUMMY:
         raise SourceNotFoundError(f"no {CONFIG_FILENAME} in {root}")
 
-    weight_files = tuple(str(p) for p in sorted(root.glob("*.safetensors")))
-    for path in weight_files:
-        safe_join(root, Path(path).name)  # symlink escape check, per file
+    if single_file is not None:
+        weight_files = (str(single_file),)
+    else:
+        weight_files = tuple(str(p) for p in sorted(root.glob("*.safetensors")))
+        for name in weight_files:
+            safe_join(root, Path(name).name)  # symlink escape check, per file
 
     return ResolvedSource(
         root=str(root),

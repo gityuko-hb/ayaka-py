@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -12,8 +13,33 @@ __all__ = [
     "TextFormatter",
     "log_master",
     "log_once",
+    "quiet_http_loggers",
     "reset_once_state",
 ]
+
+# HTTP client loggers emit one INFO line per request — a hub download is
+# dozens of them, interleaved with progress bars and ayaka's own log lines.
+# WARNING hides the per-request chatter while keeping genuine failures (timeouts,
+# connection refusals) visible.  An operator who wants the chatter back sets
+# AYAKA_HTTPX_LOGGING=1, or configures the logger's level explicitly before
+# this runs — a level set on purpose is never overridden.
+_QUIET_LOGGERS = ("httpx", "httpcore", "huggingface_hub", "urllib3")
+
+
+def quiet_http_loggers() -> None:
+    """Raise third-party HTTP loggers to WARNING, once, unless told not to.
+
+    Called before a hub download so the operator sees ayaka's progress lines,
+    not httpx's request log.  Idempotent; respects an explicit level (anything
+    set before this call stays as it is) and the ``AYAKA_HTTPX_LOGGING`` escape
+    hatch.
+    """
+    if os.environ.get("AYAKA_HTTPX_LOGGING"):
+        return
+    for name in _QUIET_LOGGERS:
+        client_logger = logging.getLogger(name)
+        if client_logger.level == logging.NOTSET:
+            client_logger.setLevel(logging.WARNING)
 
 
 class _OnceFilter:

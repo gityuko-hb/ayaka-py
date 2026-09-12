@@ -23,6 +23,7 @@ class WeightMismatch:
             f"{self.name}: {self.reason} (expected {self.expected}, checkpoint has {self.actual})"
         )
 
+
 @dataclass(frozen=True, slots=True)
 class WeightDiff:
     """Every disagreement between the model and the checkpoint, at once."""
@@ -78,6 +79,7 @@ class WeightDiff:
         where = f"{context}: " if context else ""
         raise WeightMismatchError(f"{where}checkpoint does not match the model\n{self.report()}")
 
+
 def _dtype_compatible(expected: DType, actual: DType) -> bool:
     """Whether a checkpoint dtype can feed an expected one.
 
@@ -92,10 +94,7 @@ def _dtype_compatible(expected: DType, actual: DType) -> bool:
     return actual is DType.FP32 and expected in (DType.BF16, DType.FP16)
 
 
-def get_diff_weights(
-    expected: Sequence[WeightSpec],
-    manifest: CheckpointManifest
-) -> WeightDiff:
+def get_diff_weights(expected: Sequence[WeightSpec], manifest: CheckpointManifest) -> WeightDiff:
     """Compare the model's expectation against what the checkpoint provides."""
     provided: dict[str, ManifestEntry] = {e.tensor_key: e for e in manifest.entries}
     expected_by_name = {w.name: w for w in expected}
@@ -173,6 +172,7 @@ def get_diff_weights(
         optional_absent=tuple(sorted(optional_absent)),
     )
 
+
 def verify_consumed(
     expected: Sequence[WeightSpec],
     consumed: Iterable[str],
@@ -193,6 +193,7 @@ def verify_consumed(
         offered=frozenset(w.name for w in expected),
         context=context,
     )
+
 
 def verify_consumed_names(
     required: frozenset[str],

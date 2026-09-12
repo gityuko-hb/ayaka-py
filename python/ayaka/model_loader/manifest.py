@@ -118,7 +118,9 @@ def _from_index(source: ResolvedSource) -> tuple[tuple[ManifestEntry, ...], tupl
             )
 
     declared_total = metadata.get("total_size")
-    if isinstance(declared_total, int):
+    # bool is an int subclass; True would "equal" 1 and pass a bare isinstance
+    # check against a one-tensor index.
+    if isinstance(declared_total, int) and not isinstance(declared_total, bool):
         actual = sum(e.nbytes for e in entries)
         if declared_total != actual:
             raise CheckpointCorruptError(
@@ -176,18 +178,44 @@ def read_weight_map(index_path: str | Path) -> tuple[dict[str, str], dict[str, A
 
     Raises:
         CheckpointCorruptError: If the file cannot be read, is not valid JSON,
-            is not a JSON object, or does not contain a non-empty string-to-
-            string ``weight_map``.
+            contains a duplicate key at any nesting level, is not a JSON
+            object, or does not contain a non-empty string-to-string
+            ``weight_map``.
     """
 
     p = Path(index_path)
+
+    def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        """Object hook that refuses duplicate keys anywhere in the index.
+
+        ``json.loads`` silently keeps the last value for a repeated key, so
+        ``{"w": "a.safetensors", "w": "b.safetensors"}`` parses clean and one
+        mapping vanishes — the same failure the shard-header parser guards
+        against, at the index level.  Unlike that parser (which collects every
+        key and inspects them afterwards), this fails the moment a duplicate is
+        seen, in any object at any depth.
+        """
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for key, _ in pairs:
+            if key in seen:
+                duplicates.add(key)
+            else:
+                seen.add(key)
+        if duplicates:
+            raise CheckpointCorruptError(
+                f"{p}: duplicate keys in checkpoint index: {sorted(duplicates)} — json "
+                "would have kept only the last and dropped the rest silently"
+            )
+        return dict(pairs)
+
     try:
         raw = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise CheckpointCorruptError(f"{p}: cannot read index: {exc}") from exc
 
     try:
-        obj = json.loads(raw)
+        obj = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise CheckpointCorruptError(f"{p}: index is not valid JSON: {exc}") from exc
     if not isinstance(obj, dict):

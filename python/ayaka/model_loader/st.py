@@ -55,14 +55,43 @@ _U64_MAX = (1 << 64) - 1
 # takes the machine down.
 _HEADER_LENGTH_LIMIT = 64 << 20
 
+
+class _HeaderObject(dict[str, Any]):
+    """A JSON object that remembers which keys appeared twice at its own level.
+
+    ``json.loads`` silently keeps the last value for a repeated key, so
+    ``{"w": A, "w": B}`` parses clean and one tensor vanishes — and a dict is
+    the only evidence store left, so it is replaced by one that records the
+    duplicates it was built from.  Every object in the header (nested
+    ``__metadata__`` values included) becomes one of these; only the
+    *outermost* instance's :attr:`duplicates` are tensor keys, which is what
+    keeps a nested object reusing a top-level tensor's name from producing a
+    false duplicate — the same object shape the old seen-list approach tripped
+    on.
+    """
+
+    __slots__ = ("duplicates",)
+
+    def __init__(self, pairs: list[tuple[str, Any]]) -> None:
+        super().__init__(pairs)
+        first_seen: set[str] = set()
+        duplicates: set[str] = set()
+        for key, _ in pairs:
+            if key in first_seen:
+                duplicates.add(key)
+            else:
+                first_seen.add(key)
+        self.duplicates = duplicates
+
+
 @dataclass(frozen=True, slots=True)
 class SafetensorsHeader:
     """One file's header, validated and normalized."""
 
     file_uri: str
-    data_start: int # 8 + header_length
+    data_start: int  # 8 + header_length
     file_size: int
-    entries: tuple[ManifestEntry,...] = ()
+    entries: tuple[ManifestEntry, ...] = ()
     metadata: tuple[tuple[str, str], ...] = ()
 
     @property
@@ -72,6 +101,7 @@ class SafetensorsHeader:
     @property
     def payload_bytes(self) -> int:
         return sum(e.nbytes for e in self.entries)
+
 
 def _dtype(token: object, key: str) -> DType:
     """Convert a safetensors dtype token to Ayaka's normalized dtype.
@@ -106,6 +136,7 @@ def _dtype(token: object, key: str) -> DType:
             f"{key}: unknown safetensors dtype {token!r}; known: {sorted(_SAFETENSORS_DTYPES)}"
         ) from exc
 
+
 def _shape(raw: object, key: str) -> tuple[int, ...]:
     """Validate and normalize a safetensors tensor shape.
 
@@ -133,6 +164,7 @@ def _shape(raw: object, key: str) -> tuple[int, ...]:
     if numel > _U64_MAX:
         raise CheckpointCorruptError(f"{key}: shape {shape} overflows a 64-bit element count")
     return shape
+
 
 def _offsets(raw: object, key: str) -> tuple[int, int]:
     """Validate a tensor's half-open byte range in the safetensors payload.
@@ -171,6 +203,7 @@ def _offsets(raw: object, key: str) -> tuple[int, int]:
         raise CheckpointCorruptError(f"{key}: data_offset {end} overflows u64")
     return int(begin), int(end)
 
+
 def parse_safetensors_header(
     raw_header: bytes,
     *,
@@ -192,52 +225,27 @@ def parse_safetensors_header(
 
     # object_pairs_hook, not the default: json silently keeps the last value for
     # a duplicated key, so `{"w": A, "w": B}` parses clean and one tensor
-    # vanishes.  This is the only way to see it.
-    seen: list[str] = []
-
-    def _pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        seen.extend(k for k, _ in pairs)
-        return dict(pairs)
-
+    # vanishes.  This is the only way to see it — see _HeaderObject.
     try:
-        header = json.loads(decoded, object_pairs_hook=_pairs_hook)
+        header = json.loads(decoded, object_pairs_hook=_HeaderObject)
     except json.JSONDecodeError as exc:
         raise CheckpointCorruptError(f"{file_uri}: header is not valid JSON: {exc}") from exc
-    if not isinstance(header, dict):
+    if not isinstance(header, _HeaderObject):
         raise CheckpointCorruptError(
             f"{file_uri}: header is {type(header).__name__}, not an object"
+        )
+
+    dupes = sorted(header.duplicates)
+    if dupes:
+        raise CheckpointCorruptError(
+            f"{file_uri}: duplicate tensor keys in header: {dupes} — json would have "
+            "kept only the last and dropped the rest silently"
         )
 
     metadata: tuple[tuple[str, str], ...] = ()
     meta = header.pop("__metadata__", None)
     if isinstance(meta, dict):
         metadata = tuple(sorted((str(k), str(v)) for k, v in meta.items()))
-
-    # One pass, two sets.  `top_level.count(k)` inside a comprehension over the
-    # same list is a scan per key — O(tensors^2), invisible on a 291-tensor
-    # dense shard and 36M scans on a 6k-tensor MoE one.
-    #
-    # This runs on the key list captured by `object_pairs_hook` above, which is
-    # the only place the duplicates are still visible: `json.loads` keeps the
-    # last value for a repeated key, so by the time there is a dict the evidence
-    # is gone.
-    interesting = {k for k in header} | {"__metadata__"}
-    first_seen: set[str] = set()
-    duplicates: set[str] = set()
-    duplicates: set[str] = set()
-    for key in seen:
-        if key not in interesting:
-            continue
-        if key in first_seen:
-            duplicates.add(key)
-        else:
-            first_seen.add(key)
-    dupes = sorted(duplicates)
-    if dupes:
-        raise CheckpointCorruptError(
-            f"{file_uri}: duplicate tensor keys in header: {dupes} — json would have "
-            "kept only the last and dropped the rest silently"
-        )
 
     # Build the manifest entries.  The offsets are checked against the file size
     # and for overlap in the manifest builder, not here.
@@ -257,10 +265,10 @@ def parse_safetensors_header(
                 f"{file_uri}: entry {key!r} has {nbytes} bytes in data_offsets, "
                 f"but shape {shape} and dtype {dtype} require {declared_byte}"
             )
-        abs = data_start + begin_offset
-        if abs + nbytes > file_size:
+        abs_offset = data_start + begin_offset
+        if abs_offset + nbytes > file_size:
             raise CheckpointCorruptError(
-                f"{file_uri}: entry {key!r} ends at {abs+nbytes}, which is beyond the "
+                f"{file_uri}: entry {key!r} ends at {abs_offset + nbytes}, which is beyond the "
                 f"file size of {file_size}"
             )
         entries.append(
@@ -269,7 +277,7 @@ def parse_safetensors_header(
                 file_uri=file_uri,
                 dtype=dtype,
                 shape=shape,
-                byte_offset=abs,
+                byte_offset=abs_offset,
                 nbytes=nbytes,
             )
         )
@@ -291,6 +299,7 @@ def parse_safetensors_header(
         entries=tuple(entries),
         metadata=metadata,
     )
+
 
 def read_safetensors_header(path: str | Path) -> SafetensorsHeader:
     """Read and validate one file's header.  Touches the first 8+N bytes only."""
