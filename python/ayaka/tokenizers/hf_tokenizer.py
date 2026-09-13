@@ -32,6 +32,7 @@ fast byte backend.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -39,8 +40,7 @@ from ayaka.configs.tokenizer import TokenizerConfig
 from ayaka.tokenizers.ports import DecodeStreamLike
 
 # Pre-tokenizer class names that indicate a byte-level BPE tokenizer.
-# These are the only tokenizers for which ``token_bytes_table`` is valid and
-# chunked encoding is safe.
+# These are candidates for byte-table reconstruction, subject to verification.
 _BYTE_LEVEL_TYPES = {"ByteLevel"}
 
 # Test pattern for byte-level path checking.
@@ -49,35 +49,29 @@ _DEFAULT_PROBES: tuple[str, ...] = (
     # trailing, and double whitespace (check for GPT-2 'Ġ' or SentencePiece ' ')
     "Hello world",
     "  Leading,   multiple   spaces, and trailing.  ",
-
     # Source code formatting, mixed tabs/spaces indentation, and line endings (\r\n, \n)
-    "def foo(x: int = 42) -> str:\n\t\"\"\"Docstring.\"\"\"\n\r\n    return f'{x}\\n'\n",
-
+    'def foo(x: int = 42) -> str:\n\t"""Docstring."""\n\r\n    return f\'{x}\\n\'\n',
     # Vietnamese & Latin Extended (2–3 bytes/character)
     # Check combinations of tone marks and accented vowels
     "Tiếng Việt: Xin chào thế giới! Phở bò, đường xá, ệ, ữ, ỗ, ậ, ỷ, ỹ.",
-
     # CJK languages ​​do not use spaces (3 bytes; testing word boundary segmentation capabilities)
     "日本語テキスト（漢字・ひらがな・カタカナ）。中文测试，自然语言处理。한국어 테스트.",
-
     # RTL writing systems and other character sets (Arabic, Cyrillic, Greek)
     "مرحبا بالعالم! Привет мир! Ελληνικά.",
-
     # 4-byte UTF-8 characters, single emojis, and complex combinations
     # (ZWJ sequences, Variation Selectors)
     "Emoji 4-byte: 🚀 🦄 🔥 👨‍👩‍👧‍👦 🏳️‍🌈 → ⚡",
-
     # Arithmetic, mathematical symbols, currency, and contractions
     # (Contractions / Regex split rules)
     "Prices: $1,234.56 or €99.99! They're, couldn't, isn't (π ≈ 3.14159 >= 0).",
-
     # 8. Markup-style delimiter / simulated special token
     # (handling the issue of special characters being swallowed)
-    "<|im_start|>user\n<tag attr=\"val\">content</tag><|endoftext|>",
-
+    '<|im_start|>user\n<tag attr="val">content</tag><|endoftext|>',
     # Zero-Width Space, Non-Breaking Space
     "Zero\u200bWidth\u200cJoiner\u00a0NBSP and\u202fNarrowNBSP.",
 )
+
+
 class _DecodeStreamAdapter:
     """Adapter bridging HuggingFace's Rust ``DecodeStream`` to ``DecodeStreamLike``.
 
@@ -86,9 +80,8 @@ class _DecodeStreamAdapter:
     :class:`~ayaka.tokenizers.ports.DecodeStreamLike` interface expected by
     :class:`~ayaka.tokenizers.detokenizer.FastIncrementalDetokenizer`.
 
-    The ``reset()`` method creates a fresh stream with the same configuration,
-    used by ``FastIncrementalDetokenizer`` to recover from ``"invalid prefix"``
-    errors without requiring a reference back to the owning tokenizer.
+    ``reset()`` creates an empty stream. IncrementalDetokenizer never uses it
+    for recovery: resetting without replay would lose the decoding context.
 
     Attributes:
         _raw: The underlying ``tokenizers.Tokenizer`` object (Rust backend),
@@ -137,10 +130,8 @@ class _DecodeStreamAdapter:
     def reset(self) -> _DecodeStreamAdapter:
         """Create a fresh stream with the same configuration.
 
-        Called by
-        :class:`~ayaka.tokenizers.detokenizer.FastIncrementalDetokenizer`
-        after an ``"invalid prefix"`` error to discard corrupted byte-level
-        state and resume decoding from the current token.
+        This does not replay prior tokens and is not safe recovery for an
+        already-published output stream.
 
         Returns:
             A new :class:`_DecodeStreamAdapter` with the same tokenizer
@@ -161,7 +152,7 @@ class HfTokenizer:
 
     * **Vocabulary snapshot** — ``get_vocab()`` and ``get_added_vocab()``
       results are captured at construction time and cached as plain
-      dictionaries; subsequent calls are O(1).
+      dictionaries; public accessors return defensive copies.
     * **Fingerprinting** — a BLAKE2b-16 hash of the tokenizer's serialised
       JSON (or the sorted vocabulary when serialisation is unavailable)
       provides a stable cache key across process restarts.
@@ -169,8 +160,7 @@ class HfTokenizer:
       builds and caches the raw-byte representation of every token ID.  Callers
       should invoke :meth:`verify_byte_path` after loading to confirm the table
       is correct before activating the byte detokenization backend.
-    * **Chunked encoding** — ``supports_chunked_encode`` is ``True`` when the
-      pre-tokenizer is byte-level BPE.
+    * **Chunked encoding** — disabled until whole-pipeline equivalence is proven.
 
     Attributes:
         _tok: The wrapped HuggingFace tokenizer object.
@@ -190,7 +180,7 @@ class HfTokenizer:
         _max_chars: Maximum string length across all vocabulary entries; used
             to size look-back windows.
         _is_fast: Whether the underlying tokenizer is Rust-backed.
-        _chunkable: Whether the tokenizer supports chunked encoding.
+        _chunkable: Legacy internal name for ByteLevel pre-tokenizer detection.
         _decoded_vocab: Cached ``get_decoded_vocab()`` result, or ``None``
             before first access.
         _trunc_side: Truncation side (``"left"`` or ``"right"``).
@@ -201,10 +191,26 @@ class HfTokenizer:
     """
 
     __slots__ = (
-        "_tok", "_raw", "_name", "_fp", "_eos", "_bos", "_pad",
-        "_special_ids", "_special_toks", "_vocab", "_added", "_vocab_size",
-        "_max_token_id", "_max_chars", "_is_fast", "_chunkable", "_decoded_vocab",
-        "_trunc_side", "_byte_table", "byte_path_verified",
+        "_tok",
+        "_raw",
+        "_name",
+        "_fp",
+        "_eos",
+        "_bos",
+        "_pad",
+        "_special_ids",
+        "_special_toks",
+        "_vocab",
+        "_added",
+        "_vocab_size",
+        "_max_token_id",
+        "_max_chars",
+        "_is_fast",
+        "_chunkable",
+        "_decoded_vocab",
+        "_trunc_side",
+        "_byte_table",
+        "byte_path_verified",
     )
 
     @classmethod
@@ -224,6 +230,10 @@ class HfTokenizer:
         Returns:
             A fully initialised :class:`HfTokenizer` ready for use.
         """
+        if config.skip_tokenizer_init:
+            raise ValueError("use DefaultTokenizerFactory for token-ID-only mode")
+        if config.mode not in ("auto", "hf", "slow"):
+            raise ValueError(f"unsupported tokenizer mode: {config.mode}")
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(
@@ -233,7 +243,12 @@ class HfTokenizer:
             cache_dir=config.download_dir,
             use_fast=config.mode != "slow",
         )
-        return cls(tok, truncation_side=config.truncation_side)
+        result = cls(tok, truncation_side=config.truncation_side)
+        if config.mode == "hf" and not result.is_fast:
+            raise ValueError("mode='hf' requires a fast tokenizer")
+        if config.mode == "slow" and result.is_fast:
+            raise ValueError("mode='slow' requires a slow tokenizer")
+        return result
 
     def __init__(self, tok, *, truncation_side: str = "left") -> None:
         """Wrap an existing HuggingFace tokenizer.
@@ -248,13 +263,13 @@ class HfTokenizer:
                 (default) keeps the most recent context; ``"right"`` keeps the
                 prompt start.
         """
+        if truncation_side not in ("left", "right"):
+            raise ValueError("truncation_side must be left or right")
         self._tok = tok
         self._trunc_side = truncation_side
         self._name = str(getattr(tok, "name_or_path", "<unknown>"))
         self._is_fast = bool(getattr(tok, "is_fast", False))
-        self._raw = getattr(tok, "_tokenizer", None) or getattr(
-            tok, "backend_tokenizer", None
-        )
+        self._raw = getattr(tok, "_tokenizer", None) or getattr(tok, "backend_tokenizer", None)
         if self._raw is not None:
             try:
                 self._raw.no_truncation()
@@ -304,7 +319,7 @@ class HfTokenizer:
         contains at least one ``ByteLevel`` step.
 
         Returns:
-            ``True`` when chunked encoding is safe for this tokenizer.
+            ``True`` for a candidate byte-table pipeline; not a chunk-safety proof.
         """
         # Slow / Python tokenizer: cannot inspect Rust pre_tokenizer.
         if self._raw is None:
@@ -320,7 +335,8 @@ class HfTokenizer:
         if name == "Sequence":
             try:
                 return any(
-                    type(sub).__name__ in _BYTE_LEVEL_TYPES for sub in pt  # type: ignore[union-attr]
+                    type(sub).__name__ in _BYTE_LEVEL_TYPES
+                    for sub in pt  # type: ignore[union-attr]
                 )
             except TypeError:
                 return False
@@ -337,6 +353,19 @@ class HfTokenizer:
             A 32-character lowercase hex string.
         """
         h = hashlib.blake2b(digest_size=16)
+        h.update(
+            json.dumps(
+                {
+                    "class": type(self._tok).__qualname__,
+                    "specials": self._special_toks,
+                    "special_ids": sorted(self._special_ids),
+                    "chat_template": getattr(self._tok, "chat_template", None),
+                    "truncation_side": self._trunc_side,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode()
+        )
         # Fast path: Hash complete serialized JSON representation from the Rust backend.
         if self._raw is not None:
             try:
@@ -432,13 +461,9 @@ class HfTokenizer:
 
     @property
     def supports_chunked_encode(self) -> bool:
-        """``True`` when the tokenizer's pre-tokenizer is byte-level BPE.
-
-        When ``True``, :func:`~ayaka.tokenizers.chunking.encode_chunked` may
-        split long prompts at newline boundaries and encode each chunk
-        independently.
-        """
-        return self._chunkable
+        """False: ByteLevel detection alone does not prove exact chunk encoding."""
+        # ByteLevel detection alone does not prove boundary/postprocessor equivalence.
+        return False
 
     # ------------------------------------------------------------------
     # TokenizerLike — encoding
@@ -473,12 +498,14 @@ class HfTokenizer:
         Returns:
             A list of token-ID lists, one per input string.
         """
-        if self._raw is not None:
-            encs = self._raw.encode_batch(
-                list(texts), add_special_tokens=add_special_tokens
-            )
-            return [e.ids for e in encs]
-        return [self.encode(t, add_special_tokens=add_special_tokens) for t in texts]
+        result = self._tok(
+            list(texts),
+            add_special_tokens=add_special_tokens,
+            padding=False,
+            truncation=False,
+            return_attention_mask=False,
+        )
+        return result["input_ids"]
 
     def truncate(self, ids: list[int], max_length: int | None) -> tuple[list[int], bool]:
         """Truncate a token-ID list to *max_length*.
@@ -491,11 +518,13 @@ class HfTokenizer:
             ``(truncated_ids, was_truncated)`` where ``was_truncated`` is
             ``True`` when the list was shortened.
         """
+        from ayaka.utils.validation import require_int
+
+        if max_length is not None:
+            require_int(max_length, "max_length", minimum=1)
         if max_length is None or len(ids) <= max_length:
             return ids, False
-        return (
-            ids[-max_length:] if self._trunc_side == "left" else ids[:max_length]
-        ), True
+        return (ids[-max_length:] if self._trunc_side == "left" else ids[:max_length]), True
 
     def apply_chat_template(
         self,
@@ -530,14 +559,20 @@ class HfTokenizer:
             tokenize=False,
             **kwargs,
         )
-        return out if isinstance(out, str) else out[0]
+        if not isinstance(out, str):
+            raise TypeError("chat template must render exactly one string")
+        return out
 
     # ------------------------------------------------------------------
     # TokenizerLike — decoding
     # ------------------------------------------------------------------
 
     def decode(
-        self, ids: Sequence[int] | int, *, skip_special_tokens: bool = False
+        self,
+        ids: Sequence[int] | int,
+        *,
+        skip_special_tokens: bool = False,
+        spaces_between_special_tokens: bool = True,
     ) -> str:
         """Decode token IDs back into a string.
 
@@ -551,7 +586,12 @@ class HfTokenizer:
         """
         if isinstance(ids, int):
             ids = [ids]
-        return self._tok.decode(list(ids), skip_special_tokens=skip_special_tokens)
+        return self._tok.decode(
+            list(ids),
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+            clean_up_tokenization_spaces=False,
+        )
 
     def convert_ids_to_tokens(
         self, ids: Sequence[int], *, skip_special_tokens: bool = False
@@ -570,9 +610,7 @@ class HfTokenizer:
             A list of token strings, one per input ID.  ``None`` entries from
             the HuggingFace API are replaced with empty strings.
         """
-        out = self._tok.convert_ids_to_tokens(
-            list(ids), skip_special_tokens=skip_special_tokens
-        )
+        out = self._tok.convert_ids_to_tokens(list(ids), skip_special_tokens=skip_special_tokens)
         if isinstance(out, str):
             return [out]
         return [t if t is not None else "" for t in out]
@@ -591,9 +629,7 @@ class HfTokenizer:
         """
         return self._tok.convert_tokens_to_string(list(tokens))
 
-    def new_decode_stream(
-        self, *, skip_special_tokens: bool = False
-    ) -> DecodeStreamLike | None:
+    def new_decode_stream(self, *, skip_special_tokens: bool = False) -> DecodeStreamLike | None:
         """Create a fresh incremental decode stream.
 
         Returns ``None`` when the tokenizer is not Rust-backed (no
@@ -620,11 +656,11 @@ class HfTokenizer:
 
     def get_vocab(self) -> dict[str, int]:
         """Return the full token-string → token-ID mapping (including added tokens)."""
-        return self._vocab
+        return dict(self._vocab)
 
     def get_added_vocab(self) -> dict[str, int]:
         """Return only the tokens added after the base vocabulary was built."""
-        return self._added
+        return dict(self._added)
 
     def get_decoded_vocab(self) -> list[bytes]:
         """Return the raw byte representation of every token, indexed by ID.
@@ -652,7 +688,7 @@ class HfTokenizer:
                 if 0 <= tid < n:
                     out[tid] = tok_str.encode()
             self._decoded_vocab = out
-        return self._decoded_vocab
+        return list(self._decoded_vocab)
 
     # ------------------------------------------------------------------
     # BytesTokenizerLike
@@ -692,9 +728,9 @@ class HfTokenizer:
 
         Builds (on first call) a list of ``bytes`` objects where
         ``table[token_id]`` is the raw byte sequence for that token.  The
-        table is only meaningful for byte-level BPE tokenizers
-        (``supports_chunked_encode is True``); for other tokenizer types an
-        empty list is returned.
+        table is only meaningful for a detected ByteLevel pre-tokenizer;
+        other tokenizer types return an empty list. This does not imply
+        chunk-safe encoding. Callers receive a copy of the cached table.
 
         Added-vocabulary tokens are encoded as their literal UTF-8 bytes
         rather than going through the GPT-2 byte mapping.
@@ -704,12 +740,12 @@ class HfTokenizer:
             list when the tokenizer is not byte-level BPE.
         """
         if self._byte_table is not None:
-            return self._byte_table
+            return list(self._byte_table)
         # If tokenizer is not byte-level BPE (e.g. SentencePiece or word-level),
         # byte table reconstruction is invalid.
         if not self._chunkable:
             self._byte_table = []
-            return self._byte_table
+            return []
 
         # Inverted mapping: stand-in Unicode character -> raw byte.
         c2b = self._bytelevel_char_to_byte()
@@ -731,7 +767,7 @@ class HfTokenizer:
                 tbl[tid] = tok_str.encode()
 
         self._byte_table = tbl
-        return tbl
+        return list(tbl)
 
     def verify_byte_path(self, samples: Sequence[str] = ()) -> bool:
         """Validate the byte table and update :attr:`byte_path_verified`.
@@ -755,7 +791,5 @@ class HfTokenizer:
         if not self.token_bytes_table():
             self.byte_path_verified = False
             return False
-        self.byte_path_verified = verify_byte_table(
-            self, samples or _DEFAULT_PROBES
-        )
+        self.byte_path_verified = verify_byte_table(self, samples or _DEFAULT_PROBES)
         return self.byte_path_verified

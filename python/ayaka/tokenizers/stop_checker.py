@@ -111,11 +111,11 @@ class StopChecker:
             ``(emit, matched_stop_string_or_None)``
         """
         if self._done:
-            return "", None   # already stopped — swallow all further input
+            return "", None  # already stopped — swallow all further input
         if not self._stops:
             return delta, None  # no stops configured — pass through immediately
         if not delta:
-            return "", None   # empty delta is a no-op
+            return "", None  # empty delta is a no-op
 
         # Append incoming text to the look-back buffer before scanning.
         # The buffer may already contain a partial stop-string tail from the
@@ -139,7 +139,7 @@ class StopChecker:
             # include=False → cut just before it (swallow the stop string silently).
             cut = best_idx + (len(best_stop) if self._include else 0)
             out = self._buf[:cut]
-            self._buf = ""    # discard everything after the stop
+            self._buf = ""  # discard everything after the stop
             self._done = True
             return out, best_stop
 

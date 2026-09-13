@@ -5,11 +5,8 @@ from __future__ import annotations
 import math
 from collections import deque
 
-from ayaka.configs.scheduler import SchedulerConfig
 from ayaka.sched.plan import BatchStepPlan
 from ayaka.utils.validation import require_int
-
-__all__ = ["SchedulerConfig", "TimeEstimator"]
 
 
 class TimeEstimator:

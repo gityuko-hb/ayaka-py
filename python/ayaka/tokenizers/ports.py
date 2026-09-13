@@ -24,9 +24,12 @@ then into the factory.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from ayaka.configs.tokenizer import TokenizerConfig
+
+if TYPE_CHECKING:
+    from ayaka.tokenizers.factory import LoadedTokenizer
 
 
 @runtime_checkable
@@ -94,18 +97,22 @@ class TokenizerLike(Protocol):
     def eos_token_id(self) -> int | None:
         """End-of-sequence token ID, or ``None`` if unset."""
         ...
+
     @property
     def bos_token_id(self) -> int | None:
         """Beginning-of-sequence token ID, or ``None`` if unset."""
         ...
+
     @property
     def pad_token_id(self) -> int | None:
         """Padding token ID, or ``None`` if unset."""
         ...
+
     @property
     def all_special_ids(self) -> frozenset[int]:
         """Frozen set of all registered special-token IDs."""
         ...
+
     @property
     def all_special_tokens(self) -> tuple[str, ...]:
         """Tuple of all registered special-token strings."""
@@ -139,11 +146,9 @@ class TokenizerLike(Protocol):
     def supports_chunked_encode(self) -> bool:
         """Whether ``encode`` can safely process text in chunks.
 
-        When ``True``, the engine may split long prompts at character
-        boundaries set by ``TokenizerConfig.chunk_chars`` and encode each
-        chunk independently, stitching the token lists afterwards.  Byte-level
-        BPE tokenizers (GPT-2 family, LLaMA, Qwen) typically support this;
-        SentencePiece Unigram tokenizers may not.
+        Opting in guarantees exact token-ID equivalence at the newline
+        candidates used by encode_chunked, with special tokens disabled.
+        ByteLevel detection alone is insufficient; HF currently returns False.
         """
         ...
 
@@ -206,7 +211,11 @@ class TokenizerLike(Protocol):
         ...
 
     def decode(
-        self, ids: Sequence[int] | int, *, skip_special_tokens: bool = False
+        self,
+        ids: Sequence[int] | int,
+        *,
+        skip_special_tokens: bool = False,
+        spaces_between_special_tokens: bool = True,
     ) -> str:
         """Decode token IDs back into a string.
 
@@ -251,9 +260,7 @@ class TokenizerLike(Protocol):
         """
         ...
 
-    def new_decode_stream(
-        self, *, skip_special_tokens: bool = False
-    ) -> DecodeStreamLike | None:
+    def new_decode_stream(self, *, skip_special_tokens: bool = False) -> DecodeStreamLike | None:
         """Create a fresh incremental decode stream.
 
         Returns ``None`` when the tokenizer does not support streaming
@@ -272,9 +279,11 @@ class TokenizerLike(Protocol):
     def get_vocab(self) -> dict[str, int]:
         """Return the full token-string → token-ID mapping."""
         ...
+
     def get_added_vocab(self) -> dict[str, int]:
         """Return only the tokens added after the base vocabulary was built."""
         ...
+
     def get_decoded_vocab(self) -> list[bytes]:
         """Return the raw byte representation of every token, indexed by ID.
 
@@ -309,7 +318,7 @@ class BytesTokenizerLike(Protocol):
 
 @runtime_checkable
 class TokenizerFactory(Protocol):
-    """Factory protocol for constructing a ``TokenizerLike`` from config.
+    """Factory protocol for constructing a loaded adapter/capability bundle.
 
     The composition root calls ``TokenizerFactory.from_config`` once during
     bootstrap to obtain the tokenizer instance that the engine will use for
@@ -321,7 +330,7 @@ class TokenizerFactory(Protocol):
     """
 
     @classmethod
-    def from_config(cls, config: TokenizerConfig) -> TokenizerLike:
+    def from_config(cls, config: TokenizerConfig) -> LoadedTokenizer:
         """Build a tokenizer from the given configuration.
 
         Args:
@@ -330,6 +339,6 @@ class TokenizerFactory(Protocol):
                 runtime settings (batching, chunking, session cache).
 
         Returns:
-            A fully initialized tokenizer satisfying ``TokenizerLike``.
+            LoadedTokenizer with actual capabilities; tokenizer is None in ID-only mode.
         """
         ...

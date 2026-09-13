@@ -1,143 +1,42 @@
-"""Configuration and data-transfer types for the tokenizer subsystem.
+"""Validated tokenizer settings and immutable encoding/decoding values.
 
-This module contains:
-
-* **TokenizerConfig** — immutable settings that control *which* tokenizer to
-  load and *how* to run it (batching, chunking, prefix-session cache).
-* **DetokenizeParams** — per-request parameters for the incremental
-  detokenizer (stop strings, special-token handling).
-* **DetokUpdate** — one tick of detokenizer output (delta text, stop match,
-  stall indicator).
-* **EncodeResult** — the product of a single encode operation, including
-  prefix-reuse and chunking metadata.
-* **tokenizer_config_from_source** — bridge function that builds a
-  ``TokenizerConfig`` from a ``ModelSourceConfig``.
-
-Data flow::
-
-    ModelSourceConfig
-        │
-        ├─ .tokenizer_path  ──→  tokenizer
-        ├─ .revision         ──→  revision   ("" → None)
-        ├─ .allows_remote_code → trust_remote_code
-        └─ .cache_dir        ──→  download_dir ("" → None)
-        │
-        ▼  tokenizer_config_from_source(source, **serving_kwargs)
-    TokenizerConfig(tokenizer=<path>, ...)
-        │
-        ▼  TokenizerFactory.from_config(config)
-    TokenizerLike
-        │
-        ▼  encode / decode
-    EncodeResult / DetokenizeParams / DetokUpdate
+Modes without an adapter are rejected by the factory. Character chunk settings
+are reserved for a proven chunk-safe adapter; HfTokenizer encodes whole prompts.
+The session cache stores exact whole-prompt encodings, never acquired KV state.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from ayaka.configs.base import ConfigMixin
+from ayaka.configs.base import ConfigError, ConfigMixin
+from ayaka.utils.validation import require_frozen, require_int, require_text
 
 if TYPE_CHECKING:
     from ayaka.configs.model_source import ModelSourceConfig
 
 TokenizerMode = Literal["auto", "hf", "slow", "tiktoken", "mistral"]
-"""Backend selection for the tokenizer implementation.
+DetokBackend = Literal["auto", "bytes", "stream", "window"]
 
-* ``"auto"`` — inspect ``tokenizer_config.json`` and pick the fastest
-  compatible backend automatically.
-* ``"hf"`` — force the Rust-backed ``tokenizers`` library
-  (``PreTrainedTokenizerFast``).
-* ``"slow"`` — force the pure-Python ``PreTrainedTokenizer``.  Required
-  for models whose tokenizer cannot be represented by the Rust engine
-  (rare; some SentencePiece Unigram models).
-* ``"tiktoken"`` — use the ``tiktoken`` library directly.  Required for
-  OpenAI-family byte-pair encodings (GPT-4, o-series).
-* ``"mistral"`` — use Mistral's custom ``mistral-common`` tokenizer.
-"""
 
-DetokBackend = Literal["auto", "stream", "window"]
-"""Detokenization strategy for incremental decode.
-
-* ``"auto"`` — choose based on ``TokenizerLike.new_decode_stream``
-  availability: ``"stream"`` when a ``DecodeStreamLike`` is returned,
-  ``"window"`` otherwise.
-* ``"stream"`` — feed tokens one-by-one into a ``DecodeStreamLike``.
-  Lowest latency but requires the tokenizer to support it.
-* ``"window"`` — decode a trailing window of token IDs on every step and
-  diff against the previous output.  Universal but slightly higher CPU
-  cost per token.
-"""
+def require_bool(value: bool, name: str) -> None:
+    """Reject truthy substitutes at public boundaries."""
+    if type(value) is not bool:
+        raise TypeError(f"{name} must be bool")
 
 
 @dataclass(frozen=True, slots=True)
 class TokenizerConfig(ConfigMixin):
-    """Immutable configuration for loading and operating a tokenizer.
+    """Loading and bounded encode-service settings.
 
-    ``tokenizer`` is the only required field; it names the hub ID or local
-    directory that contains the tokenizer files.  All other fields have
-    defaults suitable for the common case (HuggingFace fast tokenizer,
-    no batching pool, no session cache).
-
-    The remaining fields fall into three groups:
-
-    **Loading** — ``mode``, ``revision``, ``trust_remote_code``,
-    ``download_dir``, ``skip_tokenizer_init``.
-
-    **Encoding runtime** — ``truncation_side``, ``encode_pool_workers``,
-    ``encode_batch_window_ms``, ``encode_max_batch``, ``long_prompt_chars``,
-    ``chunk_chars``.
-
-    **Prefix session cache** — ``enable_session_cache``,
-    ``session_cache_capacity``, ``verify_session_cache``.
-
-    Attributes:
-        tokenizer: Hub ID (``"meta-llama/Llama-3-8B"``) or local path to
-            the directory containing ``tokenizer.json`` /
-            ``tokenizer.model``.  Usually populated from
-            ``ModelSourceConfig.tokenizer_path``.
-        mode: Which tokenizer backend to use.  See ``TokenizerMode``.
-        revision: Git revision (branch / tag / SHA) for hub downloads.
-            ``None`` means HEAD.
-        trust_remote_code: Allow execution of Python code shipped inside
-            the tokenizer repo.  Default ``False`` — the engine refuses
-            to run checkpoint-supplied code unless explicitly opted in.
-        download_dir: Override the default HuggingFace cache directory.
-            ``None`` means ``HF_HOME`` / the library default.
-        truncation_side: Which end to truncate when a prompt exceeds the
-            model's maximum position embeddings.  ``"left"`` (default)
-            keeps the most recent context, which is usually correct for
-            chat models.
-        skip_tokenizer_init: When ``True``, the factory returns a
-            lightweight stub that satisfies ``TokenizerLike`` but cannot
-            encode or decode.  Used by weight-validation and profiling
-            tools that need the engine's config graph but never tokenize.
-        detokenize_backend: Incremental detokenization strategy.
-            See ``DetokBackend``.
-        encode_pool_workers: Number of background threads in the encode
-            pool.  ``0`` (default) means encode synchronously in the
-            caller's thread.
-        encode_batch_window_ms: How long (in milliseconds) to hold an
-            incoming encode request before dispatching a batch to the pool.
-            Only meaningful when ``encode_pool_workers > 0``.
-        encode_max_batch: Maximum number of texts to batch in a single
-            ``encode_batch`` call.  Caps memory usage in the tokenizer's
-            Rust runtime.
-        long_prompt_chars: Character-length threshold above which a prompt
-            is considered "long" and may be chunked for encoding.
-        chunk_chars: Target character count per chunk when splitting long
-            prompts for chunked encoding.  Only used when
-            ``TokenizerLike.supports_chunked_encode`` is ``True``.
-        enable_session_cache: Enable the prefix-session cache, which
-            stores recently encoded prompt prefixes and reuses them on
-            subsequent requests that share the same prefix.
-        session_cache_capacity: Maximum number of entries in the session
-            cache (an LRU ring).
-        verify_session_cache: When ``True``, re-encode every cache hit and
-            assert equality.  Useful for development and CI; too expensive
-            for production.
+    workers=0 executes in the submitting thread. A positive worker count enables
+    bounded, coalesced background batches. The adapter is serialized because
+    slow/custom tokenizers need not be thread-safe. Limits include queued and
+    running jobs; bytes count UTF-8 payload or eight bytes per input token ID.
+    Chunking is disabled for the HF adapter until exact equivalence is proven.
     """
 
     tokenizer: str | Path
@@ -156,31 +55,69 @@ class TokenizerConfig(ConfigMixin):
     enable_session_cache: bool = False
     session_cache_capacity: int = 4096
     verify_session_cache: bool = False
+    encode_max_pending: int = 256
+    encode_max_pending_bytes: int = 16 << 20
+    session_cache_max_bytes: int = 16 << 20
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tokenizer, (str, Path)):
+            raise TypeError("tokenizer must be a string or Path")
+        require_text(str(self.tokenizer), "tokenizer")
+        for name, allowed in (
+            ("mode", ("auto", "hf", "slow", "tiktoken", "mistral")),
+            ("truncation_side", ("left", "right")),
+            ("detokenize_backend", ("auto", "bytes", "stream", "window")),
+        ):
+            if getattr(self, name) not in allowed:
+                raise ConfigError(f"tokenizer.{name}", "INVALID_CHOICE", str(allowed))
+        for name in ("revision", "download_dir"):
+            value = getattr(self, name)
+            if value is not None:
+                require_text(value, name)
+        for name in (
+            "trust_remote_code",
+            "skip_tokenizer_init",
+            "enable_session_cache",
+            "verify_session_cache",
+        ):
+            require_bool(getattr(self, name), name)
+        require_int(self.encode_pool_workers, "encode_pool_workers")
+        for name in (
+            "encode_max_batch",
+            "long_prompt_chars",
+            "chunk_chars",
+            "session_cache_capacity",
+            "encode_max_pending",
+            "encode_max_pending_bytes",
+            "session_cache_max_bytes",
+        ):
+            require_int(getattr(self, name), name, minimum=1)
+        window = self.encode_batch_window_ms
+        if type(window) not in (float, int) or not math.isfinite(window) or window < 0:
+            raise ValueError("encode_batch_window_ms must be finite and non-negative")
+        if self.verify_session_cache and not self.enable_session_cache:
+            raise ConfigError(
+                "tokenizer.verify_session_cache",
+                "CACHE_DISABLED",
+                "verification requires the session cache",
+            )
+        if self.skip_tokenizer_init and (
+            self.enable_session_cache or self.detokenize_backend != "auto"
+        ):
+            raise ConfigError(
+                "tokenizer.skip_tokenizer_init",
+                "TOKENIZER_DISABLED",
+                "token-ID-only mode cannot cache text or select a decoder",
+            )
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class DetokenizeParams:
-    """Per-request parameters that govern incremental detokenization.
+    """Fixed per-request decode policy; accumulate_text only retains output_text.
 
-    Passed to the detokenizer at the start of each generation request.
-    Mutable (not ``frozen``) because the scheduler may adjust ``stop``
-    mid-flight when a request is preempted and resumed.
-
-    Attributes:
-        skip_special_tokens: Strip special tokens (BOS, EOS, PAD, etc.)
-            from the output text.  Default ``True`` for user-facing output.
-        spaces_between_special_tokens: Insert a space before and after
-            each special token in the decoded output.
-        stop: Tuple of stop strings.  The detokenizer watches the
-            accumulated output for any of these substrings and signals a
-            match via ``DetokUpdate.stop_matched``.
-        include_stop_str_in_output: When ``True``, the matched stop string
-            is included in the final ``delta`` rather than being consumed
-            silently.
-        accumulate_text: When ``True``, the ``delta`` in each
-            ``DetokUpdate`` contains the *entire* decoded text so far, not
-            just the new fragment.  Used by logprobs endpoints that need
-            the full context for alignment.
+    update() always returns a delta. Preemption must retain decoder state rather
+    than mutate this policy. Text stop gating for min_tokens belongs to the
+    output owner (ResolvedStopPolicy), not to the scheduler.
     """
 
     skip_special_tokens: bool = True
@@ -189,78 +126,87 @@ class DetokenizeParams:
     include_stop_str_in_output: bool = False
     accumulate_text: bool = False
 
+    def __post_init__(self) -> None:
+        require_frozen(self, "detokenize params")
+        for name in (
+            "skip_special_tokens",
+            "spaces_between_special_tokens",
+            "include_stop_str_in_output",
+            "accumulate_text",
+        ):
+            require_bool(getattr(self, name), name)
+        if type(self.stop) is not tuple:
+            raise TypeError("stop must be a tuple")
+        for value in self.stop:
+            if type(value) is not str or not value:
+                raise ValueError("stop strings must be non-empty strings")
+
     def max_stop_len(self) -> int:
-        """Return the character length of the longest stop string.
-
-        Used to size the look-back window in the ``"window"``
-        detokenization backend.  Returns ``0`` when no stop strings are
-        configured.
-        """
-        return max((len(s) for s in self.stop), default=0)
+        return max(map(len, self.stop), default=0)
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class DetokUpdate:
-    """One tick of incremental detokenizer output.
-
-    Produced by the detokenizer each time one or more new tokens are
-    decoded.  The scheduler inspects ``stop_matched`` to decide whether
-    to terminate the request.
-
-    Attributes:
-        delta: New text produced in this tick.  Empty when the detokenizer
-            is stalled (see ``stalled``).
-        stop_matched: The stop string that was matched, or ``None`` if
-            generation should continue.
-        rewind_chars: Number of characters at the *end* of ``delta`` that
-            should be removed from the output buffer.  Non-zero only when
-            a stop string is matched partially inside a prior delta and
-            must be un-emitted.
-        stalled: ``True`` when the detokenizer received tokens but cannot
-            emit any text yet — typically because a multi-byte UTF-8
-            character is incomplete or a stop-string look-ahead is
-            pending.
-    """
+    """Append-only text update; consumed_tokens stops at the first text match."""
 
     delta: str = ""
     stop_matched: str | None = None
     rewind_chars: int = 0
     stalled: bool = False
+    consumed_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        require_frozen(self, "detokenizer update")
+        if type(self.delta) is not str:
+            raise TypeError("delta must be text")
+        if self.stop_matched is not None and (
+            type(self.stop_matched) is not str or not self.stop_matched
+        ):
+            raise ValueError("stop_matched must be non-empty text")
+        require_int(self.rewind_chars, "rewind_chars")
+        if self.rewind_chars:
+            raise ValueError("append-only output does not support rewind")
+        require_int(self.consumed_tokens, "consumed_tokens")
+        require_bool(self.stalled, "stalled")
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class EncodeResult:
-    """The product of encoding a single prompt.
+    """Owned IDs; reused_prefix_len is encode-cache reuse, never acquired KV.
 
-    Carries the token IDs and metadata about how the encoding was
-    performed, so upstream code (the scheduler, the KV-cache manager)
-    can make informed decisions about prefix reuse and chunking.
-
-    Attributes:
-        token_ids: The encoded token-ID sequence.
-        reused_prefix_len: Number of leading tokens that were served from
-            the session cache rather than re-encoded.  ``0`` when the
-            session cache is disabled or missed.
-        truncated: ``True`` when the prompt exceeded
-            ``max_position_embeddings`` and was truncated according to
-            ``TokenizerConfig.truncation_side``.
-        chunks: Number of independent chunks the prompt was split into
-            for encoding.  ``1`` when chunked encoding was not used.
-        extra: Opaque bag for implementation-specific metadata (e.g.
-            offset mappings, attention masks) that the engine does not
-            interpret but may forward to downstream consumers.
+    extra is a deeply immutable tuple of key/value pairs, replacing the mutable
+    metadata dict. Service callers receive tuple IDs rather than shared lists.
     """
 
-    token_ids: list[int]
+    token_ids: tuple[int, ...]
     reused_prefix_len: int = 0
     truncated: bool = False
     chunks: int = 1
-    extra: dict = field(default_factory=dict)
+    extra: tuple[tuple[str, str | int | bool], ...] = ()
 
+    def __post_init__(self) -> None:
+        require_frozen(self, "encode result")
+        if type(self.token_ids) is not tuple or type(self.extra) is not tuple:
+            raise TypeError("token_ids and extra must be tuples")
+        for token in self.token_ids:
+            require_int(token, "token id")
+        require_int(self.reused_prefix_len, "reused_prefix_len")
+        if self.reused_prefix_len > len(self.token_ids):
+            raise ValueError("reused prefix exceeds encoded length")
+        require_int(self.chunks, "chunks", minimum=1)
+        require_bool(self.truncated, "truncated")
+        keys = []
+        for pair in self.extra:
+            if type(pair) is not tuple or len(pair) != 2:
+                raise TypeError("extra entries must be pairs")
+            key, value = pair
+            require_text(key, "extra key")
+            if type(value) not in (str, int, bool):
+                raise TypeError("extra values must be string, int or bool")
+            keys.append(key)
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate extra key")
 
-# ---------------------------------------------------------------------------
-# Bridge: ModelSourceConfig → TokenizerConfig
-# ---------------------------------------------------------------------------
 
 def tokenizer_config_from_source(
     source: ModelSourceConfig,
@@ -277,51 +223,11 @@ def tokenizer_config_from_source(
     enable_session_cache: bool = False,
     session_cache_capacity: int = 4096,
     verify_session_cache: bool = False,
+    encode_max_pending: int = 256,
+    encode_max_pending_bytes: int = 16 << 20,
+    session_cache_max_bytes: int = 16 << 20,
 ) -> TokenizerConfig:
-    """Build a ``TokenizerConfig`` from a ``ModelSourceConfig``.
-
-    This is the **single bridge** between the "where does the model live?"
-    config and the "how should the tokenizer run?" config.  Four fields are
-    derived from *source*; the remaining thirteen are tokenizer-specific and
-    exposed as keyword arguments with the same defaults as ``TokenizerConfig``.
-
-    Field mapping::
-
-        ModelSourceConfig              TokenizerConfig
-        ─────────────────              ───────────────
-        source.tokenizer_path     →    tokenizer        (str)
-        source.revision           →    revision         ("" → None)
-        source.allows_remote_code →    trust_remote_code (bool)
-        source.cache_dir          →    download_dir     ("" → None)
-
-    Args:
-        source: The model-source config that identifies the hub ID or local
-            path, revision, trust policy, and cache directory.
-        mode: Tokenizer backend.  See ``TokenizerMode``.
-        truncation_side: Which end to truncate on overflow.
-        skip_tokenizer_init: Return a stub instead of a real tokenizer.
-        detokenize_backend: Incremental decode strategy.
-        encode_pool_workers: Background encode-pool thread count (0 = sync).
-        encode_batch_window_ms: Batching window before pool dispatch.
-        encode_max_batch: Max texts per ``encode_batch`` call.
-        long_prompt_chars: Char threshold for "long prompt" chunking.
-        chunk_chars: Target chars per chunk.
-        enable_session_cache: Turn on prefix-session caching.
-        session_cache_capacity: LRU ring size for the session cache.
-        verify_session_cache: Re-encode cache hits and assert equality.
-
-    Returns:
-        An immutable ``TokenizerConfig`` ready for
-        ``TokenizerFactory.from_config``.
-
-    Example::
-
-        from ayaka.configs.model_source import ModelSourceConfig
-        from ayaka.configs.tokenizer import tokenizer_config_from_source
-
-        source = ModelSourceConfig(model="meta-llama/Llama-3-8B")
-        tok_cfg = tokenizer_config_from_source(source, mode="hf")
-    """
+    """Bridge model-source loading policy and tokenizer-service settings."""
     return TokenizerConfig(
         tokenizer=source.tokenizer_path,
         mode=mode,
@@ -339,5 +245,7 @@ def tokenizer_config_from_source(
         enable_session_cache=enable_session_cache,
         session_cache_capacity=session_cache_capacity,
         verify_session_cache=verify_session_cache,
+        encode_max_pending=encode_max_pending,
+        encode_max_pending_bytes=encode_max_pending_bytes,
+        session_cache_max_bytes=session_cache_max_bytes,
     )
-

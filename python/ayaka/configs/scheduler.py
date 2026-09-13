@@ -1,82 +1,70 @@
-"""Scheduler configuration and execution budget policies for continuous batching.
+"""Immutable configuration contracts for continuous-batching schedulers.
 
-This module defines:
-
-* :class:`SchedulerConfig` — immutable limits governing token budgets, prefill
-  chunking, step iteration budgets, aging priority bypass rules, and hierarchical
-  memory tier allocations.
-
-Data flow::
-
-    Incoming Requests
-        │
-        ▼  RequestLifecycle
-    Continuous Batching Scheduler (guided by SchedulerConfig)
-        │
-        ├─ max_tokens / prefill_chunk ──→ BatchStepPlan token slice sizing
-        ├─ max_batch_requests / max_inflight ──→ Concurrency control
-        ├─ max_bypass                 ──→ Starvation prevention
-        ├─ iteration_ns / retry_ns    ──→ Time budgets and backoff
-        └─ tier_limits / transfer_bytes ──→ Ledger memory allocation & transfers
-        │
-        ▼
-    Executor Step Forward Execution
+The scheduler has two token limits. ``max_num_batched_tokens`` is the executor
+capacity, while ``max_num_scheduled_tokens`` is the smaller or equal budget the
+scheduler may issue. Keeping them separate leaves room for executors that append
+tokens after scheduling, such as speculative decoding.
 """
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
 
-from ayaka.configs.base import ConfigMixin
+from ayaka.configs.base import ConfigError, ConfigMixin
 from ayaka.types import MemoryTier
 from ayaka.utils.validation import require_int
+
+__all__ = [
+    "PreemptionMode",
+    "ResolvedSchedulerPlan",
+    "SchedulerConfig",
+    "SchedulingPolicy",
+]
+
+
+class SchedulingPolicy(enum.StrEnum):
+    """Ordering policy applied within decode and prefill work queues."""
+
+    FCFS = "fcfs"
+    PRIORITY = "priority"
+    LONGEST_PREFIX_MATCH = "longest_prefix_match"
+    SHORTEST_REMAINING = "shortest_remaining"
+
+
+class PreemptionMode(enum.StrEnum):
+    """How a scheduler releases KV state when it preempts a request."""
+
+    RECOMPUTE = "recompute"
+    SWAP = "swap"
 
 
 @dataclass(frozen=True, slots=True)
 class SchedulerConfig(ConfigMixin):
-    """Engine-thread policy limits and execution budgets for continuous batching.
+    """Policy, admission, and execution budgets for one scheduler instance.
 
-    Times are absolute monotonic nanoseconds. ``iteration_ns`` limits predicted
-    execution time, not a promised hard deadline. Memory is charged by the shared
-    ledger during reversible preparation; an optional lower tier limit is checked
-    before adoption. Transfer credits cover metadata, model input/output copies,
-    and KV-cache copies through ticket retirement. ``max_bypass`` bounds successful
-    scheduling opportunities before an older runnable request takes precedence over
-    ordinary decode priority.
+    Token and sequence limits bound a single engine iteration. Queue and
+    in-flight limits bound host-side pressure. Timing values use monotonic
+    nanoseconds. Transfer and tier limits are byte budgets charged through
+    ticket retirement.
 
-    Attributes:
-        max_tokens: Maximum number of active tokens (prefill chunk tokens plus
-            decode tokens) scheduled in a single engine step forward execution.
-            Default is ``128``.
-        prefill_chunk: Maximum prompt tokens processed per chunk for long requests,
-            enabling chunked prefill co-scheduled alongside decode tokens.
-            Default is ``64``.
-        max_batch_requests: Maximum number of concurrent active requests permitted
-            in a single batched step. Default is ``16``.
-        max_requests: Global maximum request queue capacity before incoming requests
-            are rejected with backpressure. Default is ``256``.
-        max_inflight: Maximum number of pending unretired step execution tickets
-            dispatched to the execution worker. Default is ``1``.
-        max_bypass: Aging threshold. If a runnable request has been bypassed by
-            higher-priority decode requests for ``max_bypass`` consecutive rounds,
-            it is granted immediate service to prevent starvation. Default is ``8``.
-        iteration_ns: Target execution time budget in monotonic nanoseconds for
-            a single engine iteration (default 1 second = ``1_000_000_000`` ns).
-            Limits predicted execution duration to guarantee predictable step cadence.
-        retry_ns: Monotonic nanoseconds to backoff before retrying scheduling when
-            resources or memory budgets are temporarily exhausted (default 1 ms =
-            ``1_000_000`` ns).
-        transfer_bytes: Maximum byte budget allocated for asynchronous KV-cache and
-            tensor transfers per step (default 64 MiB = ``64 << 20``).
-        tier_limits: Explicit per-tier memory allocation caps represented as
-            immutable pairs of ``(MemoryTier, byte_limit)``. Only allocatable
-            tiers (:term:`DEVICE` through :term:`DISK`) may be configured.
+    ``max_num_partial_prefills`` caps partially processed prompts that may stay
+    active together. Scheduler implementations must enforce the resolved value;
+    it is valid only with chunked prefill and cannot exceed ``max_num_seqs``.
     """
 
-    max_tokens: int = 128
-    prefill_chunk: int = 64
-    max_batch_requests: int = 16
-    max_requests: int = 256
+    max_num_seqs: int = 256
+    max_num_batched_tokens: int = 8192
+    max_num_scheduled_tokens: int | None = None
+    max_queued_requests: int | None = 256
+    enable_chunked_prefill: bool = True
+    max_num_partial_prefills: int = 1
+    long_prefill_token_threshold: int | None = None
+    scheduling_policy: SchedulingPolicy = SchedulingPolicy.FCFS
+    preemption_mode: PreemptionMode = PreemptionMode.RECOMPUTE
+    priority_preemption: bool = False
+    max_decode_steps_per_schedule: int = 1
+
     max_inflight: int = 1
     max_bypass: int = 8
     iteration_ns: int = 1_000_000_000
@@ -84,19 +72,173 @@ class SchedulerConfig(ConfigMixin):
     transfer_bytes: int = 64 << 20
     tier_limits: tuple[tuple[MemoryTier, int], ...] = ()
 
-    def __post_init__(self):
-        """Validate scheduler parameters and memory tier invariants."""
+    def __post_init__(self) -> None:
+        """Reject invalid values and contradictory scheduler policies."""
         for name in (
-            "max_tokens",
-            "prefill_chunk",
-            "max_batch_requests",
-            "max_requests",
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "max_num_partial_prefills",
+            "max_decode_steps_per_schedule",
             "max_inflight",
             "max_bypass",
             "iteration_ns",
             "retry_ns",
         ):
             require_int(getattr(self, name), name, minimum=1)
+
+        if self.max_num_scheduled_tokens is not None:
+            require_int(self.max_num_scheduled_tokens, "max_num_scheduled_tokens", minimum=1)
+            if self.max_num_scheduled_tokens > self.max_num_batched_tokens:
+                raise ConfigError(
+                    "scheduler.max_num_scheduled_tokens",
+                    "SCHEDULED_TOKEN_BUDGET_TOO_LARGE",
+                    "scheduled-token budget cannot exceed the executable token budget",
+                )
+        if self.max_queued_requests is not None:
+            require_int(self.max_queued_requests, "max_queued_requests", minimum=1)
+        if self.long_prefill_token_threshold is not None:
+            require_int(
+                self.long_prefill_token_threshold,
+                "long_prefill_token_threshold",
+                minimum=1,
+            )
+        if type(self.enable_chunked_prefill) is not bool:
+            raise TypeError("enable_chunked_prefill must be bool")
+        if type(self.priority_preemption) is not bool:
+            raise TypeError("priority_preemption must be bool")
+        if not isinstance(self.scheduling_policy, SchedulingPolicy):
+            raise TypeError("scheduling_policy must be SchedulingPolicy")
+        if not isinstance(self.preemption_mode, PreemptionMode):
+            raise TypeError("preemption_mode must be PreemptionMode")
+        if self.max_num_partial_prefills > self.max_num_seqs:
+            raise ConfigError(
+                "scheduler.max_num_partial_prefills",
+                "PARTIAL_PREFILL_LIMIT_TOO_LARGE",
+                "partial-prefill concurrency cannot exceed the sequence budget",
+            )
+        if not self.enable_chunked_prefill and self.max_num_partial_prefills != 1:
+            raise ConfigError(
+                "scheduler.max_num_partial_prefills",
+                "PARTIAL_PREFILL_WITHOUT_CHUNKING",
+                "partial-prefill concurrency requires chunked prefill",
+            )
+        if self.priority_preemption and self.scheduling_policy is not SchedulingPolicy.PRIORITY:
+            raise ConfigError(
+                "scheduler.priority_preemption",
+                "PRIORITY_PREEMPTION_WITHOUT_PRIORITY",
+                "priority preemption requires priority scheduling",
+            )
+
+        require_int(self.transfer_bytes, "transfer_bytes")
+        if type(self.tier_limits) is not tuple:
+            raise TypeError("tier_limits must be an immutable tuple")
+        if len({tier for tier, _ in self.tier_limits}) != len(self.tier_limits):
+            raise ValueError("duplicate memory tier limit")
+        for tier, limit in self.tier_limits:
+            if not isinstance(tier, MemoryTier) or not tier.allocatable:
+                raise ValueError("invalid memory tier")
+            require_int(limit, "tier limit")
+
+    @property
+    def effective_scheduled_token_budget(self) -> int:
+        """Return the scheduler issue budget after applying its default."""
+        if self.max_num_scheduled_tokens is None:
+            return self.max_num_batched_tokens
+        return self.max_num_scheduled_tokens
+
+    def effective_long_prefill_threshold(self, max_model_len: int) -> int:
+        """Resolve the explicit threshold or four percent of model context."""
+        if type(max_model_len) is not int or max_model_len < 1:
+            raise ConfigError(
+                "model.max_model_len",
+                "MODEL_LENGTH_INVALID",
+                "max model length must be a positive integer",
+            )
+        if self.long_prefill_token_threshold is not None:
+            return self.long_prefill_token_threshold
+        return max(1, int(max_model_len * 0.04))
+
+    def resolve(self, max_model_len: int) -> ResolvedSchedulerPlan:
+        """Freeze all derived defaults for runtime and fingerprinting."""
+        return ResolvedSchedulerPlan(
+            max_model_len=max_model_len,
+            max_num_seqs=self.max_num_seqs,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            max_num_scheduled_tokens=self.effective_scheduled_token_budget,
+            max_queued_requests=self.max_queued_requests,
+            chunked_prefill=self.enable_chunked_prefill,
+            max_num_partial_prefills=self.max_num_partial_prefills,
+            long_prefill_token_threshold=self.effective_long_prefill_threshold(max_model_len),
+            scheduling_policy=self.scheduling_policy,
+            preemption_mode=self.preemption_mode,
+            priority_preemption=self.priority_preemption,
+            max_decode_steps_per_schedule=self.max_decode_steps_per_schedule,
+            max_inflight=self.max_inflight,
+            max_bypass=self.max_bypass,
+            iteration_ns=self.iteration_ns,
+            retry_ns=self.retry_ns,
+            transfer_bytes=self.transfer_bytes,
+            tier_limits=self.tier_limits,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSchedulerPlan(ConfigMixin):
+    """Scheduler settings with every model-dependent default resolved."""
+
+    max_model_len: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    max_num_scheduled_tokens: int
+    max_queued_requests: int | None
+    chunked_prefill: bool
+    max_num_partial_prefills: int
+    long_prefill_token_threshold: int
+    scheduling_policy: SchedulingPolicy
+    preemption_mode: PreemptionMode
+    priority_preemption: bool
+    max_decode_steps_per_schedule: int
+    max_inflight: int
+    max_bypass: int
+    iteration_ns: int
+    retry_ns: int
+    transfer_bytes: int
+    tier_limits: tuple[tuple[MemoryTier, int], ...]
+
+    def __post_init__(self) -> None:
+        """Defend the public resolved contract against direct invalid construction."""
+        for name in (
+            "max_model_len",
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "max_num_scheduled_tokens",
+            "max_num_partial_prefills",
+            "long_prefill_token_threshold",
+            "max_decode_steps_per_schedule",
+            "max_inflight",
+            "max_bypass",
+            "iteration_ns",
+            "retry_ns",
+        ):
+            require_int(getattr(self, name), name, minimum=1)
+        if self.max_num_scheduled_tokens > self.max_num_batched_tokens:
+            raise ValueError("scheduled-token budget exceeds executable token budget")
+        if self.max_queued_requests is not None:
+            require_int(self.max_queued_requests, "max_queued_requests", minimum=1)
+        if type(self.chunked_prefill) is not bool:
+            raise TypeError("chunked_prefill must be bool")
+        if type(self.priority_preemption) is not bool:
+            raise TypeError("priority_preemption must be bool")
+        if not isinstance(self.scheduling_policy, SchedulingPolicy):
+            raise TypeError("scheduling_policy must be SchedulingPolicy")
+        if not isinstance(self.preemption_mode, PreemptionMode):
+            raise TypeError("preemption_mode must be PreemptionMode")
+        if self.max_num_partial_prefills > self.max_num_seqs:
+            raise ValueError("partial-prefill concurrency exceeds sequence budget")
+        if not self.chunked_prefill and self.max_num_partial_prefills != 1:
+            raise ValueError("partial-prefill concurrency requires chunked prefill")
+        if self.priority_preemption and self.scheduling_policy is not SchedulingPolicy.PRIORITY:
+            raise ValueError("priority preemption requires priority scheduling")
         require_int(self.transfer_bytes, "transfer_bytes")
         if type(self.tier_limits) is not tuple:
             raise TypeError("tier_limits must be an immutable tuple")
