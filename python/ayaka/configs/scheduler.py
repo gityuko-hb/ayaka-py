@@ -1,30 +1,47 @@
-"""Immutable configuration contracts for continuous-batching schedulers.
+"""Immutable scheduler contracts for the single-flight eager baseline.
 
-The scheduler has two token limits. ``max_num_batched_tokens`` is the executor
-capacity, while ``max_num_scheduled_tokens`` is the smaller or equal budget the
-scheduler may issue. Keeping them separate leaves room for executors that append
-tokens after scheduling, such as speculative decoding.
+Resolution checks declared execution/ledger capacities without allocating. It
+does not certify a runnable engine or replace transactional memory admission.
 """
 
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+import warnings
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
+from typing import Any
 
 from ayaka.configs.base import ConfigError, ConfigMixin
+from ayaka.memory.ledger import LedgerSnapshot, TierAccountSnapshot
+from ayaka.plan import (
+    ComputePlan,
+    ExecutionPlan,
+    GraphMode,
+    MemoryPlan,
+    ParallelPlan,
+    WorkspaceRequest,
+)
+from ayaka.request.schema import Request
 from ayaka.types import MemoryTier
-from ayaka.utils.validation import require_int
+from ayaka.utils.validation import require_frozen, require_int
 
 __all__ = [
     "PreemptionMode",
     "ResolvedSchedulerPlan",
+    "SchedulerCapabilities",
     "SchedulerConfig",
     "SchedulingPolicy",
+    "scheduler_config_from_dict",
 ]
 
 
 class SchedulingPolicy(enum.StrEnum):
-    """Ordering policy applied within decode and prefill work queues."""
+    """Waiting order, independent of phase allocation and victim selection.
+
+    LPM/remaining-length names remain for migration diagnostics; the baseline
+    rejects them until their data and execution contracts are integrated.
+    """
 
     FCFS = "fcfs"
     PRIORITY = "priority"
@@ -33,38 +50,76 @@ class SchedulingPolicy(enum.StrEnum):
 
 
 class PreemptionMode(enum.StrEnum):
-    """How a scheduler releases KV state when it preempts a request."""
+    """Only NONE is integrated with the baseline scheduler contract."""
 
+    NONE = "none"
     RECOMPUTE = "recompute"
     SWAP = "swap"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SchedulerCapabilities(ConfigMixin):
+    """Runner facts absent from ExecutionPlan, declared before allocation.
+
+    max_num_seqs is metadata capacity. token_padding_multiple describes packed
+    batch padding, not per-sequence padding. Chunking needs an explicit runner
+    declaration. This descriptor cannot enable multi-step, speculative or SWAP.
+    """
+
+    max_num_seqs: int
+    token_padding_multiple: int = 1
+    chunked_prefill: bool = False
+    graph_mode: GraphMode = GraphMode.EAGER
+
+    def __post_init__(self) -> None:
+        require_int(self.max_num_seqs, "capabilities.max_num_seqs", minimum=1)
+        require_int(self.token_padding_multiple, "capabilities.token_padding_multiple", minimum=1)
+        if type(self.chunked_prefill) is not bool:
+            raise TypeError("capabilities.chunked_prefill must be bool")
+        if not isinstance(self.graph_mode, GraphMode):
+            raise TypeError("capabilities.graph_mode must be GraphMode")
+
+    def physical_token_slots(self, query_tokens: int) -> int:
+        """Packed slots after padding; no speculative expansion is supported."""
+        require_int(query_tokens, "query_tokens")
+        multiple = self.token_padding_multiple
+        return ((query_tokens + multiple - 1) // multiple) * multiple
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SchedulerConfig(ConfigMixin):
-    """Policy, admission, and execution budgets for one scheduler instance.
+    """Canonical settings; parse external/legacy keys with the adapter.
 
-    Token and sequence limits bound a single engine iteration. Queue and
-    in-flight limits bound host-side pressure. Timing values use monotonic
-    nanoseconds. Transfer and tier limits are byte budgets charged through
-    ticket retirement.
+    max_num_requests counts all admitted, nonterminal requests once, including
+    waiting/running/partial prompts. max_queued_requests is an optional additional
+    waiting-only cap. Terminal requests may still hold ticket resources.
+    max_num_seqs independently bounds distinct sequences in a single batch.
 
-    ``max_num_partial_prefills`` caps partially processed prompts that may stay
-    active together. Scheduler implementations must enforce the resolved value;
-    it is valid only with chunked prefill and cannot exceed ``max_num_seqs``.
+    Scheduled tokens are real queries; batched tokens include runner padding.
+    The chunk cap bounds one request's prompt queries in one iteration. A partial
+    prefill retains its slot across iterations until completion or lifecycle
+    release; enforcing this state belongs to the concrete scheduler.
+
+    tier_limits bounds ledger charges (committed + pending), not resident bytes
+    or reserved virtual addresses. Missing tiers use ledger capacity.
+    transfer_bytes bounds aggregate outstanding transfer bytes until retirement.
+    iteration_ns is a soft batch target; retry_ns is resource backoff that capacity
+    events may interrupt. Neither is a hard latency gate or request deadline.
     """
 
     max_num_seqs: int = 256
     max_num_batched_tokens: int = 8192
     max_num_scheduled_tokens: int | None = None
-    max_queued_requests: int | None = 256
+    max_num_requests: int | None = 256
+    max_queued_requests: int | None = None
     enable_chunked_prefill: bool = True
+    max_prefill_chunk_tokens: int | None = None
     max_num_partial_prefills: int = 1
-    long_prefill_token_threshold: int | None = None
+    long_prefill_token_threshold: int = 0
     scheduling_policy: SchedulingPolicy = SchedulingPolicy.FCFS
-    preemption_mode: PreemptionMode = PreemptionMode.RECOMPUTE
+    preemption_mode: PreemptionMode = PreemptionMode.NONE
     priority_preemption: bool = False
     max_decode_steps_per_schedule: int = 1
-
     max_inflight: int = 1
     max_bypass: int = 8
     iteration_ns: int = 1_000_000_000
@@ -73,7 +128,6 @@ class SchedulerConfig(ConfigMixin):
     tier_limits: tuple[tuple[MemoryTier, int], ...] = ()
 
     def __post_init__(self) -> None:
-        """Reject invalid values and contradictory scheduler policies."""
         for name in (
             "max_num_seqs",
             "max_num_batched_tokens",
@@ -84,167 +138,419 @@ class SchedulerConfig(ConfigMixin):
             "iteration_ns",
             "retry_ns",
         ):
-            require_int(getattr(self, name), name, minimum=1)
-
-        if self.max_num_scheduled_tokens is not None:
-            require_int(self.max_num_scheduled_tokens, "max_num_scheduled_tokens", minimum=1)
-            if self.max_num_scheduled_tokens > self.max_num_batched_tokens:
-                raise ConfigError(
-                    "scheduler.max_num_scheduled_tokens",
-                    "SCHEDULED_TOKEN_BUDGET_TOO_LARGE",
-                    "scheduled-token budget cannot exceed the executable token budget",
-                )
-        if self.max_queued_requests is not None:
-            require_int(self.max_queued_requests, "max_queued_requests", minimum=1)
-        if self.long_prefill_token_threshold is not None:
-            require_int(
-                self.long_prefill_token_threshold,
-                "long_prefill_token_threshold",
-                minimum=1,
-            )
+            require_int(getattr(self, name), f"scheduler.{name}", minimum=1)
+        for name in (
+            "max_num_scheduled_tokens",
+            "max_num_requests",
+            "max_queued_requests",
+            "max_prefill_chunk_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                require_int(value, f"scheduler.{name}", minimum=1)
+        require_int(self.long_prefill_token_threshold, "scheduler.long_prefill_token_threshold")
+        require_int(self.transfer_bytes, "scheduler.transfer_bytes")
         if type(self.enable_chunked_prefill) is not bool:
-            raise TypeError("enable_chunked_prefill must be bool")
+            raise TypeError("scheduler.enable_chunked_prefill must be bool")
         if type(self.priority_preemption) is not bool:
-            raise TypeError("priority_preemption must be bool")
+            raise TypeError("scheduler.priority_preemption must be bool")
         if not isinstance(self.scheduling_policy, SchedulingPolicy):
-            raise TypeError("scheduling_policy must be SchedulingPolicy")
+            raise TypeError("scheduler.scheduling_policy must be SchedulingPolicy")
         if not isinstance(self.preemption_mode, PreemptionMode):
-            raise TypeError("preemption_mode must be PreemptionMode")
+            raise TypeError("scheduler.preemption_mode must be PreemptionMode")
+        if self.effective_scheduled_token_budget > self.max_num_batched_tokens:
+            raise ConfigError(
+                "scheduler.max_num_scheduled_tokens",
+                "SCHEDULED_TOKEN_BUDGET_TOO_LARGE",
+                "issue budget cannot exceed execution capacity",
+            )
         if self.max_num_partial_prefills > self.max_num_seqs:
             raise ConfigError(
                 "scheduler.max_num_partial_prefills",
                 "PARTIAL_PREFILL_LIMIT_TOO_LARGE",
-                "partial-prefill concurrency cannot exceed the sequence budget",
+                "partial-prefill limit exceeds the sequence cap",
             )
-        if not self.enable_chunked_prefill and self.max_num_partial_prefills != 1:
+        if not self.enable_chunked_prefill and self.max_prefill_chunk_tokens is not None:
             raise ConfigError(
-                "scheduler.max_num_partial_prefills",
-                "PARTIAL_PREFILL_WITHOUT_CHUNKING",
-                "partial-prefill concurrency requires chunked prefill",
+                "scheduler.max_prefill_chunk_tokens", "CHUNKING_DISABLED", "chunking is disabled"
             )
-        if self.priority_preemption and self.scheduling_policy is not SchedulingPolicy.PRIORITY:
+        if (
+            self.max_prefill_chunk_tokens is not None
+            and self.max_prefill_chunk_tokens > self.effective_scheduled_token_budget
+        ):
             raise ConfigError(
-                "scheduler.priority_preemption",
-                "PRIORITY_PREEMPTION_WITHOUT_PRIORITY",
-                "priority preemption requires priority scheduling",
+                "scheduler.max_prefill_chunk_tokens",
+                "CHUNK_BUDGET_TOO_LARGE",
+                "chunk cap cannot exceed the issue budget",
             )
-
-        require_int(self.transfer_bytes, "transfer_bytes")
+        for name, supported in (
+            ("max_decode_steps_per_schedule", 1),
+            ("max_inflight", 1),
+            ("max_num_partial_prefills", 1),
+            ("long_prefill_token_threshold", 0),
+            ("preemption_mode", PreemptionMode.NONE),
+            ("priority_preemption", False),
+        ):
+            if getattr(self, name) != supported:
+                raise ConfigError(
+                    f"scheduler.{name}", "UNSUPPORTED_FEATURE", f"baseline requires {supported!r}"
+                )
+        if self.scheduling_policy not in (SchedulingPolicy.FCFS, SchedulingPolicy.PRIORITY):
+            raise ConfigError(
+                "scheduler.scheduling_policy",
+                "UNSUPPORTED_POLICY",
+                "baseline supports FCFS/PRIORITY",
+            )
         if type(self.tier_limits) is not tuple:
-            raise TypeError("tier_limits must be an immutable tuple")
-        if len({tier for tier, _ in self.tier_limits}) != len(self.tier_limits):
-            raise ValueError("duplicate memory tier limit")
-        for tier, limit in self.tier_limits:
-            if not isinstance(tier, MemoryTier) or not tier.allocatable:
-                raise ValueError("invalid memory tier")
-            require_int(limit, "tier limit")
+            raise TypeError("scheduler.tier_limits must be a tuple of tuple pairs")
+        tiers: dict[MemoryTier, int] = {}
+        for index, pair in enumerate(self.tier_limits):
+            if type(pair) is not tuple or len(pair) != 2:
+                raise TypeError(f"scheduler.tier_limits[{index}] must be a two-element tuple")
+            tier, limit = pair
+            if not isinstance(tier, MemoryTier):
+                raise TypeError(f"scheduler.tier_limits[{index}] must name a MemoryTier")
+            if not tier.allocatable:
+                raise ConfigError(
+                    f"scheduler.tier_limits[{index}]",
+                    "INVALID_MEMORY_TIER",
+                    "expected an allocatable MemoryTier",
+                )
+            if tier in tiers:
+                raise ConfigError(
+                    f"scheduler.tier_limits[{index}]",
+                    "DUPLICATE_MEMORY_TIER",
+                    "duplicate memory tier limit",
+                )
+            require_int(limit, f"scheduler.tier_limits[{index}].bytes")
+            tiers[tier] = limit
+        object.__setattr__(self, "tier_limits", tuple(sorted(tiers.items())))
 
     @property
     def effective_scheduled_token_budget(self) -> int:
-        """Return the scheduler issue budget after applying its default."""
-        if self.max_num_scheduled_tokens is None:
-            return self.max_num_batched_tokens
-        return self.max_num_scheduled_tokens
+        """Unpadded issue budget; resolve() also accounts for runner padding."""
+        return (
+            self.max_num_batched_tokens
+            if self.max_num_scheduled_tokens is None
+            else self.max_num_scheduled_tokens
+        )
 
-    def effective_long_prefill_threshold(self, max_model_len: int) -> int:
-        """Resolve the explicit threshold or four percent of model context."""
-        if type(max_model_len) is not int or max_model_len < 1:
-            raise ConfigError(
-                "model.max_model_len",
-                "MODEL_LENGTH_INVALID",
-                "max model length must be a positive integer",
-            )
-        if self.long_prefill_token_threshold is not None:
-            return self.long_prefill_token_threshold
-        return max(1, int(max_model_len * 0.04))
+    def resolve(
+        self,
+        max_model_len: int,
+        *,
+        execution: ExecutionPlan,
+        capabilities: SchedulerCapabilities,
+        memory: LedgerSnapshot,
+        workspace: MemoryPlan,
+    ) -> ResolvedSchedulerPlan:
+        """Bind execution/memory descriptors without allocation.
 
-    def resolve(self, max_model_len: int) -> ResolvedSchedulerPlan:
-        """Freeze all derived defaults for runtime and fingerprinting."""
+        max_model_len already incorporates model context resolution. Capacity is
+        copied from the ledger snapshot, never from transient free bytes. Requiring
+        execution/runner/memory inputs is an intentional break: context alone cannot
+        certify compatible limits. workspace is the runner's static minimum plan;
+        actual per-step reservations must still be checked during preparation.
+        """
+        require_int(max_model_len, "model.max_model_len", minimum=1)
+        if not isinstance(capabilities, SchedulerCapabilities):
+            raise TypeError("capabilities must be SchedulerCapabilities")
+        require_frozen(capabilities, "capabilities")
+        if not isinstance(memory, LedgerSnapshot):
+            raise TypeError("memory must be LedgerSnapshot")
+        if not isinstance(memory.tiers, Mapping):
+            raise TypeError("memory.tiers must be a mapping of tier accounts")
+        pairs = []
+        for tier, account in memory.tiers.items():
+            if not isinstance(account, TierAccountSnapshot) or tier is not account.tier:
+                raise ConfigError("memory.tiers", "MEMORY_TIER_MISMATCH", "invalid tier account")
+            pairs.append((tier, account.capacity_bytes))
+        values = {item.name: getattr(self, item.name) for item in fields(SchedulerConfig)}
+        issue = self.max_num_scheduled_tokens
+        if issue is None:
+            multiple = capabilities.token_padding_multiple
+            issue = (self.max_num_batched_tokens // multiple) * multiple
+            if issue < 1:
+                raise ConfigError(
+                    "scheduler.max_num_scheduled_tokens",
+                    "PADDED_CAPACITY_EXCEEDED",
+                    "execution capacity is smaller than one padding unit",
+                )
+        values["max_num_scheduled_tokens"] = issue
+        if self.enable_chunked_prefill and self.max_prefill_chunk_tokens is None:
+            values["max_prefill_chunk_tokens"] = min(issue, max_model_len)
         return ResolvedSchedulerPlan(
+            **values,
             max_model_len=max_model_len,
-            max_num_seqs=self.max_num_seqs,
-            max_num_batched_tokens=self.max_num_batched_tokens,
-            max_num_scheduled_tokens=self.effective_scheduled_token_budget,
-            max_queued_requests=self.max_queued_requests,
-            chunked_prefill=self.enable_chunked_prefill,
-            max_num_partial_prefills=self.max_num_partial_prefills,
-            long_prefill_token_threshold=self.effective_long_prefill_threshold(max_model_len),
-            scheduling_policy=self.scheduling_policy,
-            preemption_mode=self.preemption_mode,
-            priority_preemption=self.priority_preemption,
-            max_decode_steps_per_schedule=self.max_decode_steps_per_schedule,
-            max_inflight=self.max_inflight,
-            max_bypass=self.max_bypass,
-            iteration_ns=self.iteration_ns,
-            retry_ns=self.retry_ns,
-            transfer_bytes=self.transfer_bytes,
-            tier_limits=self.tier_limits,
+            execution=execution,
+            capabilities=capabilities,
+            memory_device_index=memory.device_index,
+            memory_capacity_bytes=tuple(pairs),
+            workspace=workspace,
         )
 
 
-@dataclass(frozen=True, slots=True)
-class ResolvedSchedulerPlan(ConfigMixin):
-    """Scheduler settings with every model-dependent default resolved."""
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ResolvedSchedulerPlan(SchedulerConfig):
+    """Validated settings bound to immutable execution, runner and tier capacity.
 
+    Direct construction repeats config and cross-module checks. Its fingerprint
+    covers these host settings and execution identity, not a compiled graph key or
+    acquired KV. No mutable ledger map is retained. Engine construction must pass
+    this max_inflight explicitly to the executor; runtime wiring belongs to S1.
+    """
+
+    max_num_scheduled_tokens: int = field()
+    max_prefill_chunk_tokens: int | None = field()
     max_model_len: int
-    max_num_seqs: int
-    max_num_batched_tokens: int
-    max_num_scheduled_tokens: int
-    max_queued_requests: int | None
-    chunked_prefill: bool
-    max_num_partial_prefills: int
-    long_prefill_token_threshold: int
-    scheduling_policy: SchedulingPolicy
-    preemption_mode: PreemptionMode
-    priority_preemption: bool
-    max_decode_steps_per_schedule: int
-    max_inflight: int
-    max_bypass: int
-    iteration_ns: int
-    retry_ns: int
-    transfer_bytes: int
-    tier_limits: tuple[tuple[MemoryTier, int], ...]
+    execution: ExecutionPlan
+    capabilities: SchedulerCapabilities
+    memory_device_index: int
+    memory_capacity_bytes: tuple[tuple[MemoryTier, int], ...]
+    workspace: MemoryPlan
 
     def __post_init__(self) -> None:
-        """Defend the public resolved contract against direct invalid construction."""
-        for name in (
-            "max_model_len",
-            "max_num_seqs",
-            "max_num_batched_tokens",
-            "max_num_scheduled_tokens",
-            "max_num_partial_prefills",
-            "long_prefill_token_threshold",
-            "max_decode_steps_per_schedule",
-            "max_inflight",
-            "max_bypass",
-            "iteration_ns",
-            "retry_ns",
+        SchedulerConfig.__post_init__(self)
+        require_int(self.max_model_len, "model.max_model_len", minimum=1)
+        require_int(self.memory_device_index, "memory.device_index")
+        require_int(self.max_num_scheduled_tokens, "scheduler.max_num_scheduled_tokens", minimum=1)
+        if self.enable_chunked_prefill and self.max_prefill_chunk_tokens is None:
+            raise ConfigError(
+                "scheduler.max_prefill_chunk_tokens", "UNRESOLVED_VALUE", "missing chunk cap"
+            )
+        for value, expected, name in (
+            (self.execution, ExecutionPlan, "execution"),
+            (self.capabilities, SchedulerCapabilities, "capabilities"),
+            (self.workspace, MemoryPlan, "workspace"),
         ):
-            require_int(getattr(self, name), name, minimum=1)
-        if self.max_num_scheduled_tokens > self.max_num_batched_tokens:
-            raise ValueError("scheduled-token budget exceeds executable token budget")
-        if self.max_queued_requests is not None:
-            require_int(self.max_queued_requests, "max_queued_requests", minimum=1)
-        if type(self.chunked_prefill) is not bool:
-            raise TypeError("chunked_prefill must be bool")
-        if type(self.priority_preemption) is not bool:
-            raise TypeError("priority_preemption must be bool")
-        if not isinstance(self.scheduling_policy, SchedulingPolicy):
-            raise TypeError("scheduling_policy must be SchedulingPolicy")
-        if not isinstance(self.preemption_mode, PreemptionMode):
-            raise TypeError("preemption_mode must be PreemptionMode")
-        if self.max_num_partial_prefills > self.max_num_seqs:
-            raise ValueError("partial-prefill concurrency exceeds sequence budget")
-        if not self.chunked_prefill and self.max_num_partial_prefills != 1:
-            raise ValueError("partial-prefill concurrency requires chunked prefill")
-        if self.priority_preemption and self.scheduling_policy is not SchedulingPolicy.PRIORITY:
-            raise ValueError("priority preemption requires priority scheduling")
-        require_int(self.transfer_bytes, "transfer_bytes")
-        if type(self.tier_limits) is not tuple:
-            raise TypeError("tier_limits must be an immutable tuple")
-        if len({tier for tier, _ in self.tier_limits}) != len(self.tier_limits):
-            raise ValueError("duplicate memory tier limit")
+            if not isinstance(value, expected):
+                raise TypeError(f"{name} must be {expected.__name__}")
+            require_frozen(value, name)
+        if type(self.memory_capacity_bytes) is not tuple:
+            raise TypeError("memory.capacity_bytes must be a tuple of tuple pairs")
+        capacities: dict[MemoryTier, int] = {}
+        for index, pair in enumerate(self.memory_capacity_bytes):
+            if type(pair) is not tuple or len(pair) != 2:
+                raise TypeError(f"memory.capacity_bytes[{index}] must be a two-element tuple")
+            tier, limit = pair
+            if not isinstance(tier, MemoryTier):
+                raise TypeError(f"memory.capacity_bytes[{index}] must name a MemoryTier")
+            if not tier.allocatable:
+                raise ConfigError(
+                    f"memory.capacity_bytes[{index}]",
+                    "INVALID_MEMORY_TIER",
+                    "expected an allocatable MemoryTier",
+                )
+            if tier in capacities:
+                raise ConfigError(
+                    f"memory.capacity_bytes[{index}]",
+                    "DUPLICATE_MEMORY_TIER",
+                    "duplicate memory tier limit",
+                )
+            require_int(limit, f"memory.capacity_bytes[{index}].bytes")
+            capacities[tier] = limit
+        object.__setattr__(self, "memory_capacity_bytes", tuple(sorted(capacities.items())))
+
+        compute = self.execution.compute
+        if not isinstance(compute, ComputePlan):
+            raise TypeError("execution.compute must be ComputePlan")
+        require_frozen(compute, "execution.compute")
+        parallel = self.execution.parallel
+        if not isinstance(parallel, ParallelPlan):
+            raise TypeError("execution.parallel must be ParallelPlan")
+        require_frozen(parallel, "execution.parallel")
+        for axis in ("tp", "pp", "dp", "ep", "cp"):
+            require_int(
+                getattr(parallel, f"{axis}_size"),
+                f"execution.parallel.{axis}_size",
+                minimum=1,
+            )
+            require_int(getattr(parallel, f"{axis}_rank"), f"execution.parallel.{axis}_rank")
+        if type(parallel.sp_enabled) is not bool:
+            raise TypeError("execution.parallel.sp_enabled must be bool")
+        require_int(
+            compute.max_num_batched_tokens,
+            "execution.compute.max_num_batched_tokens",
+            minimum=1,
+        )
+        if type(compute.enable_chunked_prefill) is not bool:
+            raise TypeError("execution.compute.enable_chunked_prefill must be bool")
+        if self.max_num_batched_tokens > compute.max_num_batched_tokens:
+            raise ConfigError(
+                "scheduler.max_num_batched_tokens",
+                "EXECUTION_CAPACITY_EXCEEDED",
+                "exceeds ComputePlan capacity",
+            )
+        if self.max_num_seqs > self.capabilities.max_num_seqs:
+            raise ConfigError(
+                "scheduler.max_num_seqs",
+                "METADATA_CAPACITY_EXCEEDED",
+                "exceeds runner sequence capacity",
+            )
+        if (
+            self.capabilities.physical_token_slots(self.max_num_scheduled_tokens)
+            > self.max_num_batched_tokens
+        ):
+            raise ConfigError(
+                "scheduler.max_num_scheduled_tokens",
+                "PADDED_CAPACITY_EXCEEDED",
+                "padded issue budget exceeds execution capacity",
+            )
+        if self.enable_chunked_prefill and not (
+            compute.enable_chunked_prefill and self.capabilities.chunked_prefill
+        ):
+            raise ConfigError(
+                "scheduler.enable_chunked_prefill",
+                "CHUNKING_UNSUPPORTED",
+                "compute plan and runner must both support chunking",
+            )
+        if not self.enable_chunked_prefill and self.max_model_len > self.max_num_scheduled_tokens:
+            raise ConfigError(
+                "scheduler.max_num_scheduled_tokens",
+                "UNCHUNKED_MODEL_TOO_LARGE",
+                "unchunked baseline requires model context to fit the issue budget",
+            )
+        if (
+            not self.execution.parallel.is_single_process
+            or self.execution.parallel.sp_enabled
+            or compute.num_micro_batches != 1
+            or self.capabilities.graph_mode is not GraphMode.EAGER
+        ):
+            raise ConfigError(
+                "execution",
+                "UNSUPPORTED_EXECUTION_MODE",
+                "baseline requires one rank, one micro-batch and eager execution",
+            )
+
+        if not capacities:
+            raise ConfigError(
+                "memory.capacity_bytes",
+                "EMPTY_MEMORY_CAPACITY",
+                "at least one ledger tier is required",
+            )
         for tier, limit in self.tier_limits:
-            if not isinstance(tier, MemoryTier) or not tier.allocatable:
-                raise ValueError("invalid memory tier")
-            require_int(limit, "tier limit")
+            if tier not in capacities or limit > capacities[tier]:
+                raise ConfigError(
+                    "scheduler.tier_limits",
+                    "TIER_CAPACITY_EXCEEDED",
+                    "tier limit exceeds the configured ledger capacity",
+                )
+            capacities[tier] = limit
+        required: dict[MemoryTier, int] = {}
+        for item in self.workspace.workspaces:
+            if not isinstance(item, WorkspaceRequest):
+                raise TypeError("workspace.request must be WorkspaceRequest")
+            require_frozen(item, "workspace.request")
+            if not isinstance(item.tier, MemoryTier):
+                raise TypeError("workspace.tier must be MemoryTier")
+            if not item.tier.allocatable:
+                raise ConfigError(
+                    "workspace.tier", "INVALID_MEMORY_TIER", "workspace tier must be allocatable"
+                )
+            require_int(item.nbytes, "workspace.nbytes")
+            required[item.tier] = required.get(item.tier, 0) + item.nbytes
+        require_int(self.workspace.activation_bytes, "workspace.activation_bytes")
+        if self.workspace.activation_bytes:
+            required[MemoryTier.DEVICE] = (
+                required.get(MemoryTier.DEVICE, 0) + self.workspace.activation_bytes
+            )
+        for tier, nbytes in required.items():
+            if tier not in capacities or nbytes > capacities[tier]:
+                raise ConfigError(
+                    "workspace",
+                    "WORKSPACE_CAPACITY_EXCEEDED",
+                    "workspace plus activations exceed the tier charge ceiling",
+                )
+
+    def validate_request(self, request: Request) -> None:
+        """Check permanent length feasibility before admission without mutation.
+
+        Reject prompt plus requested output beyond context; never clamp output.
+        Queue occupancy, available KV pages, prefix acquisition and readiness still
+        require the concrete scheduler and the existing memory/request owners.
+        """
+        if not isinstance(request, Request):
+            raise TypeError("request must be Request")
+        require_int(request.stop.max_tokens, "request.stop.max_tokens", minimum=1)
+        if request.max_total_len > self.max_model_len:
+            raise ConfigError(
+                "request.max_total_len",
+                "REQUEST_TOO_LONG",
+                "prompt plus output limit exceeds model context",
+            )
+        if not self.enable_chunked_prefill and request.prompt_len > self.max_num_scheduled_tokens:
+            raise ConfigError(
+                "request.prompt_len", "PROMPT_EXCEEDS_BUDGET", "unchunked prompt cannot fit"
+            )
+
+
+def scheduler_config_from_dict(values: Mapping[str, Any]) -> SchedulerConfig:
+    """Parse JSON-style canonical/legacy settings without retaining input aliases.
+
+    Unknown keys and conflicting aliases raise ConfigError. Equal old/new values
+    are accepted with DeprecationWarning. Legacy issue budgets never enlarge
+    execution capacity. Strings are parsed only here; dataclasses require
+    canonical enum values. to_dict()/JSON payloads round-trip through here.
+    """
+    aliases = {
+        "max_tokens": "max_num_scheduled_tokens",
+        "max_batch_requests": "max_num_seqs",
+        "max_requests": "max_num_requests",
+        "prefill_chunk": "max_prefill_chunk_tokens",
+    }
+    if not isinstance(values, Mapping) or any(type(key) is not str for key in values):
+        raise ConfigError("scheduler", "INVALID_MAPPING", "expected a mapping with string keys")
+    data = dict(values)
+    known = {item.name for item in fields(SchedulerConfig)}
+    unknown = data.keys() - known - aliases.keys()
+    if unknown:
+        raise ConfigError("scheduler", "UNKNOWN_KEY", f"unknown keys: {', '.join(sorted(unknown))}")
+    used_aliases = []
+    for old, new in aliases.items():
+        if old not in data:
+            continue
+        value = data.pop(old)
+        if new in data and (type(data[new]) is not type(value) or data[new] != value):
+            raise ConfigError(f"scheduler.{old}", "ALIAS_CONFLICT", f"conflicts with {new}")
+        data[new] = value
+        used_aliases.append(f"{old} -> {new}")
+    for name, enum_type in (
+        ("scheduling_policy", SchedulingPolicy),
+        ("preemption_mode", PreemptionMode),
+    ):
+        if name in data and type(data[name]) is str:
+            try:
+                data[name] = enum_type(data[name])
+            except ValueError as exc:
+                raise ConfigError(f"scheduler.{name}", "INVALID_ENUM", str(exc)) from exc
+    if "tier_limits" in data:
+        tiers = data["tier_limits"]
+        if type(tiers) not in (list, tuple):
+            raise ConfigError(
+                "scheduler.tier_limits", "INVALID_TIER_LIMITS", "expected an array of pairs"
+            )
+        parsed = []
+        for index, pair in enumerate(tiers):
+            path = f"scheduler.tier_limits[{index}]"
+            if type(pair) not in (tuple, list) or len(pair) != 2:
+                raise ConfigError(path, "INVALID_TIER_PAIR", "expected a two-element array")
+            tier, limit = pair
+            try:
+                if type(tier) is str:
+                    tier = MemoryTier[tier.upper()]
+                elif type(tier) is int:
+                    tier = MemoryTier(tier)
+            except (KeyError, ValueError) as exc:
+                raise ConfigError(path, "INVALID_MEMORY_TIER", "unknown tier") from exc
+            if not isinstance(tier, MemoryTier):
+                raise ConfigError(path, "INVALID_MEMORY_TIER", "unknown tier")
+            parsed.append((tier, limit))
+        data["tier_limits"] = tuple(parsed)
+    config = SchedulerConfig(**data)
+    if used_aliases:
+        warnings.warn(
+            "Deprecated scheduler keys: " + ", ".join(used_aliases),
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return config
