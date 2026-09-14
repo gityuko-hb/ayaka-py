@@ -9,16 +9,19 @@ against which the production ContinuousScheduler can be compared.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
 
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.completion import CompletionResult
 from ayaka.executor.ticket import ExecutionTicket, TerminalStatus
-from ayaka.plan import SamplingPlan
 from ayaka.request.lifecycle import LifecycleManager
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import OverloadedError, SequenceAllocator, StepPrepareError, StepRuntime
 from ayaka.sched.plan import BatchStepPlan, KVRequirement, Phase, PreparedStep, ScheduledSlice
 from ayaka.sched.policy import rank_waiting
+
+if TYPE_CHECKING:
+    from ayaka.sampling.engine import SamplingCoordinator
 
 __all__ = [
     "EagerScheduler",
@@ -53,6 +56,7 @@ class EagerScheduler(SchedulerCore):
         *,
         text_stops: bool = False,
         clock: Callable[[], int] | None = None,
+        sampling: SamplingCoordinator | None = None,
     ) -> None:
         super().__init__(
             plan,
@@ -61,6 +65,7 @@ class EagerScheduler(SchedulerCore):
             allocator,
             text_stops=text_stops,
             clock=clock,
+            sampling=sampling,
         )
         self._inflight_phases: dict[str, Phase] = {}
 
@@ -121,6 +126,8 @@ class EagerScheduler(SchedulerCore):
         return ticket
 
     def update_from_output(self, output: CompletionResult) -> None:
+        if self._sampling is not None and output.published:
+            self._sampling.record_published(output.published)
         settled_ids = self._clear_inflight(output.ticket_id)
         if settled_ids is not None:
             phases = self._inflight_phases
@@ -129,17 +136,15 @@ class EagerScheduler(SchedulerCore):
                 for request_id in settled_ids:
                     lifecycle = self._requests.find(request_id)
                     self._prefilling.pop(request_id, None)
-                    if (
-                        lifecycle is None
-                        or lifecycle.is_terminal
-                        or lifecycle.token.is_cancelled
-                    ):
+                    if lifecycle is None or lifecycle.is_terminal or lifecycle.token.is_cancelled:
                         continue
                     if phases.get(request_id) is Phase.PREFILL:
                         self._running[request_id] = lifecycle
             else:
                 for request_id in settled_ids:
                     if request_id not in self._abort_pending:
+                        if self._sampling is not None:
+                            self._sampling.release(request_id)
                         self._drop(request_id)
                         self._sequences.pop(request_id, None)
             self._finalize_settled_aborts(settled_ids)
@@ -148,6 +153,8 @@ class EagerScheduler(SchedulerCore):
             if request_id in self._abort_pending:
                 self._finalize_abort(request_id)
             else:
+                if self._sampling is not None:
+                    self._sampling.release(request_id)
                 self._drop(request_id)
                 self._sequences.pop(request_id, None)
 
@@ -244,7 +251,7 @@ class EagerScheduler(SchedulerCore):
             inputs=tuple(inputs),
             padded_num_tokens=self._plan.capabilities.physical_token_slots(total),
             sampling_rows=tuple(sampling_rows),
-            sampling=SamplingPlan(num_rows=len(sampling_rows), all_greedy=True),
+            sampling=self._sampling_plan(slices),
             kv_requirements=tuple(
                 KVRequirement(group, total, request_tokens=request_tokens)
                 for group in range(groups)

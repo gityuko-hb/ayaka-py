@@ -10,18 +10,24 @@ from __future__ import annotations
 
 import time
 from abc import abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from typing import TYPE_CHECKING
 
 from ayaka.configs.base import ConfigError
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.ticket import ExecutionTicket
 from ayaka.handles import SequenceHandle
+from ayaka.plan import SamplingPlan
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.schema import Request
 from ayaka.sched.base import BaseScheduler
 from ayaka.sched.interfaces import OverloadedError, SequenceAllocator, StepRuntime
 from ayaka.sched.outcome import FinishReason, RequestOutcome, RequestReport, SchedulerReport
 from ayaka.sched.policy import QueueEntry
+
+if TYPE_CHECKING:
+    from ayaka.sampling.engine import SamplingCoordinator
+    from ayaka.sched.plan import ScheduledSlice
 
 __all__ = ["SchedulerCore"]
 
@@ -38,11 +44,19 @@ class SchedulerCore(BaseScheduler):
         *,
         text_stops: bool = False,
         clock: Callable[[], int] | None = None,
+        sampling: SamplingCoordinator | None = None,
     ) -> None:
         if not isinstance(plan, ResolvedSchedulerPlan):
             raise TypeError("plan must be ResolvedSchedulerPlan")
         if not isinstance(requests, LifecycleManager):
             raise TypeError("requests must be LifecycleManager")
+        if sampling is not None and plan.max_num_requests is not None:
+            if sampling.max_batch_size < plan.max_num_requests:
+                raise ValueError(
+                    f"sampling capacity {sampling.max_batch_size} < max_num_requests "
+                    f"{plan.max_num_requests}; slots are held for the whole admitted "
+                    "lifetime, not just the running set"
+                )
 
         self._plan = plan
         self._requests = requests
@@ -50,6 +64,7 @@ class SchedulerCore(BaseScheduler):
         self._allocator = allocator
         self._text_stops = text_stops
         self._clock = clock or time.monotonic_ns
+        self._sampling = sampling
 
         self._waiting: list[QueueEntry] = []
         self._prefilling: dict[str, RequestLifecycle] = {}
@@ -78,6 +93,19 @@ class SchedulerCore(BaseScheduler):
         self._validate_request_features(request)
         self._check_capacity()
 
+        # Claim the sampling slot before the lifecycle so a capacity failure
+        # leaves no half-registered request behind. ``create`` repeats the
+        # duplicate check; doing it first keeps the slot accounting clean.
+        if request.request_id in self._requests:
+            raise ValueError(f"duplicate request_id {request.request_id!r}")
+        if self._sampling is not None:
+            self._sampling.add(
+                request.request_id,
+                request.sampling,
+                request.prompt_token_ids,
+                request_index=self._next_ordinal,
+            )
+
         lifecycle = self._requests.create(request)
         self._requests.advance_to_queue(lifecycle.request_id)
         sequence = self._allocator.create(lifecycle.request_id)
@@ -94,12 +122,18 @@ class SchedulerCore(BaseScheduler):
         return lifecycle
 
     def _validate_request_features(self, request: Request) -> None:
-        sampling = request.sampling
-        if not sampling.is_greedy or sampling.n != 1:
+        params = request.sampling
+        if params.n != 1:
             raise ConfigError(
                 "request.sampling",
                 "UNSUPPORTED_SAMPLING",
-                "scheduler core requires the K06 sampling-plan path for non-greedy/n>1",
+                "scheduler core supports n == 1 only; parallel sampling is not ported",
+            )
+        if not params.is_greedy and self._sampling is None:
+            raise ConfigError(
+                "request.sampling",
+                "UNSUPPORTED_SAMPLING",
+                "non-greedy sampling requires a wired SamplingCoordinator",
             )
         if request.stop.stop_strings and not self._text_stops:
             raise ConfigError(
@@ -169,6 +203,8 @@ class SchedulerCore(BaseScheduler):
             return None
         self._drop(request_id)
         self._abort_pending.discard(request_id)
+        if self._sampling is not None:
+            self._sampling.release(request_id)
         self._queue_report(
             RequestReport(
                 request_id,
@@ -186,6 +222,8 @@ class SchedulerCore(BaseScheduler):
             return None
         self._drop(request_id)
         self._abort_pending.discard(request_id)
+        if self._sampling is not None:
+            self._sampling.release(request_id)
         self._queue_report(
             RequestReport(
                 request_id,
@@ -208,8 +246,7 @@ class SchedulerCore(BaseScheduler):
             num_running=len(self._running) + len(self._prefilling),
             num_waiting=len(self._waiting),
             num_preempted_this_step=sum(
-                item.outcome
-                in (RequestOutcome.PREEMPTED_RECOMPUTE, RequestOutcome.PREEMPTED_SWAP)
+                item.outcome in (RequestOutcome.PREEMPTED_RECOMPUTE, RequestOutcome.PREEMPTED_SWAP)
                 for item in pending
             ),
         )
@@ -247,6 +284,8 @@ class SchedulerCore(BaseScheduler):
     def _finalize_abort(self, request_id: str) -> None:
         lifecycle = self._requests.find(request_id)
         self._drop(request_id)
+        if self._sampling is not None:
+            self._sampling.release(request_id)
         if lifecycle is not None and not lifecycle.is_terminal:
             self._queue_report(
                 RequestReport(
@@ -318,6 +357,19 @@ class SchedulerCore(BaseScheduler):
 
     def _seq_cap(self) -> int:
         return min(self._plan.max_num_seqs, self._plan.capabilities.max_num_seqs)
+
+    def _sampling_plan(self, slices: Sequence[ScheduledSlice]) -> SamplingPlan:
+        """Freeze this step's sampling shape before any forward work exists.
+
+        Without a coordinator the engine keeps the greedy contract: the
+        executor may take the argmax fast path. With one, ``plan_for`` pins the
+        packed active-row map and reads ``all_greedy``/``any_penalty`` from host
+        staging, so no device sync is needed to pick the kernel variant.
+        """
+        if self._sampling is None:
+            num_rows = sum(1 for scheduled in slices if scheduled.sample_last_query)
+            return SamplingPlan(num_rows=num_rows, all_greedy=True)
+        return self._sampling.plan_for(slices)
 
     def _next_step_id(self) -> int:
         self._step_id += 1

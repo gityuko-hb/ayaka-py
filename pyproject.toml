@@ -66,6 +66,7 @@ cpu = ["torch>=2.12"]
 flashinfer = ["flashinfer-python>=0.6,<0.7"]
 flash-attn = ["flash-attn>=2.7,<3"]
 
+
 [project.scripts]
 ayaka = "ayaka.entrypoints.cli:main"
 

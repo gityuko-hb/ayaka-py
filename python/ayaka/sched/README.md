@@ -124,8 +124,12 @@ sequence release/reporting is deferred until the ticket settles.
   and sampling off the known-token boundary.
 - `BatchStepPlan` is frozen; `sampling_rows` must exactly match slice sampling
   boundaries, and one request has at most one slice per step.
-- The core requires greedy sampling with `n == 1`; text stop strings need a
-  tokenizer-backed output owner.
+- Without a sampling coordinator (`sampling=` on the scheduler) the core stays
+  greedy-only and rejects non-greedy requests with `UNSUPPORTED_SAMPLING`. With
+  one, `SamplingPlan` flags and the packed active-row map come from
+  `ayaka.sampling.engine.SamplingCoordinator`, and the executor backend samples
+  through `ayaka.runtime.sampling_runner`. Parallel sampling (`n > 1`) is still
+  rejected; text stop strings need a tokenizer-backed output owner.
 - `configs.scheduler` resolves and cross-checks capacities, padding, chunking,
   and workspace limits before any allocation, and the current baseline rejects
   execution/preemption combinations it cannot certify.

@@ -38,6 +38,7 @@ class DeviceBackend(Protocol):
     def query(self, event: Any) -> bool: ...
     def elapsed_ms(self, start: Any, end: Any) -> float: ...
     def synchronize_stream(self, stream: Any) -> None: ...
+    def synchronize_event(self, event: Any) -> None: ...
     def synchronize_device(self, index: int) -> None: ...
 
 
@@ -128,6 +129,9 @@ class NullBackend(DeviceBackend):
         return float(self._recorded.get(int(end), 0) - self._recorded.get(int(start), 0))
 
     def synchronize_stream(self, stream: Any) -> None:
+        self.advance()
+
+    def synchronize_event(self, event: Any) -> None:
         self.advance()
 
     def synchronize_device(self, index: int) -> None:
@@ -226,6 +230,9 @@ class TorchCudaBackend(DeviceBackend):
 
     def synchronize_stream(self, stream: Any) -> None:
         stream.synchronize()
+
+    def synchronize_event(self, event: Any) -> None:
+        event.synchronize()
 
     def synchronize_device(self, index: int) -> None:
         synchronize(index)

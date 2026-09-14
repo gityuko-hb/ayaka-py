@@ -9,18 +9,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.completion import CompletionResult
 from ayaka.executor.ticket import ExecutionTicket, TerminalStatus
-from ayaka.plan import SamplingPlan
-from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
+from ayaka.request.lifecycle import LifecycleManager
 from ayaka.sched.budget import BatchBudget
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import (
     AdmissionAdvisor,
-    PrefixHintProvider,
     PreemptionController,
+    PrefixHintProvider,
     SequenceAllocator,
     StepPrepareError,
     StepRuntime,
@@ -36,6 +36,9 @@ from ayaka.sched.plan import (
 )
 from ayaka.sched.policy import QueueEntry, order
 from ayaka.sched.preemption import select_preemption_victim
+
+if TYPE_CHECKING:
+    from ayaka.sampling.engine import SamplingCoordinator
 
 __all__ = ["ContinuousScheduler", "ContinuousSchedulerStats"]
 
@@ -101,6 +104,7 @@ class ContinuousScheduler(SchedulerCore):
         allow_mixed_batches: bool = True,
         prefill_chunk_size: int | None = None,
         max_bypass: int = 64,
+        sampling: SamplingCoordinator | None = None,
     ) -> None:
         super().__init__(
             plan,
@@ -109,6 +113,7 @@ class ContinuousScheduler(SchedulerCore):
             allocator,
             text_stops=text_stops,
             clock=clock,
+            sampling=sampling,
         )
         if prefill_chunk_size is not None and prefill_chunk_size <= 0:
             raise ValueError("prefill_chunk_size must be positive")
@@ -148,6 +153,8 @@ class ContinuousScheduler(SchedulerCore):
         return None
 
     def update_from_output(self, output: CompletionResult) -> None:
+        if self._sampling is not None and output.published:
+            self._sampling.record_published(output.published)
         settled_ids = self._clear_inflight(output.ticket_id)
         if settled_ids is not None:
             inflight = self._inflight_slices
@@ -157,11 +164,7 @@ class ContinuousScheduler(SchedulerCore):
                 for item in inflight:
                     lifecycle = self._requests.find(item.request_id)
                     self._prefilling.pop(item.request_id, None)
-                    if (
-                        lifecycle is None
-                        or lifecycle.is_terminal
-                        or lifecycle.token.is_cancelled
-                    ):
+                    if lifecycle is None or lifecycle.is_terminal or lifecycle.token.is_cancelled:
                         continue
                     if item.phase is Phase.PREFILL:
                         if item.query_end < item.prompt_tokens:
@@ -173,6 +176,8 @@ class ContinuousScheduler(SchedulerCore):
             else:
                 for request_id in settled_ids:
                     if request_id not in self._abort_pending:
+                        if self._sampling is not None:
+                            self._sampling.release(request_id)
                         self._drop(request_id)
                         self._sequences.pop(request_id, None)
 
@@ -182,6 +187,8 @@ class ContinuousScheduler(SchedulerCore):
             if request_id in self._abort_pending:
                 self._finalize_abort(request_id)
             else:
+                if self._sampling is not None:
+                    self._sampling.release(request_id)
                 self._drop(request_id)
                 self._sequences.pop(request_id, None)
 
@@ -475,9 +482,7 @@ class ContinuousScheduler(SchedulerCore):
 
         self._running.pop(victim.request_id, None)
         outcome = (
-            RequestOutcome.PREEMPTED_SWAP
-            if mode == "swap"
-            else RequestOutcome.PREEMPTED_RECOMPUTE
+            RequestOutcome.PREEMPTED_SWAP if mode == "swap" else RequestOutcome.PREEMPTED_RECOMPUTE
         )
         self._queue_report(RequestReport(victim.request_id, outcome, victim.sequence_epoch))
         self._requeue(victim)
@@ -516,7 +521,7 @@ class ContinuousScheduler(SchedulerCore):
             inputs=tuple(inputs),
             padded_num_tokens=self._plan.capabilities.physical_token_slots(total),
             sampling_rows=tuple(sampling_rows),
-            sampling=SamplingPlan(num_rows=len(sampling_rows), all_greedy=True),
+            sampling=self._sampling_plan(slices),
             kv_requirements=tuple(
                 KVRequirement(group, total, request_tokens=request_tokens)
                 for group in range(groups)
