@@ -14,8 +14,10 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from ayaka.exceptions import WeightMismatchError
 from ayaka.layers.base import BaseLayer
 from ayaka.layers.quantization.base import QuantizationTarget
+from ayaka.model_loader.mapping import ExternMapping, QuantizeMapping
 from ayaka.model_loader.reader import BoundedCheckpointReader
 from ayaka.model_loader.validate import verify_consumed_names
 from ayaka.types import DType
@@ -139,23 +141,160 @@ def _bindings(
     return tensors, result
 
 
+def _load_with_extern_mapping(
+    module: nn.Module,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    mapping: ExternMapping,
+    quantize_mapping: QuantizeMapping | None,
+    device: torch.device | str | None,
+    finalize: bool,
+) -> frozenset[str]:
+    tensors = _tensors(module)
+    for target in mapping.param_map:
+        if quantize_mapping and target in quantize_mapping.param_map:
+            for q_dst in quantize_mapping.param_map[target]:
+                if q_dst not in tensors:
+                    raise KeyError(f"unknown quantized destination tensor {q_dst!r}")
+        else:
+            if target not in tensors:
+                raise KeyError(f"unknown module tensor {target!r}")
+
+    materialize_module_weights(module, device=device)
+    tensors = _tensors(module)
+    for owner in module.modules():
+        if isinstance(owner, BaseLayer) and owner.quant_config is not None:
+            if owner._quantization_state != "created":
+                raise RuntimeError(
+                    "quantized weights must be loaded before finalization, exactly once"
+                )
+
+    source_to_targets = mapping.source_to_targets()
+    all_source_keys = mapping.all_source_keys
+    pending: dict[str, dict[str, torch.Tensor]] = {target: {} for target in mapping.param_map}
+    completed_targets: set[str] = set()
+    consumed: set[str] = set()
+
+    for key, source in weights:
+        if key in mapping.unused_params:
+            if key in consumed:
+                raise ValueError(f"duplicate checkpoint tensor {key!r}")
+            consumed.add(key)
+            continue
+
+        if key not in source_to_targets:
+            raise KeyError(f"unexpected checkpoint tensor {key!r}")
+        if key in consumed:
+            raise ValueError(f"duplicate checkpoint tensor {key!r}")
+        consumed.add(key)
+
+        if source.is_meta:
+            raise ValueError("checkpoint copies require materialized tensors")
+
+        for target in source_to_targets[key]:
+            pending[target][key] = source
+            expected_sources = mapping.param_map[target]
+            if len(pending[target]) == len(expected_sources):
+                args = [pending[target][s] for s in expected_sources]
+                combined = mapping.map_func[target](*args)
+                if combined.is_meta:
+                    raise ValueError("combined tensor cannot be meta")
+
+                if quantize_mapping and target in quantize_mapping.param_map:
+                    dest_names = quantize_mapping.param_map[target]
+                    q_res = quantize_mapping.map_func[target](combined)
+                    if isinstance(q_res, dict):
+                        for d_name, d_val in q_res.items():
+                            dest_tensor = tensors[d_name]
+                            if dest_tensor.is_meta:
+                                raise ValueError("checkpoint copies require materialized tensors")
+                            with torch.no_grad():
+                                dest_tensor.copy_(d_val.to(dest_tensor))
+                    elif isinstance(q_res, (list, tuple)):
+                        if len(q_res) != len(dest_names):
+                            raise ValueError(
+                                f"quantize func for {target!r} returned {len(q_res)} tensors, "
+                                f"expected {len(dest_names)}"
+                            )
+                        for d_name, d_val in zip(dest_names, q_res, strict=True):
+                            dest_tensor = tensors[d_name]
+                            if dest_tensor.is_meta:
+                                raise ValueError("checkpoint copies require materialized tensors")
+                            with torch.no_grad():
+                                dest_tensor.copy_(d_val.to(dest_tensor))
+                    else:
+                        raise TypeError(
+                            f"quantize func for {target!r} returned unexpected type {type(q_res)}"
+                        )
+                else:
+                    destination = tensors[target]
+                    if destination.is_meta:
+                        raise ValueError("checkpoint copies require materialized tensors")
+                    loader = getattr(destination, "weight_loader", None)
+                    if loader is not None:
+                        loader(destination, combined)
+                    else:
+                        if combined.shape != destination.shape:
+                            raise ValueError(
+                                f"checkpoint shape {combined.shape} does not match "
+                                f"{target!r} ({destination.shape})"
+                            )
+                        with torch.no_grad():
+                            destination.copy_(combined.to(destination))
+
+                completed_targets.add(target)
+                del pending[target]
+
+    if len(completed_targets) != len(mapping.param_map):
+        unmet = set(mapping.param_map.keys()) - completed_targets
+        missing = {
+            t: [s for s in mapping.param_map[t] if s not in pending.get(t, {})]
+            for t in sorted(unmet)
+        }
+        raise WeightMismatchError(f"incomplete checkpoint weights for targets: {missing}")
+
+    verify_consumed_names(
+        frozenset(all_source_keys),
+        consumed - mapping.unused_params,
+        offered=frozenset(all_source_keys | mapping.unused_params),
+        context="module weight loading",
+    )
+
+    if finalize:
+        for owner in module.modules():
+            if isinstance(owner, BaseLayer):
+                owner.process_weights_after_loading()
+
+    return frozenset(consumed)
+
+
 def load_module_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
-    bindings: Mapping[str, WeightBinding] | None = None,
+    bindings: Mapping[str, WeightBinding] | ExternMapping | None = None,
+    quantize_mapping: QuantizeMapping | None = None,
     device: torch.device | str | None = None,
     finalize: bool = True,
 ) -> frozenset[str]:
     """Load every required parameter/buffer and optionally finalize layer methods.
 
-    Unknown, missing, duplicate and overlapping bindings raise. A custom parameter
-    weight_loader owns storage/shard interpretation; otherwise shapes must match.
-    Pre-sharded tensors remain local when their shape matches destination storage.
-    Model-wide I/O/copy failures do not roll back earlier writes: recreate/reload
-    the model after failure. CUDA copies/packing are ordered on the current stream;
-    the runtime must join that stream before publishing to other execution streams.
+    Supports both legacy Mapping[str, WeightBinding] and declarative ExternMapping.
+    When ExternMapping is provided, streaming dependency collection fuses multi-source
+    weights on-the-fly and frees temporary host tensors immediately.
     """
+    if isinstance(bindings, ExternMapping):
+        return _load_with_extern_mapping(
+            module,
+            weights,
+            bindings,
+            quantize_mapping=quantize_mapping,
+            device=device,
+            finalize=finalize,
+        )
+
+    if quantize_mapping is not None:
+        raise ValueError("quantize_mapping requires bindings to be an ExternMapping")
+
     _bindings(module, bindings)  # Fail on incomplete architecture maps before allocation.
     materialize_module_weights(module, device=device)
     tensors, mapping = _bindings(module, bindings)

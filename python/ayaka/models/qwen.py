@@ -19,6 +19,7 @@ from ayaka.layers.linear.core import FusedGateUpLinear, RowParallelLinear
 from ayaka.layers.norm import RMSNorm
 from ayaka.layers.rotary_embedding import get_rope
 from ayaka.model_loader.manifest import build_manifest_from_source
+from ayaka.model_loader.mapping import ExternMapping
 from ayaka.model_loader.module import (
     WeightBinding,
     iter_checkpoint_tensors,
@@ -38,6 +39,7 @@ __all__ = [
     "load_qwen_weights",
     "qwen_expected_weights",
     "qwen_weight_bindings",
+    "qwen_weight_mapping",
     "write_qwen_checkpoint",
 ]
 
@@ -236,12 +238,42 @@ def qwen_weight_bindings(config: QwenConfig) -> dict[str, WeightBinding]:
     return bindings
 
 
+def qwen_weight_mapping(config: QwenConfig) -> ExternMapping:
+    """Declarative ExternMapping for Qwen checkpoints.
+
+    Maps 1-1 tensors, fuses mlp.w2 (gate) and mlp.w1 (up) into gate_up_proj,
+    and whitelists rotary_emb.inv_freq.
+    """
+    mapping = ExternMapping()
+    mapping.add_mapping("transformer.wte.weight", "transformer.wte.weight")
+    mapping.add_mapping("transformer.ln_f.weight", "transformer.ln_f.weight")
+    for layer in range(config.num_hidden_layers):
+        prefix = f"transformer.h.{layer}"
+        mapping.add_mapping(f"{prefix}.attn.c_attn.weight", f"{prefix}.attn.c_attn.weight")
+        mapping.add_mapping(f"{prefix}.attn.c_attn.bias", f"{prefix}.attn.c_attn.bias")
+        mapping.add_mapping(f"{prefix}.attn.c_proj.weight", f"{prefix}.attn.c_proj.weight")
+        mapping.add_mapping(
+            f"{prefix}.mlp.gate_up_proj.weight",
+            [f"{prefix}.mlp.w2.weight", f"{prefix}.mlp.w1.weight"],
+            func=lambda w2, w1: torch.cat([w2, w1], dim=0),
+        )
+        mapping.add_mapping(f"{prefix}.mlp.c_proj.weight", f"{prefix}.mlp.c_proj.weight")
+        mapping.add_mapping(f"{prefix}.ln_1.weight", f"{prefix}.ln_1.weight")
+        mapping.add_mapping(f"{prefix}.ln_2.weight", f"{prefix}.ln_2.weight")
+        mapping.add_unused(f"{prefix}.attn.rotary_emb.inv_freq")
+
+    if not config.tie_word_embeddings:
+        mapping.add_mapping("lm_head.weight", "lm_head.weight")
+    return mapping
+
+
 def load_qwen_weights(
     model: QwenForCausalLM,
     checkpoint_dir: str | Path,
     *,
     device: torch.device | str | None = None,
     validate: bool = True,
+    use_mapping: bool = False,
 ) -> frozenset[str]:
     """Load a safetensors QWen checkpoint with the production bounded reader.
 
@@ -265,9 +297,10 @@ def load_qwen_weights(
         for name, tensor in iter_checkpoint_tensors(manifest)
         if not name.endswith(_IGNORED_CHECKPOINT_SUFFIXES)
     )
-    return load_module_weights(
-        model, weights, bindings=qwen_weight_bindings(model.config), device=device
+    bindings = (
+        qwen_weight_mapping(model.config) if use_mapping else qwen_weight_bindings(model.config)
     )
+    return load_module_weights(model, weights, bindings=bindings, device=device)
 
 
 def _checkpoint_dtype(model: QwenForCausalLM, manifest: CheckpointManifest) -> DType:
