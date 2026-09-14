@@ -121,22 +121,11 @@ class SchedulerReport:
     num_waiting: int = 0
     num_free_blocks: int = 0
     num_preempted_this_step: int = 0
-    scheduled_prefill_tokens: int = 0
-    scheduled_decode_tokens: int = 0
-    cache_hint_tokens: int = 0
 
     def __post_init__(self) -> None:
         require_frozen(self, "scheduler report")
         require_int(self.step_id, "step_id")
-        for name in (
-            "num_running",
-            "num_waiting",
-            "num_free_blocks",
-            "num_preempted_this_step",
-            "scheduled_prefill_tokens",
-            "scheduled_decode_tokens",
-            "cache_hint_tokens",
-        ):
+        for name in ("num_running", "num_waiting", "num_free_blocks", "num_preempted_this_step"):
             require_int(getattr(self, name), name)
         if len({r.request_id for r in self.reports}) != len(self.reports):
             raise ValueError("one report per request is allowed in a step")

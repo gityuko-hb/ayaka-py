@@ -1,4 +1,4 @@
-"""Bounded scheduler budgets and a shape-sensitive, online latency estimate."""
+"""Scheduler token/sequence budgets and online latency estimation."""
 
 from __future__ import annotations
 
@@ -14,10 +14,11 @@ from ayaka.configs.scheduler import (
     SchedulingPolicy,
     scheduler_config_from_dict,
 )
-from ayaka.sched.plan import BatchStepPlan
+from ayaka.sched.plan import BatchStepPlan, Phase
 from ayaka.utils.validation import require_int
 
 __all__ = [
+    "BatchBudget",
     "PreemptionMode",
     "ResolvedSchedulerPlan",
     "SchedulerCapabilities",
@@ -30,12 +31,7 @@ __all__ = [
 
 @dataclass(slots=True)
 class BatchBudget:
-    """Mutable, per-iteration compute/sequence budget.
-
-    The budget is expressed in *logical* query tokens but every admission check
-    is validated through ``physical_token_slots`` so backend padding/alignment is
-    never accidentally ignored.
-    """
+    """Per-iteration logical budget checked through physical padding rules."""
 
     max_physical_tokens: int
     max_sequences: int
@@ -46,14 +42,15 @@ class BatchBudget:
     decode_tokens: int = 0
 
     @classmethod
-    def from_plan(cls, plan: ResolvedSchedulerPlan) -> BatchBudget:
-        cap = plan.capabilities
-        max_tokens = min(
-            plan.max_num_scheduled_tokens,
-            plan.execution.compute.max_num_batched_tokens,
+    def from_plan(cls, plan: ResolvedSchedulerPlan) -> "BatchBudget":
+        return cls(
+            max_physical_tokens=min(
+                plan.max_num_scheduled_tokens,
+                plan.execution.compute.max_num_batched_tokens,
+            ),
+            max_sequences=min(plan.max_num_seqs, plan.capabilities.max_num_seqs),
+            capabilities=plan.capabilities,
         )
-        max_sequences = min(plan.max_num_seqs, cap.max_num_seqs)
-        return cls(max_tokens, max_sequences, cap)
 
     @property
     def physical_tokens(self) -> int:
@@ -65,16 +62,15 @@ class BatchBudget:
 
     def can_add(self, tokens: int, *, new_sequence: bool = True) -> bool:
         require_int(tokens, "tokens", minimum=1)
-        seqs = self.sequences + int(new_sequence)
-        if seqs > self.max_sequences:
+        if self.sequences + int(new_sequence) > self.max_sequences:
             return False
-        physical = self.capabilities.physical_token_slots(self.logical_tokens + tokens)
-        return physical <= self.max_physical_tokens
+        slots = self.capabilities.physical_token_slots(self.logical_tokens + tokens)
+        return slots <= self.max_physical_tokens
 
     def largest_fittable(self, requested: int, *, new_sequence: bool = True) -> int:
-        """Largest positive logical token count that still fits, or zero."""
+        """Largest positive logical token count that fits, otherwise zero."""
         require_int(requested, "requested", minimum=1)
-        if self.remaining_sequences <= 0 and new_sequence:
+        if new_sequence and self.remaining_sequences <= 0:
             return 0
         lo, hi = 0, requested
         while lo < hi:
@@ -85,27 +81,28 @@ class BatchBudget:
                 hi = mid - 1
         return lo
 
-    def consume(self, tokens: int, *, phase: str, new_sequence: bool = True) -> None:
+    def consume(
+        self,
+        tokens: int,
+        *,
+        phase: Phase | str,
+        new_sequence: bool = True,
+    ) -> None:
         if not self.can_add(tokens, new_sequence=new_sequence):
             raise ValueError("scheduler budget exceeded")
         self.logical_tokens += tokens
         self.sequences += int(new_sequence)
-        if phase == "prefill":
+        name = getattr(phase, "value", phase)
+        if name == Phase.PREFILL.value:
             self.prefill_tokens += tokens
-        elif phase == "decode":
+        elif name == Phase.DECODE.value:
             self.decode_tokens += tokens
         else:
-            raise ValueError(f"unknown phase: {phase}")
+            raise ValueError(f"unknown scheduling phase: {phase}")
 
 
 class TimeEstimator:
-    """EWMA nanoseconds per model work unit, calibrated per runner instance.
-
-    Work includes dense projections, attention over actual context lengths,
-    sampling-vocabulary rows, page boundaries and KV transfer bytes. The runner
-    fixes geometry, dtype, layout and backend; estimates must not be shared
-    between different runners.
-    """
+    """EWMA nanoseconds per model-work unit, calibrated per runner instance."""
 
     def __init__(self, runner, *, ns_per_unit: float = 0.01):
         if not math.isfinite(ns_per_unit) or ns_per_unit <= 0:
