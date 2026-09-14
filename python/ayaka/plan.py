@@ -467,3 +467,10 @@ class ExecutionPlan:
     def execution_plan_id(self) -> str:
         """Identity referenced by dynamic steps using this configuration."""
         return self.plan_id
+
+
+EMPTY_SAMPLING_PLAN = SamplingPlan()
+EMPTY_MEMORY_PLAN = MemoryPlan()
+EMPTY_COMMUNICATION_PLAN = CommunicationPlan()
+EMPTY_WEIGHT_RESIDENCY_PLAN = WeightResidencyPlan()
+EMPTY_GRAPH_PLAN = GraphPlan()

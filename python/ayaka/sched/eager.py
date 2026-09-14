@@ -227,15 +227,16 @@ class EagerScheduler(SchedulerCore):
     ) -> BatchStepPlan:
         if step_id is None:
             step_id = self._next_step_id()
-        total = sum(s.query_count for s in slices)
+        total = 0
         sampling_rows: list[int] = []
-        offset = 0
+        attribution: list[tuple[str, int]] = []
         for scheduled in slices:
-            offset += scheduled.query_count
+            total += scheduled.query_count
+            attribution.append((scheduled.request_id, scheduled.query_count))
             if scheduled.sample_last_query:
-                sampling_rows.append(offset - 1)
-        attribution = tuple((s.request_id, s.query_count) for s in slices)
+                sampling_rows.append(total - 1)
         groups = len(self._plan.execution.attention_groups)
+        request_tokens = tuple(attribution)
         return BatchStepPlan(
             step_id=step_id,
             execution_plan_id=self._plan.execution.execution_plan_id,
@@ -245,7 +246,7 @@ class EagerScheduler(SchedulerCore):
             sampling_rows=tuple(sampling_rows),
             sampling=SamplingPlan(num_rows=len(sampling_rows), all_greedy=True),
             kv_requirements=tuple(
-                KVRequirement(group, total, request_tokens=attribution)
+                KVRequirement(group, total, request_tokens=request_tokens)
                 for group in range(groups)
             ),
             created_ns=self._clock(),

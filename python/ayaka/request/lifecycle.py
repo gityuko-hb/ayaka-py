@@ -40,6 +40,7 @@ class RequestLifecycle:
         "request",
         "token",
         "_output_token_ids",
+        "_known_tokens",
         "_sequence",
         "_binding_epoch",
         "_state_version",
@@ -65,6 +66,7 @@ class RequestLifecycle:
         )
         self.token = CancellationToken(str(request.request_id))
         self._output_token_ids: list[int] = []
+        self._known_tokens: tuple[int, ...] = request.prompt_token_ids
         self.finish_reason: FinishReason | None = None
         self._sequence: SequenceHandle | None = None
         self._binding_epoch = 0
@@ -107,8 +109,8 @@ class RequestLifecycle:
 
     @property
     def known_tokens(self) -> tuple[int, ...]:
-        """Prompt plus published output, derived rather than stored twice."""
-        return self.request.prompt_token_ids + self.output_token_ids
+        """Prompt plus published output, maintained once per publication."""
+        return self._known_tokens
 
     @property
     def computed_tokens(self) -> int:
@@ -301,6 +303,7 @@ class RequestLifecycle:
             raise ValueError("output token budget is exhausted")
         self.machine.on_token_generated(1)
         self._output_token_ids.append(token_id)
+        self._known_tokens += (token_id,)
         self._clear_slice()
 
     def discard_slice(self, step_id: int, scheduled: ScheduledSlice) -> None:

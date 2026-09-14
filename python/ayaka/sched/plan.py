@@ -4,7 +4,7 @@ These values neither allocate resources nor prove device completion. Physical
 page snapshots become usable only while their execution lease is retained.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 
 from ayaka.handles import SequenceHandle
@@ -14,6 +14,11 @@ from ayaka.memory.views import (
     SequenceExecutionView,
 )
 from ayaka.plan import (
+    EMPTY_COMMUNICATION_PLAN,
+    EMPTY_GRAPH_PLAN,
+    EMPTY_MEMORY_PLAN,
+    EMPTY_SAMPLING_PLAN,
+    EMPTY_WEIGHT_RESIDENCY_PLAN,
     CommunicationPlan,
     ExecutionPlan,
     GraphMode,
@@ -99,10 +104,11 @@ class RequestStepInput:
     max_output_tokens: int
 
     def __post_init__(self) -> None:
-        require_frozen(self, "request input")
         require_text(self.request_id, "request_id")
         if not isinstance(self.sequence, SequenceHandle):
             raise TypeError("sequence must be SequenceHandle")
+        if type(self.known_tokens) is not tuple:
+            raise TypeError("known_tokens must be a tuple of token ids")
         require_int(self.sequence_epoch, "sequence_epoch", minimum=1)
         require_int(self.state_version, "state_version")
         require_int(self.prompt_tokens, "prompt_tokens", minimum=1)
@@ -221,36 +227,64 @@ class BatchStepPlan:
     inputs: tuple[RequestStepInput, ...]
     padded_num_tokens: int
     sampling_rows: tuple[int, ...] = ()
-    sampling: SamplingPlan = field(default_factory=SamplingPlan)
-    memory: MemoryPlan = field(default_factory=MemoryPlan)
+    sampling: SamplingPlan = EMPTY_SAMPLING_PLAN
+    memory: MemoryPlan = EMPTY_MEMORY_PLAN
     kv_requirements: tuple[KVRequirement, ...] = ()
     dependencies: tuple[StepDependency, ...] = ()
     distributed: DistributedStepIdentity | None = None
-    communication: CommunicationPlan = field(default_factory=CommunicationPlan)
-    weight_residency: WeightResidencyPlan = field(default_factory=WeightResidencyPlan)
-    graph: GraphPlan = field(default_factory=GraphPlan)
+    communication: CommunicationPlan = EMPTY_COMMUNICATION_PLAN
+    weight_residency: WeightResidencyPlan = EMPTY_WEIGHT_RESIDENCY_PLAN
+    graph: GraphPlan = EMPTY_GRAPH_PLAN
     trace_ids: tuple[str, ...] = ()
     created_ns: int = 0
 
     def __post_init__(self) -> None:
-        require_frozen(self, "batch step")
         require_int(self.step_id, "step_id")
         require_text(self.execution_plan_id, "execution_plan_id")
         require_int(self.padded_num_tokens, "padded_num_tokens")
         require_int(self.created_ns, "created_ns")
+        if type(self.slices) is not tuple or type(self.inputs) is not tuple:
+            raise TypeError("slices and inputs must be tuples")
+        if type(self.sampling_rows) is not tuple or type(self.trace_ids) is not tuple:
+            raise TypeError("sampling_rows and trace_ids must be tuples")
+        if type(self.kv_requirements) is not tuple or type(self.dependencies) is not tuple:
+            raise TypeError("kv_requirements and dependencies must be tuples")
+        if not isinstance(self.sampling, SamplingPlan):
+            raise TypeError("sampling must be SamplingPlan")
+        if not isinstance(self.memory, MemoryPlan):
+            raise TypeError("memory must be MemoryPlan")
+        if not isinstance(self.communication, CommunicationPlan):
+            raise TypeError("communication must be CommunicationPlan")
+        if not isinstance(self.weight_residency, WeightResidencyPlan):
+            raise TypeError("weight_residency must be WeightResidencyPlan")
+        if not isinstance(self.graph, GraphPlan):
+            raise TypeError("graph must be GraphPlan")
+        if self.distributed is not None and not isinstance(
+            self.distributed, DistributedStepIdentity
+        ):
+            raise TypeError("distributed must be DistributedStepIdentity or None")
         if len(self.inputs) != len(self.slices):
             raise ValueError("one input snapshot is required for each slice")
-        if len(set(self.request_order)) != len(self.slices):
-            raise ValueError("a request may have only one slice per step")
-        if len({value.sequence for value in self.inputs}) != len(self.inputs):
-            raise ValueError("different requests cannot bind the same sequence")
+
+        request_ids: set[str] = set()
+        sequences: set[SequenceHandle] = set()
+        expected_rows: list[int] = []
         offset = 0
-        expected_rows = []
         for scheduled, value in zip(self.slices, self.inputs, strict=True):
+            if not isinstance(scheduled, ScheduledSlice):
+                raise TypeError("slices must contain ScheduledSlice")
+            if not isinstance(value, RequestStepInput):
+                raise TypeError("inputs must contain RequestStepInput")
+            if scheduled.request_id in request_ids:
+                raise ValueError("a request may have only one slice per step")
+            request_ids.add(scheduled.request_id)
+            sequences.add(value.sequence)
             value.validate_slice(scheduled)
             offset += scheduled.query_count
             if scheduled.sample_last_query:
                 expected_rows.append(offset - 1)
+        if len(sequences) != len(self.inputs):
+            raise ValueError("different requests cannot bind the same sequence")
         if self.padded_num_tokens < offset:
             raise ValueError("padding cannot remove real query rows")
         for row in self.sampling_rows:
@@ -326,7 +360,10 @@ class PreparedStep:
     memory_view: ExecutionMemoryView | GroupedExecutionMemoryView
 
     def __post_init__(self) -> None:
-        require_frozen(self, "prepared step")
+        if not isinstance(self.execution, ExecutionPlan):
+            raise TypeError("execution must be ExecutionPlan")
+        if not isinstance(self.step, BatchStepPlan):
+            raise TypeError("step must be BatchStepPlan")
         if not isinstance(self.memory_view, (ExecutionMemoryView, GroupedExecutionMemoryView)):
             raise TypeError("memory_view must be an execution memory snapshot")
         if self.execution.plan_id != self.step.execution_plan_id:

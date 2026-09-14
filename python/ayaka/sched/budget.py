@@ -68,18 +68,38 @@ class BatchBudget:
         return slots <= self.max_physical_tokens
 
     def largest_fittable(self, requested: int, *, new_sequence: bool = True) -> int:
-        """Largest positive logical token count that fits, otherwise zero."""
+        """Largest positive logical token count that fits, otherwise zero.
+
+        ``physical_token_slots`` pads to ``token_padding_multiple``, so the
+        largest increment is computed directly instead of binary-searching
+        ``can_add``.  The remainder term credits the unused tail of the current
+        padded block, which a plain ``remaining = max - physical`` subtraction
+        would undercount.
+        """
         require_int(requested, "requested", minimum=1)
         if new_sequence and self.remaining_sequences <= 0:
             return 0
-        lo, hi = 0, requested
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if self.can_add(mid, new_sequence=new_sequence):
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
+        multiple = self.capabilities.token_padding_multiple
+        capacity = (self.max_physical_tokens // multiple) * multiple
+        headroom = capacity - self.physical_tokens + ((-self.logical_tokens) % multiple)
+        return min(requested, max(0, headroom))
+
+    def try_consume(
+        self,
+        tokens: int,
+        *,
+        phase: Phase | str,
+        new_sequence: bool = True,
+    ) -> bool:
+        """Consume when the budget allows it, reporting refusal without raising."""
+        require_int(tokens, "tokens", minimum=1)
+        if self.sequences + int(new_sequence) > self.max_sequences:
+            return False
+        slots = self.capabilities.physical_token_slots(self.logical_tokens + tokens)
+        if slots > self.max_physical_tokens:
+            return False
+        self._record(tokens, phase=phase, new_sequence=new_sequence)
+        return True
 
     def consume(
         self,
@@ -88,17 +108,19 @@ class BatchBudget:
         phase: Phase | str,
         new_sequence: bool = True,
     ) -> None:
-        if not self.can_add(tokens, new_sequence=new_sequence):
+        if not self.try_consume(tokens, phase=phase, new_sequence=new_sequence):
             raise ValueError("scheduler budget exceeded")
+
+    def _record(self, tokens: int, *, phase: Phase | str, new_sequence: bool) -> None:
+        name = getattr(phase, "value", phase)
+        if name not in (Phase.PREFILL.value, Phase.DECODE.value):
+            raise ValueError(f"unknown scheduling phase: {phase}")
         self.logical_tokens += tokens
         self.sequences += int(new_sequence)
-        name = getattr(phase, "value", phase)
         if name == Phase.PREFILL.value:
             self.prefill_tokens += tokens
-        elif name == Phase.DECODE.value:
-            self.decode_tokens += tokens
         else:
-            raise ValueError(f"unknown scheduling phase: {phase}")
+            self.decode_tokens += tokens
 
 
 class TimeEstimator:

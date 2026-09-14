@@ -110,7 +110,8 @@ def rank_waiting(
             "UNSUPPORTED_POLICY",
             f"unsupported scheduling policy: {name}",
         )
-    return sorted(ranked, key=key)
+    ranked.sort(key=key)
+    return ranked
 
 
 def order(
@@ -127,19 +128,23 @@ def order(
     require_int(now_ns, "now_ns")
     require_int(max_bypass, "max_bypass", minimum=1)
     ranked = rank_waiting(entries, scheduling_policy=scheduling_policy)
-    aged = sorted(
-        (
-            entry
-            for entry in ranked
-            if entry.bypass_count >= max_bypass
-            or round_id - entry.ready_round >= max_bypass
-        ),
+    for entry in ranked:
+        if entry.bypass_count >= max_bypass or round_id - entry.ready_round >= max_bypass:
+            break
+    else:
+        return ranked
+    aged = [
+        entry
+        for entry in ranked
+        if entry.bypass_count >= max_bypass or round_id - entry.ready_round >= max_bypass
+    ]
+    aged.sort(
         key=lambda entry: (
             -entry.bypass_count,
             entry.ready_round,
             _arrival_ns(entry),
             entry.ordinal,
-        ),
+        )
     )
     aged_ids = {id(entry) for entry in aged}
     return aged + [entry for entry in ranked if id(entry) not in aged_ids]

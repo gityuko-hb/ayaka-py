@@ -7,7 +7,7 @@ can accept, reject, or force the scheduler to reshape a candidate step.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
@@ -26,7 +26,14 @@ from ayaka.sched.interfaces import (
     StepRuntime,
 )
 from ayaka.sched.outcome import RequestOutcome, RequestReport
-from ayaka.sched.plan import BatchStepPlan, KVRequirement, Phase, PreparedStep, ScheduledSlice
+from ayaka.sched.plan import (
+    BatchStepPlan,
+    KVRequirement,
+    Phase,
+    PreparedStep,
+    RequestStepInput,
+    ScheduledSlice,
+)
 from ayaka.sched.policy import QueueEntry, order
 from ayaka.sched.preemption import select_preemption_victim
 
@@ -236,14 +243,15 @@ class ContinuousScheduler(SchedulerCore):
             for lifecycle in self._running.values()
             if not lifecycle.is_terminal and not lifecycle.token.is_cancelled
         ]
-        if not active:
+        count = len(active)
+        if not count:
             return
 
-        start = self._decode_cursor % len(active)
-        ordered = active[start:] + active[:start]
+        start = self._decode_cursor % count
         scheduled_count = 0
-        for lifecycle in ordered:
-            if not budget.can_add(1):
+        for offset in range(count):
+            lifecycle = active[(start + offset) % count]
+            if not budget.try_consume(1, phase=Phase.DECODE):
                 break
             snapshot = lifecycle.snapshot()
             slices.append(
@@ -258,11 +266,10 @@ class ContinuousScheduler(SchedulerCore):
                 )
             )
             inputs.append(snapshot)
-            budget.consume(1, phase=Phase.DECODE)
             scheduled_count += 1
 
         if scheduled_count:
-            self._decode_cursor = (start + scheduled_count) % len(active)
+            self._decode_cursor = (start + scheduled_count) % count
 
     def _append_prefills(
         self,
@@ -318,6 +325,9 @@ class ContinuousScheduler(SchedulerCore):
 
             query_end = snapshot.computed_tokens + chunk
             last_prompt_chunk = query_end == snapshot.prompt_tokens
+            if not budget.try_consume(chunk, phase=Phase.PREFILL):
+                self._mark_bypass(entry)
+                continue
             slices.append(
                 ScheduledSlice(
                     lifecycle.request_id,
@@ -330,7 +340,6 @@ class ContinuousScheduler(SchedulerCore):
                 )
             )
             inputs.append(snapshot)
-            budget.consume(chunk, phase=Phase.PREFILL)
 
         # No queue mutation here. Candidate creation must be rollback-safe.
 
@@ -400,43 +409,49 @@ class ContinuousScheduler(SchedulerCore):
 
     def _shrink_transient(self, plan: BatchStepPlan) -> BatchStepPlan | None:
         """Reduce pressure while protecting decode latency as long as possible."""
-        pairs = list(zip(plan.slices, plan.inputs, strict=True))
-        prefill_indices = [
-            i for i, (scheduled, _) in enumerate(pairs) if scheduled.phase is Phase.PREFILL
-        ]
+        slices = plan.slices
+        inputs = plan.inputs
+        largest = -1
+        for index, scheduled in enumerate(slices):
+            if scheduled.phase is Phase.PREFILL and (
+                largest < 0 or scheduled.query_count > slices[largest].query_count
+            ):
+                largest = index
 
         # 1. Halve the largest prefill chunk first.
-        if prefill_indices:
-            i = max(prefill_indices, key=lambda j: pairs[j][0].query_count)
-            scheduled, value = pairs[i]
+        if largest >= 0:
+            scheduled = slices[largest]
             if scheduled.query_count > 1:
                 new_count = max(1, scheduled.query_count // 2)
                 new_end = scheduled.query_start + new_count
-                pairs[i] = (
-                    ScheduledSlice(
-                        scheduled.request_id,
-                        scheduled.sequence_epoch,
-                        scheduled.expected_state_version,
-                        scheduled.query_start,
-                        new_count,
-                        Phase.PREFILL,
-                        sample_last_query=(
-                            new_end == value.prompt_tokens
-                            and new_end == len(value.known_tokens)
-                        ),
+                value = inputs[largest]
+                replacement = ScheduledSlice(
+                    scheduled.request_id,
+                    scheduled.sequence_epoch,
+                    scheduled.expected_state_version,
+                    scheduled.query_start,
+                    new_count,
+                    Phase.PREFILL,
+                    sample_last_query=(
+                        new_end == value.prompt_tokens and new_end == len(value.known_tokens)
                     ),
-                    value,
                 )
-                return self._rebuild_plan(plan, pairs)
+                return self._make_plan(
+                    slices[:largest] + (replacement,) + slices[largest + 1 :],
+                    inputs,
+                    step_id=plan.step_id,
+                )
 
             # 2. Remove a one-token prefill before sacrificing decode width.
-            pairs.pop(i)
-            return self._rebuild_plan(plan, pairs)
+            return self._make_plan(
+                slices[:largest] + slices[largest + 1 :],
+                inputs[:largest] + inputs[largest + 1 :],
+                step_id=plan.step_id,
+            )
 
         # 3. Pure decode: narrow by one request. Round-robin gives it another turn.
-        if len(pairs) > 1:
-            pairs.pop()
-            return self._rebuild_plan(plan, pairs)
+        if len(slices) > 1:
+            return self._make_plan(slices[:-1], inputs[:-1], step_id=plan.step_id)
         return None
 
     def _try_preempt_one(self, current_request_ids: set[str]) -> str | None:
@@ -475,24 +490,25 @@ class ContinuousScheduler(SchedulerCore):
 
     def _make_plan(
         self,
-        slices: list[ScheduledSlice],
-        inputs: list,
+        slices: Sequence[ScheduledSlice],
+        inputs: Sequence[RequestStepInput],
         *,
         step_id: int | None = None,
     ) -> BatchStepPlan:
         if step_id is None:
             step_id = self._next_step_id()
 
-        total = sum(scheduled.query_count for scheduled in slices)
+        total = 0
         sampling_rows: list[int] = []
-        offset = 0
+        attribution: list[tuple[str, int]] = []
         for scheduled in slices:
-            offset += scheduled.query_count
+            total += scheduled.query_count
+            attribution.append((scheduled.request_id, scheduled.query_count))
             if scheduled.sample_last_query:
-                sampling_rows.append(offset - 1)
+                sampling_rows.append(total - 1)
 
-        attribution = tuple((s.request_id, s.query_count) for s in slices)
         groups = len(self._plan.execution.attention_groups)
+        request_tokens = tuple(attribution)
         return BatchStepPlan(
             step_id=step_id,
             execution_plan_id=self._plan.execution.execution_plan_id,
@@ -502,7 +518,7 @@ class ContinuousScheduler(SchedulerCore):
             sampling_rows=tuple(sampling_rows),
             sampling=SamplingPlan(num_rows=len(sampling_rows), all_greedy=True),
             kv_requirements=tuple(
-                KVRequirement(group, total, request_tokens=attribution)
+                KVRequirement(group, total, request_tokens=request_tokens)
                 for group in range(groups)
             ),
             created_ns=self._clock(),
