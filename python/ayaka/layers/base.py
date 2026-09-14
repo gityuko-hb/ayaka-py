@@ -143,6 +143,15 @@ class BaseLayer(nn.Module, ABC):
             )
         return self.communication.all_reduce(tensor, group, op=op, async_op=async_op)
 
+    def select_weight_loader(self, method: QuantizeMethodBase) -> Callable[..., None] | None:
+        """Return the parameter loader the selected method object should receive.
+
+        The default has no opinion; linear layers override this to choose between
+        their loader entry points from the method object, never by class name.
+        """
+        del method
+        return None
+
     def create_weights(
         self,
         *weight_args: Any,
@@ -173,6 +182,9 @@ class BaseLayer(nn.Module, ABC):
         method = self.quant_config.select_method(self, context, prefix=self.prefix)
         self.quant_context = context
         self.quant_method = method
+        loader = self.select_weight_loader(method)
+        if loader is not None:
+            extra_weight_attrs.setdefault("weight_loader", loader)
         # Weight creation may partially mutate the module before raising. Do not retry.
         self._quantization_state = "failed"
         method.create_weights(
