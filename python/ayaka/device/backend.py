@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Protocol, runtime_checkable
 
 from ayaka.configs.hardware import CC_LIMITS
@@ -29,6 +30,7 @@ class DeviceBackend(Protocol):
     def stream_priority_range(self) -> tuple[int, int]: ...
     def create_stream(self, index: int, priority: int) -> Any: ...
     def destroy_stream(self, stream: Any) -> None: ...
+    def stream_context(self, stream: Any) -> AbstractContextManager[None]: ...
     def create_event(self, *, timing: bool) -> Any: ...
     def destroy_event(self, event: Any) -> None: ...
     def record(self, event: Any, stream: Any) -> None: ...
@@ -47,7 +49,7 @@ class NullBackend(DeviceBackend):
         self._next_id = 1
         self._streams: dict[int, int] = {}  # handle -> priority
         self._events: dict[int, bool] = {}  # handle -> timing
-        self._recorded: dict[int, int] = {} # handle -> clock at record
+        self._recorded: dict[int, int] = {}  # handle -> clock at record
         self._capability = capability or DeviceCapability(
             name="null", sm_major=8, sm_minor=6, num_sms=16, hbm_bytes=8 << 30
         )
@@ -95,6 +97,9 @@ class NullBackend(DeviceBackend):
     def destroy_stream(self, stream: Any) -> None:
         if self._streams.pop(int(stream), None) is None:
             raise RuntimeError(f"double free of stream {stream}")
+
+    def stream_context(self, stream: Any) -> AbstractContextManager[None]:
+        return nullcontext()
 
     def create_event(self, *, timing: bool) -> Any:
         handle = self._alloc()
@@ -195,6 +200,11 @@ class TorchCudaBackend(DeviceBackend):
 
     def destroy_stream(self, stream: Any) -> None:
         return None
+
+    def stream_context(self, stream: Any) -> AbstractContextManager[None]:
+        if stream is None:
+            return nullcontext()
+        return self._torch.cuda.stream(stream)
 
     def create_event(self, *, timing: bool) -> Any:
         return self._torch.cuda.Event(enable_timing=timing)

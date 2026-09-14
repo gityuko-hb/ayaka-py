@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -48,6 +48,7 @@ Attributes:
         transfers across local interconnects (PCIe / NVLink) without host staging.
 """
 
+
 class StreamPool:
     __slots__ = ("_backend", "_closed", "_events", "_index", "_priority_range", "_streams")
 
@@ -87,6 +88,18 @@ class StreamPool:
         least, greatest = self._priority_range
         offset = ROLE_PRIORITY.get(role, 0)
         return max(greatest, min(least, least + offset))
+
+    @contextmanager
+    def context(self, role: StreamRole) -> Generator[None]:
+        """Run the body under ``role``'s stream.
+
+        The only supported way to make a stream current: the pool owns lifetime
+        and the backend decides whether the stream is real. A null backend has
+        no device queues, so its context is a silent no-op rather than an
+        invalid ``torch.cuda.stream`` call on an opaque handle.
+        """
+        with self._backend.stream_context(self.get(role)):
+            yield
 
     def priority_of(self, role: StreamRole) -> int:
         return self._priority_for(role)
