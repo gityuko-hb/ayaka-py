@@ -155,10 +155,24 @@ class KVRequirement:
     cow_pages: int = 0
     restore_bytes: int = 0
     growth_bytes: int = 0
+    # Optional attribution used by admission/preemption diagnostics. Physical
+    # allocation remains group-owned; this does not hold page-table state.
+    request_tokens: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("group_id", "append_tokens", "cow_pages", "restore_bytes", "growth_bytes"):
             require_int(getattr(self, name), name)
+        total = 0
+        seen: set[str] = set()
+        for request_id, tokens in self.request_tokens:
+            require_text(request_id, "request_id")
+            require_int(tokens, "request append tokens")
+            if request_id in seen:
+                raise ValueError("KV request attribution must be unique")
+            seen.add(request_id)
+            total += tokens
+        if self.request_tokens and total != self.append_tokens:
+            raise ValueError("per-request KV attribution must sum to append_tokens")
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +281,19 @@ class BatchStepPlan:
     @property
     def is_pure_decode(self) -> bool:
         return bool(self.slices) and all(s.phase is Phase.DECODE for s in self.slices)
+
+    @property
+    def is_mixed(self) -> bool:
+        phases = {s.phase for s in self.slices}
+        return Phase.PREFILL in phases and Phase.DECODE in phases
+
+    @property
+    def num_prefill_tokens(self) -> int:
+        return sum(s.query_count for s in self.slices if s.phase is Phase.PREFILL)
+
+    @property
+    def num_decode_tokens(self) -> int:
+        return sum(s.query_count for s in self.slices if s.phase is Phase.DECODE)
 
     @property
     def token_ids(self) -> tuple[int, ...]:

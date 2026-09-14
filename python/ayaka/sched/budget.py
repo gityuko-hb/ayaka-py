@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from dataclasses import dataclass
 
 from ayaka.configs.scheduler import (
     PreemptionMode,
@@ -27,14 +28,83 @@ __all__ = [
 ]
 
 
+@dataclass(slots=True)
+class BatchBudget:
+    """Mutable, per-iteration compute/sequence budget.
+
+    The budget is expressed in *logical* query tokens but every admission check
+    is validated through ``physical_token_slots`` so backend padding/alignment is
+    never accidentally ignored.
+    """
+
+    max_physical_tokens: int
+    max_sequences: int
+    capabilities: SchedulerCapabilities
+    logical_tokens: int = 0
+    sequences: int = 0
+    prefill_tokens: int = 0
+    decode_tokens: int = 0
+
+    @classmethod
+    def from_plan(cls, plan: ResolvedSchedulerPlan) -> BatchBudget:
+        cap = plan.capabilities
+        max_tokens = min(
+            plan.max_num_scheduled_tokens,
+            plan.execution.compute.max_num_batched_tokens,
+        )
+        max_sequences = min(plan.max_num_seqs, cap.max_num_seqs)
+        return cls(max_tokens, max_sequences, cap)
+
+    @property
+    def physical_tokens(self) -> int:
+        return self.capabilities.physical_token_slots(self.logical_tokens)
+
+    @property
+    def remaining_sequences(self) -> int:
+        return max(0, self.max_sequences - self.sequences)
+
+    def can_add(self, tokens: int, *, new_sequence: bool = True) -> bool:
+        require_int(tokens, "tokens", minimum=1)
+        seqs = self.sequences + int(new_sequence)
+        if seqs > self.max_sequences:
+            return False
+        physical = self.capabilities.physical_token_slots(self.logical_tokens + tokens)
+        return physical <= self.max_physical_tokens
+
+    def largest_fittable(self, requested: int, *, new_sequence: bool = True) -> int:
+        """Largest positive logical token count that still fits, or zero."""
+        require_int(requested, "requested", minimum=1)
+        if self.remaining_sequences <= 0 and new_sequence:
+            return 0
+        lo, hi = 0, requested
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.can_add(mid, new_sequence=new_sequence):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def consume(self, tokens: int, *, phase: str, new_sequence: bool = True) -> None:
+        if not self.can_add(tokens, new_sequence=new_sequence):
+            raise ValueError("scheduler budget exceeded")
+        self.logical_tokens += tokens
+        self.sequences += int(new_sequence)
+        if phase == "prefill":
+            self.prefill_tokens += tokens
+        elif phase == "decode":
+            self.decode_tokens += tokens
+        else:
+            raise ValueError(f"unknown phase: {phase}")
+
+
 class TimeEstimator:
     """EWMA nanoseconds per model work unit, calibrated per runner instance.
 
     Work includes dense projections, attention over actual context lengths,
     sampling-vocabulary rows, page boundaries and KV transfer bytes. The runner
     fixes geometry, dtype, layout and backend; estimates must not be shared
-    between different runners. Observations include host-observed completion
-    delay. They are deliberately conservative when an engine polls infrequently.
+    between different runners.
     """
 
     def __init__(self, runner, *, ns_per_unit: float = 0.01):

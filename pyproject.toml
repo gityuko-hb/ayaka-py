@@ -115,6 +115,7 @@ testpaths = ["tests"]
 timeout = 30
 markers = [
     "slow: spawns a real OS process; keep to cases a thread cannot prove",
+    "gpu: requires a working CUDA device and the cuda extra",
 ]
 
 [tool.pyright]
