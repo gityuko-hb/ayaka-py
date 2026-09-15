@@ -26,8 +26,8 @@ import torch
 
 from ayaka.caps import Cap
 from ayaka.device.backend import DeviceBackend, get_backend
-from ayaka.sampling.footprint import SamplingFootprint, measure
 from ayaka.sampling.mask.producer import MaskRows
+from ayaka.sampling.metadata import SamplingFootprint, measure
 from ayaka.utils.torch_memory import pinned_empty
 from ayaka.utils.torch_utils import resolve_device
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,23 +12,57 @@ import torch
 
 from ayaka.caps import Cap
 from ayaka.plan import SamplingPlan
-from ayaka.sampling.custom.executor import apply_custom_ops
+from ayaka.sampling.executor import apply_custom_ops
 from ayaka.sampling.mask.arena import MaskHandle
 from ayaka.sampling.mask.pipeline import MaskEntry
 from ayaka.sampling.mask.producer import MaskProducer
 from ayaka.sampling.metadata import SamplingMetadata
-from ayaka.sampling.ops import bias as _bias
 from ayaka.sampling.ops import penalties as _pen
-from ayaka.sampling.ops.bitmask import apply_allow_bitmask_
-from ayaka.sampling.ops.topk_topp import (
+from ayaka.sampling.ops.penalties import PenaltyState, apply_bias_, apply_penalties_
+from ayaka.sampling.ops.sampling import (
+    apply_allow_bitmask_,
+    gumbel_sample,
     softmax_stats_scaled,
     topk_first_hint,
     topk_topp_sample,
 )
-from ayaka.sampling.trace import trace_sampler
 from ayaka.utils.import_utils import CapabilityError
 
 __all__ = ["MaskSchedule", "Sampler", "SamplerOutput", "SamplingPlanner"]
+
+
+def _trace_enabled() -> bool:
+    """Check whether end-to-end sampler tracing is enabled in the environment."""
+    return os.environ.get("AYAKA_TRACE_SAMPLER_E2E", "0").lower() in ("1", "true", "yes")
+
+
+def _rank_prefix() -> str:
+    """Construct distributed rank prefix string for formatted trace output."""
+    try:
+        from ayaka.distributed.env import local_rank, rank, world_size
+
+        return f"ws={world_size()} rank={rank()} local={local_rank()}"
+    except Exception:  # pragma: no cover - defensive, prefix only
+        return "rank=unknown"
+
+
+def trace_sampler(stage: str, **fields: Any) -> None:
+    """Emit a structured trace log entry for a sampling pipeline stage.
+
+    When `AYAKA_TRACE_SAMPLER_E2E` is enabled, formats and prints the stage name,
+    distributed rank information, and key-value fields to stdout with immediate flush.
+    Acts as a no-op when tracing is disabled.
+
+    Args:
+        stage: Identifier string of the current sampling execution stage.
+        **fields: Arbitrary key-value attributes associated with the stage event.
+    """
+    # Fast exit when tracing is disabled.
+    if not _trace_enabled():
+        return
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    suffix = f" {details}" if details else ""
+    print(f"AYAKA_TRACE_SAMPLER {_rank_prefix()} stage={stage}{suffix}", flush=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,7 +359,7 @@ class Sampler:
             trace_sampler("custom_ops_done", ops=plan.custom_ops)
 
         if plan.any_bias and self.bias_state is not None:
-            _bias.apply_bias_(logits, md, self.bias_state)
+            apply_bias_(logits, md, self.bias_state)
             trace_sampler("bias_done")
 
         if plan.any_penalty and self.penalty_state is not None:
@@ -404,3 +441,163 @@ def _greedy_winner_with_mask_check(logits: torch.Tensor, mask: MaskHandle) -> to
     if bool(allowed.all()):
         return winner
     return None
+
+
+BUILT_IN_SAMPLER_BACKENDS: frozenset[str] = frozenset({"triton", "reference"})
+_FACTORIES: dict[str, Callable[[], Sampler]] = {}
+
+logger = logging.getLogger(__name__)
+
+
+def register_sampler_backend(backend: str, factory: Callable[[], Sampler]) -> None:
+    """Register a custom sampler factory for a backend identifier.
+
+    The factory callable must adhere to a zero-argument convention and return an
+    object satisfying the `Sampler` subclass contract. If a backend with the given
+    identifier is already registered, the existing factory is overwritten with a
+    warning, matching SGLang registration semantics.
+
+    Args:
+        backend: Unique string identifier for the backend.
+        factory: Zero-argument callable returning a `Sampler`-compatible instance.
+
+    Raises:
+        ValueError: If `backend` is an empty string.
+    """
+    # Enforce non-empty backend identifier.
+    if not backend:
+        raise ValueError("backend must be a non-empty string")
+    # Log warning when overwriting an existing backend factory.
+    if backend in _FACTORIES:
+        logger.warning("Overriding existing sampler factory for backend '%s'", backend)
+    _FACTORIES[backend] = factory
+
+
+def registered_sampler_backends() -> tuple[str, ...]:
+    """Return all currently registered custom sampler backend names.
+
+    Returns:
+        Sorted tuple of registered custom backend identifiers, excluding
+        built-in backend names.
+    """
+    return tuple(sorted(_FACTORIES))
+
+
+def create_sampler(
+    backend: str | None = None,
+    *,
+    penalty_state: Any | None = None,
+    need_stats: bool = False,
+    bias_state: Any | None = None,
+) -> Sampler:
+    """Instantiate a sampler for the specified backend identifier.
+
+    When `backend` is `None` or matches a built-in backend (`triton`, `reference`),
+    the canonical `Sampler` is instantiated with the provided execution states.
+    When a custom backend is requested, its registered zero-argument factory is
+    invoked; custom factories are responsible for their own state wiring.
+
+    Args:
+        backend: Optional backend identifier. Defaults to None (canonical Sampler).
+        penalty_state: Optional state container tracking repetition/frequency penalties.
+        need_stats: Whether to compute sampling distribution statistics.
+        bias_state: Optional state container tracking logit biases.
+
+    Returns:
+        Instantiated `Sampler` instance.
+
+    Raises:
+        TypeError: If a custom backend factory returns an object that does not
+            subclass `Sampler`.
+        ValueError: If `backend` is neither registered nor a recognized built-in.
+    """
+    from ayaka.sampling.plan import Sampler
+
+    # Dispatch to custom factory if registered.
+    if backend in _FACTORIES:
+        sampler = _FACTORIES[backend]()
+        # Assert subclass contract for custom sampler instances.
+        if not isinstance(sampler, Sampler):
+            raise TypeError(f"Sampler factory for backend '{backend}' must return a Sampler")
+        return sampler
+    # Default and built-in backends resolve to the canonical Sampler implementation.
+    if backend is None or backend in BUILT_IN_SAMPLER_BACKENDS:
+        return Sampler(penalty_state=penalty_state, need_stats=need_stats, bias_state=bias_state)
+    # Reject unknown backend identifiers fail-closed.
+    raise ValueError(
+        f"Unknown sampling backend {backend!r}. Register it via register_sampler_backend()."
+    )
+
+
+_SAMPLING_STAGES = ("penalty", "bitmask", "temperature", "stats", "filter_sample")
+
+
+def run_sampling_pipeline(
+    logits: torch.Tensor,
+    md: SamplingMetadata,
+    penalty_state: PenaltyState,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    row_indices: torch.Tensor | None = None,
+    *,
+    sampler: str = "inverse_cdf",  # "inverse_cdf" | "gumbel"
+    compute_stats: bool = False,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
+    """Execute the canonical sampling pipeline stages on logits in specification order.
+
+    Applies penalties and grammar/allowed-token masks in place to `logits`. If the
+    caller requires preservation of the original raw logits (e.g., for raw logprob
+    computation), `logits` must be cloned prior to invoking this function.
+
+    Args:
+        logits: Float tensor of raw model logits of shape `[batch_size, vocab_size]`.
+            Modified in place by penalties and bitmask stages.
+        md: Sampling metadata container holding column parameters and active rows.
+        penalty_state: State tracking per-slot token frequencies and penalty occurrences.
+        temperature: Tensor of shape `[batch_size]` containing temperature scaling values.
+        top_k: Tensor of shape `[batch_size]` specifying top-k filtering thresholds.
+        top_p: Tensor of shape `[batch_size]` specifying top-p cumulative thresholds.
+        min_p: Tensor of shape `[batch_size]` specifying min-p probability cutoffs.
+        seed: Tensor of 64-bit random seeds per batch row.
+        offset: Tensor of 64-bit RNG step offsets per batch row.
+        mask: Optional packed 32-bit bitmask tensor defining allowed token sets.
+        row_indices: Optional mapping of batch rows to corresponding mask rows.
+        sampler: Sampling algorithm identifier, either `"inverse_cdf"` or `"gumbel"`.
+        compute_stats: Whether to compute and return distribution statistics.
+
+    Returns:
+        A tuple `(token_ids, stats)` where `token_ids` is the sampled token tensor
+        and `stats` is an optional tuple `(max_prob, entropy, exp_entropy)` or `None`.
+
+    Raises:
+        AssertionError: If `mask` is provided without `row_indices`.
+        ValueError: If `sampler` is not recognized.
+    """
+    # Stage 1: Apply frequency, presence, and repetition penalties in place.
+    apply_penalties_(logits, md, penalty_state)
+
+    # Stage 2: Apply allowed-token bitmask constraints in place.
+    if mask is not None:
+        assert row_indices is not None, "mask không row_indices không rõ ràng buộc row nào"
+        apply_allow_bitmask_(logits, mask, row_indices, logits.size(1))
+
+    # Stage 3: Scale logits by temperature exactly once (clamped to prevent division by zero).
+    scaled = logits / temperature.clamp_min(1e-6).unsqueeze(1)
+
+    # Stage 4: Compute softmax statistics on temperature-scaled distribution if requested.
+    stats = softmax_stats_scaled(scaled) if compute_stats else None
+
+    # Stage 5: Stochastic filter and sampling draw.
+    if sampler == "gumbel":
+        tok = gumbel_sample(scaled, top_k, top_p, min_p, seed, offset)
+    elif sampler == "inverse_cdf":
+        tok = topk_topp_sample(scaled, top_k, top_p, min_p, seed, offset)
+    else:
+        raise ValueError(f"sampler không hợp lệ: {sampler!r}")
+
+    return tok, stats

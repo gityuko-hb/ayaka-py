@@ -41,8 +41,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ayaka.sampling.plan import trace_sampler
 from ayaka.sampling.rng import counter_uniform, counter_uniform_cols
-from ayaka.sampling.trace import trace_sampler
 
 NEG_INF = float("-inf")
 
