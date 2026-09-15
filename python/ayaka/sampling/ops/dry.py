@@ -14,7 +14,8 @@ nhận penalty = multiplier * base^(k - allowed_length). Nhiều vị trí cùng
 một token thì lấy MAX (không cộng dồn).
 
 CỐ Ý viết bằng vòng lặp Python (O(B × T × max_ngram), không vectorize) —
-đây là oracle tham chiếu, không phải hot path. Giống PenaltyState.coords(),
+đây là oracle tham chiếu, không phải hot path. Khác PenaltyState (A1 đã
+delta-flush trên bảng device), DRY cần THỨ TỰ history nên giữ vòng lặp host;
 đây là ứng viên tối ưu/kernel hoá về sau nếu profiling cho thấy cần, không
 phải bây giờ.
 """
