@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -26,43 +25,10 @@ from ayaka.sampling.ops.sampling import (
     topk_first_hint,
     topk_topp_sample,
 )
+from ayaka.sampling.trace import trace_sampler
 from ayaka.utils.import_utils import CapabilityError
 
 __all__ = ["MaskSchedule", "Sampler", "SamplerOutput", "SamplingPlanner"]
-
-
-def _trace_enabled() -> bool:
-    """Check whether end-to-end sampler tracing is enabled in the environment."""
-    return os.environ.get("AYAKA_TRACE_SAMPLER_E2E", "0").lower() in ("1", "true", "yes")
-
-
-def _rank_prefix() -> str:
-    """Construct distributed rank prefix string for formatted trace output."""
-    try:
-        from ayaka.distributed.env import local_rank, rank, world_size
-
-        return f"ws={world_size()} rank={rank()} local={local_rank()}"
-    except Exception:  # pragma: no cover - defensive, prefix only
-        return "rank=unknown"
-
-
-def trace_sampler(stage: str, **fields: Any) -> None:
-    """Emit a structured trace log entry for a sampling pipeline stage.
-
-    When `AYAKA_TRACE_SAMPLER_E2E` is enabled, formats and prints the stage name,
-    distributed rank information, and key-value fields to stdout with immediate flush.
-    Acts as a no-op when tracing is disabled.
-
-    Args:
-        stage: Identifier string of the current sampling execution stage.
-        **fields: Arbitrary key-value attributes associated with the stage event.
-    """
-    # Fast exit when tracing is disabled.
-    if not _trace_enabled():
-        return
-    details = " ".join(f"{key}={value}" for key, value in fields.items())
-    suffix = f" {details}" if details else ""
-    print(f"AYAKA_TRACE_SAMPLER {_rank_prefix()} stage={stage}{suffix}", flush=True)
 
 
 @dataclass(frozen=True, slots=True)

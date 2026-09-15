@@ -31,13 +31,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from ayaka.device.backend import get_backend
 from ayaka.memory.ledger import MemoryLedger, Reservation
-from ayaka.request.batch import BatchUpdate
 from ayaka.sampling.params import (
     ALL_COLUMNS,
     COLUMN_DTYPES,
@@ -49,6 +48,9 @@ from ayaka.sampling.params import (
 from ayaka.types import MemoryOwner, MemoryTier
 from ayaka.utils.torch_memory import pinned_empty
 from ayaka.utils.torch_utils import resolve_device
+
+if TYPE_CHECKING:
+    from ayaka.request.batch import BatchUpdate
 
 
 @dataclass(frozen=True, slots=True)

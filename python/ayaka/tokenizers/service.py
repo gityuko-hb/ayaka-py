@@ -122,6 +122,13 @@ class TokenizerService:
         with self._cv:
             return self._pending, self._pending_bytes
 
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        """EOS ids for pre-sample masking; empty when the tokenizer is disabled."""
+        if self.tokenizer is None or self.tokenizer.eos_token_id is None:
+            return ()
+        return (int(self.tokenizer.eos_token_id),)
+
     def _weight(self, value: EncodeInput) -> int:
         if isinstance(value, TextInput):
             return len(value.text.encode("utf-8"))

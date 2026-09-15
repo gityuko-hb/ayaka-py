@@ -11,7 +11,7 @@ of reimplementing it.
 Follows the direct-``triton`` import convention of
 ``ayaka.kernel.triton.paged_attention``: ``triton`` lives in the ``cuda``
 extra, so this module imports only with Triton present while the caller in
-``ayaka.sampling.ops.gumbel`` catches ``ImportError`` and falls back to the
+``ayaka.sampling.ops.sampling`` catches ``ImportError`` and falls back to the
 torch oracle.
 """
 
@@ -98,7 +98,7 @@ def _fused_gumbel_ref(
     topk_bound: int = 512,
 ) -> torch.Tensor:
     """Plain-torch reference mirroring the Triton truncation and RNG stream."""
-    from ayaka.sampling.ops.topk_topp import filter_probs
+    from ayaka.sampling.ops.sampling import filter_probs
 
     sp, si = filter_probs(logits, top_k, top_p, min_p)
     bound = min(topk_bound, sp.size(1))
@@ -194,7 +194,7 @@ def fused_gumbel_sample(
             raise ValueError(f"{tensor_name} and logits must be on the same device")
     if not isinstance(topk_bound, int) or topk_bound <= 0:
         raise ValueError("topk_bound must be a positive integer")
-    from ayaka.sampling.ops.topk_topp import filter_probs
+    from ayaka.sampling.ops.sampling import filter_probs
 
     sp, si = filter_probs(logits, top_k, top_p, min_p)
     b, v = sp.shape

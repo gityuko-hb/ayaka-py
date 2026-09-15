@@ -48,6 +48,7 @@ import torch.nn.functional as F
 
 from ayaka.executor.ticket import SampleOutputs
 from ayaka.logits_processor import LogitsPlan, LogitsProcessor
+from ayaka.sampling.bans import BanApplier, BansProvider, LogitFillBanApplier
 from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sampling.logprobs import (
     LogprobEntry,
@@ -99,7 +100,7 @@ class _GenerationReport:
 class ModelSamplingRunner:
     """Run one real model forward + LogitsProcessor + Sampler per prepared step."""
 
-    __slots__ = ("_coordinator", "_force_reference", "_logits", "_model")
+    __slots__ = ("_ban_applier", "_bans", "_coordinator", "_force_reference", "_logits", "_model")
 
     def __init__(
         self,
@@ -109,6 +110,8 @@ class ModelSamplingRunner:
         logit_scale: float = 1.0,
         final_logit_softcapping: float | None = None,
         force_reference: bool = False,
+        bans: BansProvider | None = None,
+        ban_applier: BanApplier | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._model = model
@@ -116,6 +119,20 @@ class ModelSamplingRunner:
             model, logit_scale=logit_scale, final_logit_softcapping=final_logit_softcapping
         )
         self._force_reference = force_reference
+        self._bans = bans
+        self._ban_applier = ban_applier if ban_applier is not None else LogitFillBanApplier()
+
+    def set_bans(self, bans: BansProvider | None) -> None:
+        """Install the per-step ban provider (the engine's sampling masks)."""
+        self._bans = bans
+
+    def _apply_bans(self, prepared: PreparedStep, logits: torch.Tensor, rows: int) -> None:
+        if self._bans is None:
+            return
+        bans = self._bans(prepared.step)
+        if len(bans) != rows:
+            raise ValueError(f"ban provider returned {len(bans)} sets for {rows} sampling rows")
+        self._ban_applier.apply(logits, bans)
 
     def __call__(self, prepared: PreparedStep) -> SampleOutputs:
         step = prepared.step
@@ -157,8 +174,10 @@ class ModelSamplingRunner:
             if plan.num_rows:
                 # Sampler consumes only the sampling-row prefix of the packed
                 # logits (LogitsPlan contract); prompt rows live beyond it.
+                sampling_logits = logits.narrow(0, 0, plan.num_rows)
+                self._apply_bans(prepared, sampling_logits, plan.num_rows)
                 token_ids, support = self._coordinator.sample_with_support(
-                    logits.narrow(0, 0, plan.num_rows),
+                    sampling_logits,
                     plan,
                     force_reference=self._force_reference,
                 )
