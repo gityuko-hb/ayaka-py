@@ -8,10 +8,11 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.types import DType
 from ayaka.utils.validation import require_int
 
-_QUERY_DTYPES = (torch.float16, torch.bfloat16)
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_QUERY_DTYPES = (DType.FP16.torch_dtype, DType.BF16.torch_dtype)
+_FP8_DTYPES = (DType.FP8_E4M3.torch_dtype, DType.FP8_E5M2.torch_dtype)
 
 
 def _require_cuda_tensor(

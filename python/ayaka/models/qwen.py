@@ -45,14 +45,6 @@ __all__ = [
 
 AttentionCallback = Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
-_TORCH_DTYPES: dict[DType, torch.dtype] = {
-    DType.BF16: torch.bfloat16,
-    DType.FP16: torch.float16,
-    DType.FP32: torch.float32,
-}
-
-_DTYPE_ALIASES = {"float16": "fp16", "bfloat16": "bf16", "float32": "fp32"}
-
 _IGNORED_CHECKPOINT_SUFFIXES = ("rotary_emb.inv_freq",)
 
 
@@ -145,8 +137,7 @@ class QwenConfig:
         if self.fp32:
             return DType.FP32
         if self.torch_dtype:
-            alias = _DTYPE_ALIASES.get(self.torch_dtype.lower(), self.torch_dtype.lower())
-            return DType.from_str(alias)
+            return DType.from_str(self.torch_dtype)
         return DType.BF16
 
     @classmethod
@@ -331,7 +322,7 @@ def write_qwen_checkpoint(
     }
     (root / "config.json").write_text(json.dumps(document, indent=2), encoding="utf-8")
 
-    torch_dtype = _TORCH_DTYPES[config.resolved_dtype()]
+    torch_dtype = config.resolved_dtype().torch_dtype
     generator = torch.Generator().manual_seed(seed)
     tensors: dict[str, torch.Tensor] = {}
     for spec in qwen_expected_weights(config, config.resolved_dtype()):

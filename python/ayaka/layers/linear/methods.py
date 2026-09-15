@@ -17,6 +17,7 @@ from ayaka.layers.quantization.base import (
     QuantizeMethodBase,
 )
 from ayaka.utils.import_utils import resolve_qualname
+from ayaka.utils.torch_utils import compute_torch_dtypes
 from ayaka.utils.validation import require_int
 
 from .weight_loading import set_weight_attrs
@@ -32,7 +33,7 @@ class LinearMethodBase(QuantizeMethodBase):
         """Dense callable defaults; packed methods should declare their capabilities."""
         return QuantizationCapabilities(
             supported_devices=frozenset({"cpu", "cuda"}),
-            supported_act_dtypes=(torch.float16, torch.bfloat16, torch.float32),
+            supported_act_dtypes=compute_torch_dtypes(),
         )
 
 

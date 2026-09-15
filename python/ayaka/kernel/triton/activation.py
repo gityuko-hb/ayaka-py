@@ -9,6 +9,7 @@ import triton.language as tl
 from triton.language.extra.libdevice import tanh as _tanh
 
 from ayaka.kernel.ops import custom_op
+from ayaka.utils.torch_utils import compute_torch_dtypes
 
 # Triton's libdevice stubs also describe interpreter-only None results.
 tanh: Any = _tanh
@@ -18,7 +19,7 @@ _ACT_GELU = 1
 _ACT_GELU_TANH = 2
 _NUM_WARPS = 4
 _BLOCK_SIZE = 256
-_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+_SUPPORTED_DTYPES = compute_torch_dtypes()
 
 
 @triton.jit

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 from enum import IntEnum, StrEnum
-from typing import Final
+from typing import Any, Final
 
 
 class DType(enum.Enum):
@@ -10,45 +10,64 @@ class DType(enum.Enum):
 
     Deliberately decoupled from ``torch.dtype``: the protocol layer must remain
     importable on environments without PyTorch or CUDA drivers installed.
-    Conversion adapters are located in ``ayaka.backends.torch``.
+    Conversion adapters are located in ``ayaka.utils.torch_utils``.
 
     Attributes:
         label (str): Canonical lowercase string identifier (e.g., "fp16", "int4").
         bits (int): Bit width per element.
         sub_byte (bool): Flag indicating whether the type occupies less than 1 byte
             and requires packing.
+        torch_name (str | None): PyTorch attribute name for the type, or None when
+            PyTorch has no representation for it.
+        safetensors_token (str): Safetensors ``dtype`` token for the type.
+        max_finite (float | None): Largest finite magnitude representable by the
+            type, or None for non-floating-point types.
     """
 
     # Floating Point Types
-    FP64 = ("fp64", 64, False)
-    FP32 = ("fp32", 32, False)
-    FP16 = ("fp16", 16, False)
-    BF16 = ("bf16", 16, False)
-    FP8_E4M3 = ("fp8_e4m3", 8, False)
-    FP8_E5M2 = ("fp8_e5m2", 8, False)
-    FP4_E2M1 = ("fp4_e2m1", 4, True)
+    FP64 = ("fp64", 64, False, "float64", "F64", None)
+    FP32 = ("fp32", 32, False, "float32", "F32", 3.4028234663852886e38)
+    FP16 = ("fp16", 16, False, "float16", "F16", 65504.0)
+    BF16 = ("bf16", 16, False, "bfloat16", "BF16", 3.3895313892515355e38)
+    FP8_E4M3 = ("fp8_e4m3", 8, False, "float8_e4m3fn", "F8_E4M3", 448.0)
+    FP8_E5M2 = ("fp8_e5m2", 8, False, "float8_e5m2", "F8_E5M2", 57344.0)
+    FP4_E2M1 = ("fp4_e2m1", 4, True, None, "F4", None)
 
     # Integer & Quantized Types
-    INT64 = ("int64", 64, False)
-    INT32 = ("int32", 32, False)
-    INT8 = ("int8", 8, False)
-    UINT8 = ("uint8", 8, False)
-    INT4 = ("int4", 4, True)
+    INT64 = ("int64", 64, False, "int64", "I64", None)
+    INT32 = ("int32", 32, False, "int32", "I32", None)
+    INT8 = ("int8", 8, False, "int8", "I8", None)
+    UINT8 = ("uint8", 8, False, "uint8", "U8", None)
+    INT4 = ("int4", 4, True, None, "I4", None)
 
     # Boolean Type
-    BOOL = ("bool", 8, False)
+    BOOL = ("bool", 8, False, "bool", "BOOL", None)
 
-    def __init__(self, label: str, bits: int, sub_byte: bool) -> None:
+    def __init__(
+        self,
+        label: str,
+        bits: int,
+        sub_byte: bool,
+        torch_name: str | None,
+        safetensors_token: str,
+        max_finite: float | None,
+    ) -> None:
         self.label: Final[str] = label
         self.bits: Final[int] = bits
         self.sub_byte: Final[bool] = sub_byte
+        self.torch_name: Final[str | None] = torch_name
+        self.safetensors_token: Final[str] = safetensors_token
+        self.max_finite: Final[float | None] = max_finite
 
     @classmethod
     def from_str(cls, name: str) -> DType:
-        """Lookup a DType instance by its string identifier (case-insensitive).
+        """Lookup a DType instance by any of its registered names (case-insensitive).
+
+        Accepts the canonical label, the enum name, the PyTorch attribute name,
+        and the safetensors token.
 
         Args:
-            name: The dtype name (e.g., "fp16", "FP16", "int4").
+            name: The dtype name (e.g., "fp16", "float16", "F16", "int4").
 
         Returns:
             The matching DType enum member.
@@ -58,11 +77,52 @@ class DType(enum.Enum):
         """
         normalized = name.strip().lower()
         for member in cls:
-            if member.label == normalized or member.name.lower() == normalized:
+            if normalized in (member.label, member.name.lower(), member.safetensors_token.lower()):
                 return member
-        raise ValueError(
-            f"Unknown dtype: '{name}'. Valid options: {[m.label for m in cls]}"
-        )
+            if member.torch_name is not None and member.torch_name == normalized:
+                return member
+        raise ValueError(f"Unknown dtype: '{name}'. Valid options: {[m.label for m in cls]}")
+
+    @classmethod
+    def by_torch_name(cls, name: str) -> DType:
+        """Lookup a DType by its PyTorch attribute name (case-insensitive).
+
+        Raises:
+            ValueError: If no registered type has a torch representation under
+                ``name``.
+        """
+        normalized = name.strip().lower()
+        for member in cls:
+            if member.torch_name == normalized:
+                return member
+        raise ValueError(f"dtype {name!r} has no PyTorch representation")
+
+    @classmethod
+    def by_safetensors_token(cls, token: str) -> DType:
+        """Lookup a DType by its safetensors ``dtype`` token (case-insensitive).
+
+        Raises:
+            ValueError: If no registered type carries ``token``.
+        """
+        normalized = token.strip().lower()
+        for member in cls:
+            if member.safetensors_token.lower() == normalized:
+                return member
+        raise ValueError(f"unknown safetensors dtype {token!r}")
+
+    @property
+    def torch_dtype(self) -> Any:
+        """The matching ``torch.dtype``.
+
+        Imported lazily so this module stays usable without PyTorch.
+
+        Raises:
+            CapabilityError: If PyTorch is unavailable, this build lacks the
+                dtype, or the type has no torch representation.
+        """
+        from ayaka.utils.torch_utils import torch_dtype
+
+        return torch_dtype(self, capability=f"dtype.{self.label}")
 
     @property
     def itemsize(self) -> float:
@@ -114,6 +174,13 @@ class DType(enum.Enum):
     def __repr__(self) -> str:
         return f"DType.{self.name}"
 
+
+#: The compute formats every torch-backed layer accepts. Single source for the
+#: per-kernel "supported dtype" checks; resolve through
+#: ``utils.torch_utils.compute_torch_dtypes`` on the torch side.
+COMPUTE_DTYPES: Final[tuple[DType, ...]] = (DType.FP16, DType.BF16, DType.FP32)
+
+
 class DeviceKind(enum.StrEnum):
     """Hardware target categories for storage and kernel execution.
 
@@ -128,6 +195,7 @@ class DeviceKind(enum.StrEnum):
     CUDA = "cuda"
     DISK = "disk"
     REMOTE = "remote"
+
 
 class MemoryTier(enum.IntEnum):
     """Hardware memory hierarchy, ordered strictly from fastest to slowest.
@@ -175,9 +243,7 @@ class MemoryTier(enum.IntEnum):
             ValueError: If called on a non-residency kernel tier (REGISTER, SHARED, L2).
         """
         if self < MemoryTier.DEVICE:
-            raise ValueError(
-                f"{self.name} is a kernel cost model tier, not a residency tier"
-            )
+            raise ValueError(f"{self.name} is a kernel cost model tier, not a residency tier")
         return MemoryTier(max(int(MemoryTier.DEVICE), int(self) - 1))
 
     def demoted(self) -> MemoryTier:
@@ -190,10 +256,9 @@ class MemoryTier(enum.IntEnum):
             ValueError: If called on a non-residency kernel tier (REGISTER, SHARED, L2).
         """
         if self < MemoryTier.DEVICE:
-            raise ValueError(
-                f"{self.name} is a kernel cost model tier, not a residency tier"
-            )
+            raise ValueError(f"{self.name} is a kernel cost model tier, not a residency tier")
         return MemoryTier(min(int(MemoryTier.REMOTE), int(self) + 1))
+
 
 class MemoryOwner(enum.StrEnum):
     """Explicit ownership tag for memory allocation and ledger accounting.
@@ -230,6 +295,7 @@ class MemoryOwner(enum.StrEnum):
     def is_static(self) -> bool:
         """Whether this allocation represents static baseline engine overhead."""
         return not self.is_dynamic
+
 
 class Layout(enum.StrEnum):
     """Physical memory layout hints for memory planning and kernel dispatching.
@@ -289,6 +355,7 @@ class StreamRole(enum.StrEnum):
     COMM = "comm"
     KV = "kv"
 
+
 class AttentionType(StrEnum):
     """One value per KV-pool family.
 
@@ -314,6 +381,7 @@ class AttentionType(StrEnum):
     @property
     def is_paged_kv(self) -> bool:
         return self in (AttentionType.FULL, AttentionType.SWA, AttentionType.MLA)
+
 
 class ForwardMode(IntEnum):
     """What a forward is doing, as data rather than as ``max(query_len) == 1``.
@@ -344,6 +412,7 @@ class ForwardMode(IntEnum):
         """Whether ``computed_lens`` can be non-zero (i.e. the K/V loop must page)."""
         return self is not ForwardMode.PREFILL
 
+
 class AttentionCudaGraphSupport(IntEnum):
     """How much of a batch a backend can serve from inside a captured graph.
 
@@ -355,6 +424,7 @@ class AttentionCudaGraphSupport(IntEnum):
     PURE_DECODE = 1  # DECODE only (one query per request)
     UNIFORM_QUERY = 2  # DECODE + TARGET_VERIFY (same query len for every request)
     ALWAYS = 3  # any mode, including ragged prefill
+
 
 class KVCacheDtype(StrEnum):
     """Storage dtype of the KV pool, independent of the model's compute dtype.
@@ -380,10 +450,9 @@ class KVCacheDtype(StrEnum):
     @property
     def torch_dtype_name(self) -> str | None:
         """Canonical name for ``torch_utils.torch_dtype``; None for AUTO."""
-        return {
-            KVCacheDtype.FP8_E4M3: "float8_e4m3fn",
-            KVCacheDtype.FP8_E5M2: "float8_e5m2",
-        }.get(self)
+        if self is KVCacheDtype.AUTO:
+            return None
+        return DType.from_str(self.value).torch_name
 
     @property
     def element_bytes(self) -> int | None:
@@ -393,6 +462,7 @@ class KVCacheDtype(StrEnum):
         why the quantization choice must reach capacity planning and not just the kernel.
         """
         return 1 if self.is_quantized else None
+
 
 class MaskKind(StrEnum):
     CAUSAL = "causal"

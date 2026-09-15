@@ -1,40 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Final
+from typing import Final, cast
 
 from ayaka.types import DType
 from ayaka.utils.torch_utils import dtype_name
 
+#: Dtypes the KV storage layer accepts. Deliberately an allowlist: integer and
+#: sub-byte formats cannot carry a scale (``KVQuantization.validate_for_dtype``
+#: refuses a scheme on any non-FP8 dtype), so every write would cast real
+#: activations through a truncating ``.to(int8)`` with no diagnostic. Until a
+#: calibrated integer scheme exists, refusing the dtype is the fail-closed answer.
+_KV_STORAGE_DTYPES: Final[tuple[DType, ...]] = (
+    DType.FP32,
+    DType.FP16,
+    DType.BF16,
+    DType.FP8_E4M3,
+    DType.FP8_E5M2,
+)
 
-@dataclass(frozen=True, slots=True)
-class _StorageDTypeInfo:
-    torch_name: str
-    max_finite: float
-
-
-#: Information specific to KV storage that cannot be derived from :class:`DType`.
-#:
-#: Names deliberately match PyTorch attributes. ``max_finite`` lets quantization clamp
-#: values before casting; element size and floating-point classification come directly
-#: from :class:`DType` and are not repeated here.
-#:
-#: ``INT8`` is intentionally absent. Integer KV storage cannot carry a scale
-#: (``KVQuantization.validate_for_dtype`` refuses a scheme on any non-FP8
-#: dtype), so every write would cast real activations through a truncating
-#: ``.to(int8)`` with no diagnostic. Until a calibrated integer scheme exists,
-#: refusing the dtype is the fail-closed answer.
-_STORAGE_INFO: Final[dict[DType, _StorageDTypeInfo]] = {
-    DType.FP32: _StorageDTypeInfo("float32", 3.4028234663852886e38),
-    DType.FP16: _StorageDTypeInfo("float16", 65504.0),
-    DType.BF16: _StorageDTypeInfo("bfloat16", 3.3895313892515355e38),
-    DType.FP8_E4M3: _StorageDTypeInfo("float8_e4m3fn", 448.0),
-    DType.FP8_E5M2: _StorageDTypeInfo("float8_e5m2", 57344.0),
-}
-
-#: Derived once so forward and reverse conversion cannot drift apart.
+#: Derived once so forward and reverse conversion cannot drift apart. Element
+#: size, floating-point classification, and max magnitude all come from the
+#: :class:`~ayaka.types.DType` registry; nothing about the type is repeated here.
 _DTYPE_BY_NAME: Final[dict[str, DType]] = {
-    info.torch_name: dtype for dtype, info in _STORAGE_INFO.items()
+    cast(str, dtype.torch_name): dtype for dtype in _KV_STORAGE_DTYPES
 }
 
 #: Public, ordered view of every supported dtype name. Useful in error messages and
@@ -73,10 +61,9 @@ def to_storage_dtype(dtype: DType) -> str:
             formats and integer formats are intentionally unsupported rather than
             silently promoted or stored unscaled.
     """
-    info = _STORAGE_INFO.get(dtype)
-    if info is None:
+    if dtype not in _KV_STORAGE_DTYPES:
         raise ValueError(f"{dtype.label} has no KV storage representation")
-    return info.torch_name
+    return cast(str, dtype.torch_name)
 
 
 def from_storage_dtype(name: str) -> DType:
@@ -91,7 +78,10 @@ def storage_dtype_bytes(dtype: str) -> int:
 
 def storage_dtype_max(dtype: str) -> float:
     """Return the largest finite magnitude representable by ``dtype``."""
-    return _STORAGE_INFO[from_storage_dtype(dtype)].max_finite
+    info = from_storage_dtype(dtype)
+    if info.max_finite is None:
+        raise ValueError(f"{info.label} has no finite magnitude")
+    return info.max_finite
 
 
 def is_fp8_storage_dtype(dtype: str) -> bool:

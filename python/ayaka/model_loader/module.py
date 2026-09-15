@@ -20,7 +20,6 @@ from ayaka.layers.quantization.base import QuantizationTarget
 from ayaka.model_loader.mapping import ExternMapping, QuantizeMapping
 from ayaka.model_loader.reader import BoundedCheckpointReader
 from ayaka.model_loader.validate import verify_consumed_names
-from ayaka.types import DType
 from ayaka.utils.torch_utils import torch_dtype
 from ayaka.weights.plan import CheckpointManifest, FileReadPlan, ManifestEntry, TensorSlice
 
@@ -380,21 +379,7 @@ def iter_checkpoint_tensors(
     with BoundedCheckpointReader(workers=1, max_inflight=1) as reader:
         for entry in manifest.entries:
             plan, shape = _read_plan(entry, selections.get(entry.tensor_key))
-            dtype = torch_dtype(
-                {
-                    DType.FP64: "float64",
-                    DType.FP32: "float32",
-                    DType.FP16: "float16",
-                    DType.BF16: "bfloat16",
-                    DType.FP8_E4M3: "float8_e4m3fn",
-                    DType.FP8_E5M2: "float8_e5m2",
-                    DType.INT64: "int64",
-                    DType.INT32: "int32",
-                    DType.INT8: "int8",
-                    DType.UINT8: "uint8",
-                    DType.BOOL: "bool",
-                }[entry.dtype]
-            )
+            dtype = torch_dtype(entry.dtype)
             if plan is None:
                 tensor = torch.empty(shape, dtype=dtype)
             else:

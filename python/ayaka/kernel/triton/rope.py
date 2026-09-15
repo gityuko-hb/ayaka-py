@@ -7,8 +7,9 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.utils.torch_utils import compute_torch_dtypes
 
-_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+_SUPPORTED_DTYPES = compute_torch_dtypes()
 _BLOCK_SIZE = 256
 _NUM_WARPS = 4
 

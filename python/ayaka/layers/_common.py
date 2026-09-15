@@ -9,10 +9,11 @@ from typing import Any, Literal
 import torch
 
 from ayaka.utils.import_utils import require_module
+from ayaka.utils.torch_utils import compute_torch_dtypes
 
 type LayerBackend = Literal["triton", "torch"]
 
-SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+SUPPORTED_DTYPES = compute_torch_dtypes()
 
 
 def load_kernel(backend: LayerBackend, module: str, name: str) -> Callable[..., Any] | None:

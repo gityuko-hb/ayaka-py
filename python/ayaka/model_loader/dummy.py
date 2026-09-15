@@ -25,14 +25,17 @@ __all__ = [
 ]
 
 _DTYPE_TOKENS: dict[DType, str] = {
-    DType.FP32: "F32",
-    DType.FP16: "F16",
-    DType.BF16: "BF16",
-    DType.INT64: "I64",
-    DType.INT32: "I32",
-    DType.INT8: "I8",
-    DType.UINT8: "U8",
-    DType.BOOL: "BOOL",
+    dtype: dtype.safetensors_token
+    for dtype in (
+        DType.FP32,
+        DType.FP16,
+        DType.BF16,
+        DType.INT64,
+        DType.INT32,
+        DType.INT8,
+        DType.UINT8,
+        DType.BOOL,
+    )
 }
 
 # A tiny but *structurally real* Qwen2: 2 layers, GQA 4:2, tied embeddings.

@@ -9,6 +9,7 @@ from functools import cache
 from types import ModuleType
 from typing import Any, Final
 
+from ayaka.types import COMPUTE_DTYPES, DType
 from ayaka.utils.import_utils import CapabilityError, LazyModule
 
 #: Lazy handle. Import this instead of ``torch`` in modules that must stay
@@ -345,23 +346,33 @@ def has_dtype(name: str) -> bool:
     return getattr(require_torch(), dtype_name(name), None) is not None
 
 
-def torch_dtype(name: str, *, capability: str = "dtype") -> Any:
-    """Resolve a canonical dtype name to a ``torch.dtype``.
+def torch_dtype(dtype: Any, *, capability: str = "dtype") -> Any:
+    """Resolve a dtype to a ``torch.dtype``.
 
-    Accepts ``"float16"`` or ``"torch.float16"``, and passes an actual
-    ``torch.dtype`` straight through so callers can accept either.
+    Accepts a :class:`~ayaka.types.DType`, ``"float16"`` or ``"torch.float16"``,
+    and passes an actual ``torch.dtype`` straight through so callers can accept
+    any of the three.
 
     Raises:
-        CapabilityError: if torch is unavailable or this build lacks the dtype.
+        CapabilityError: if torch is unavailable, the type has no torch
+            representation, or this build lacks the dtype.
     """
     module = require_torch(capability=capability)
-    if isinstance(name, module.dtype):
-        return name
-    resolved = getattr(module, dtype_name(name), None)
+    if isinstance(dtype, module.dtype):
+        return dtype
+    if isinstance(dtype, DType):
+        if dtype.torch_name is None:
+            raise CapabilityError(
+                capability,
+                detail=f"{dtype.label} has no PyTorch representation",
+                remedy="choose a dtype that PyTorch can represent",
+            )
+        dtype = dtype.torch_name
+    resolved = getattr(module, dtype_name(dtype), None)
     if not isinstance(resolved, module.dtype):
         raise CapabilityError(
             capability,
-            detail=f"this PyTorch build does not provide dtype {name!r}",
+            detail=f"this PyTorch build does not provide dtype {dtype!r}",
             remedy="upgrade torch, or choose a dtype this build supports",
         )
     return resolved
@@ -374,8 +385,18 @@ def dtype_bytes(dtype: Any) -> int:
     dtypes this module has never heard of.
     """
     module = require_torch(capability="dtype_bytes")
-    resolved = torch_dtype(dtype) if not isinstance(dtype, module.dtype) else dtype
+    resolved = dtype if isinstance(dtype, module.dtype) else torch_dtype(dtype)
     return module.empty(0, dtype=resolved).element_size()
+
+
+@cache
+def compute_torch_dtypes() -> tuple[Any, ...]:
+    """Torch dtypes every torch-backed compute layer accepts.
+
+    Derived from :data:`ayaka.types.COMPUTE_DTYPES` so the registry, the layer
+    guards, and the kernel guards cannot drift apart.
+    """
+    return tuple(dtype.torch_dtype for dtype in COMPUTE_DTYPES)
 
 
 def synchronize(device: Any = None) -> None:

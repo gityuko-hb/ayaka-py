@@ -33,18 +33,10 @@ from ayaka.weights.plan import ManifestEntry
 
 # Safetensors dtype tokens.  Explicit map: an unknown token must be a refusal,
 # because guessing an item size turns a corrupt file into a silently misread one.
+# Derived from the DType registry; sub-byte formats are absent because ``_dtype``
+# refuses them before the lookup.
 _SAFETENSORS_DTYPES: dict[str, DType] = {
-    "F64": DType.FP64,  # widened at read; there is no fp64 compute path
-    "F32": DType.FP32,
-    "F16": DType.FP16,
-    "BF16": DType.BF16,
-    "F8_E4M3": DType.FP8_E4M3,
-    "F8_E5M2": DType.FP8_E5M2,
-    "I64": DType.INT64,
-    "I32": DType.INT32,
-    "I8": DType.INT8,
-    "U8": DType.UINT8,
-    "BOOL": DType.BOOL,
+    dtype.safetensors_token: dtype for dtype in DType if not dtype.sub_byte
 }
 
 # The largest unsigned integer that can be represented in 64 bits.
