@@ -47,7 +47,7 @@ import torch
 import torch.nn.functional as F
 
 from ayaka.executor.ticket import SampleOutputs
-from ayaka.runtime.logits import LogitsPlan, LogitsProcessor
+from ayaka.logits_processor import LogitsPlan, LogitsProcessor
 from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sampling.logprobs import (
     LogprobEntry,
