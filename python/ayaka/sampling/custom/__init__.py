@@ -1,4 +1,4 @@
-"""Tier-2 sampling custom ops — matcher adapters (A4/B3)."""
+"""Sampling custom operators and structured generation matcher adapters."""
 
 from __future__ import annotations
 

@@ -1,35 +1,35 @@
-"""Pipeline sampling THAM CHIẾU — spec thứ tự các bước, KHÔNG phải runtime path.
+"""Reference sampling pipeline defining canonical stage execution order.
 
-Sau M0 đường runtime duy nhất là ``ayaka.sampling.plan.Sampler``. File này giữ
-một bản cài đặt độc lập của CÙNG thứ tự để tests so parity giữa bản runtime và
-bản spec (tests/test_pipeline_order.py). Đổi Sampler mà không đổi bản này (hoặc
-ngược lại) phải làm parity test đỏ.
+This module provides a specification implementation of the canonical sampling stage
+order for parity verification against the optimized runtime path (`Sampler` in
+`ayaka.sampling.plan`).
 
-THỨ TỰ CANONICAL (Sampler.__call__ cài đúng thứ tự này; đổi ở đây thì PHẢI đổi
-docstring Sampler và test_pipeline_order.py cùng lúc):
-  1. penalty         (penalties.py, apply_penalties_)      — trên logit thô
-  2. bitmask         (bitmask.py, apply_allow_bitmask_)     — NEG_INF=-inf
-  3. temperature     — chia ĐÚNG MỘT LẦN, trước stats và lọc
-  4. stats           (topk_topp.py, softmax_stats_scaled)   — trên scaled
-  5. filter + sample (topk_topp.py hoặc gumbel.py)
+Canonical Pipeline Order:
+    1. Penalties (`apply_penalties_`): Applied in place to raw model logits.
+    2. Bitmask (`apply_allow_bitmask_`): Applied in place to disallow forbidden tokens (-inf).
+    3. Temperature: Scaled exactly once prior to statistics collection and filtering.
+    4. Statistics (`softmax_stats_scaled`): Computed on temperature-scaled logits.
+    5. Filter and Sample (`topk_topp_sample` or `gumbel_sample`): Stochastic draw.
 
-GHI CHÚ lịch sử: bản trước tính stats TRÊN logits chưa chia temperature rồi
-truyền logits thô vào sampler — hai nơi lệch nhau. M0 hợp nhất; stats giờ nằm
-trên distribution thật dùng để sample.
+Notes:
+    The runtime execution path in production is handled by `ayaka.sampling.plan.Sampler`.
+    This independent reference implementation is retained for parity testing
+    (`tests/test_pipeline_order.py`). Any semantic modification to the sampling pipeline
+    must maintain parity between both implementations.
 """
 
 from __future__ import annotations
 
+import torch
+
+from ayaka.sampling.metadata import SamplingMetadata
+from ayaka.sampling.ops.penalties import PenaltyState, apply_penalties_
 from ayaka.sampling.ops.sampling import (
     apply_allow_bitmask_,
     gumbel_sample,
     softmax_stats_scaled,
     topk_topp_sample,
 )
-import torch
-
-from ayaka.sampling.metadata import SamplingMetadata
-from ayaka.sampling.ops.penalties import PenaltyState, apply_penalties_
 
 STAGES = ("penalty", "bitmask", "temperature", "stats", "filter_sample")
 
@@ -50,21 +50,51 @@ def run_sampling_pipeline(
     sampler: str = "inverse_cdf",  # "inverse_cdf" | "gumbel"
     compute_stats: bool = False,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
-    """Reference: chạy đúng thứ tự canonical ở trên. Trả (token, stats_hoac_None).
+    """Execute the canonical sampling pipeline stages on logits in specification order.
 
-    logits bị sửa IN-PLACE bởi penalty + bitmask — caller phải clone() trước nếu
-    cần giữ logits gốc (LogprobProcessor raw snapshot phải clone TRƯỚC hàm này).
+    Applies penalties and grammar/allowed-token masks in place to `logits`. If the
+    caller requires preservation of the original raw logits (e.g., for raw logprob
+    computation), `logits` must be cloned prior to invoking this function.
+
+    Args:
+        logits: Float tensor of raw model logits of shape `[batch_size, vocab_size]`.
+            Modified in place by penalties and bitmask stages.
+        md: Sampling metadata container holding column parameters and active rows.
+        penalty_state: State tracking per-slot token frequencies and penalty occurrences.
+        temperature: Tensor of shape `[batch_size]` containing temperature scaling values.
+        top_k: Tensor of shape `[batch_size]` specifying top-k filtering thresholds.
+        top_p: Tensor of shape `[batch_size]` specifying top-p cumulative thresholds.
+        min_p: Tensor of shape `[batch_size]` specifying min-p probability cutoffs.
+        seed: Tensor of 64-bit random seeds per batch row.
+        offset: Tensor of 64-bit RNG step offsets per batch row.
+        mask: Optional packed 32-bit bitmask tensor defining allowed token sets.
+        row_indices: Optional mapping of batch rows to corresponding mask rows.
+        sampler: Sampling algorithm identifier, either `"inverse_cdf"` or `"gumbel"`.
+        compute_stats: Whether to compute and return distribution statistics.
+
+    Returns:
+        A tuple `(token_ids, stats)` where `token_ids` is the sampled token tensor
+        and `stats` is an optional tuple `(max_prob, entropy, exp_entropy)` or `None`.
+
+    Raises:
+        AssertionError: If `mask` is provided without `row_indices`.
+        ValueError: If `sampler` is not recognized.
     """
+    # Stage 1: Apply frequency, presence, and repetition penalties in place.
     apply_penalties_(logits, md, penalty_state)
 
+    # Stage 2: Apply allowed-token bitmask constraints in place.
     if mask is not None:
         assert row_indices is not None, "mask không row_indices không rõ ràng buộc row nào"
         apply_allow_bitmask_(logits, mask, row_indices, logits.size(1))
 
+    # Stage 3: Scale logits by temperature exactly once (clamped to prevent division by zero).
     scaled = logits / temperature.clamp_min(1e-6).unsqueeze(1)
 
+    # Stage 4: Compute softmax statistics on temperature-scaled distribution if requested.
     stats = softmax_stats_scaled(scaled) if compute_stats else None
 
+    # Stage 5: Stochastic filter and sampling draw.
     if sampler == "gumbel":
         tok = gumbel_sample(scaled, top_k, top_p, min_p, seed, offset)
     elif sampler == "inverse_cdf":

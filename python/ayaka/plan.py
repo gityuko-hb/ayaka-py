@@ -44,7 +44,12 @@ class BatchEntry:
         require_text(self.request_id, "request_id")
         if not isinstance(self.kind, TokenKind):
             raise TypeError("kind must be TokenKind")
-        for name in ("token_offset", "num_cached_tokens", "slot_offset", "seq_len_after"):
+        for name in (
+            "token_offset",
+            "num_cached_tokens",
+            "slot_offset",
+            "seq_len_after",
+        ):
             require_int(getattr(self, name), name)
         require_int(self.num_tokens, "num_tokens", minimum=1)
         if self.seq_len_after != self.token_offset + self.num_tokens:
@@ -406,6 +411,7 @@ class SamplingPlan:
     num_mask_rows: int = 0
     all_greedy: bool = True
     any_penalty: bool = False
+    any_bias: bool = False
     custom_ops: tuple[str, ...] = ()
     # A4 — caps của từng custom op (custom_ops_caps[i] ↔ custom_ops[i]) và
     # flag "mọi producer mask đều ARGMAX_INVARIANT" (AND caps của producers).
