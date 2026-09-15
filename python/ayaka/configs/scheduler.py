@@ -126,6 +126,7 @@ class SchedulerConfig(ConfigMixin):
     retry_ns: int = 1_000_000
     transfer_bytes: int = 64 << 20
     tier_limits: tuple[tuple[MemoryTier, int], ...] = ()
+    sampling_support_max_tokens: int = 512
 
     def __post_init__(self) -> None:
         for name in (
@@ -150,6 +151,11 @@ class SchedulerConfig(ConfigMixin):
                 require_int(value, f"scheduler.{name}", minimum=1)
         require_int(self.long_prefill_token_threshold, "scheduler.long_prefill_token_threshold")
         require_int(self.transfer_bytes, "scheduler.transfer_bytes")
+        require_int(
+            self.sampling_support_max_tokens,
+            "scheduler.sampling_support_max_tokens",
+            minimum=1,
+        )
         if type(self.enable_chunked_prefill) is not bool:
             raise TypeError("scheduler.enable_chunked_prefill must be bool")
         if type(self.priority_preemption) is not bool:

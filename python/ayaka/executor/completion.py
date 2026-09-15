@@ -15,6 +15,7 @@ from ayaka.executor.ticket import (
 )
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.sampling.logprobs import LogprobResult, TokenLogprob
+from ayaka.sampling.ops.sampling import SamplingSupportStatus
 from ayaka.sched.plan import PreparedStep, ScheduledSlice
 from ayaka.utils.validation import require_int
 
@@ -25,6 +26,23 @@ class PublishedSample:
     sequence_epoch: int
     token_id: int
     logprobs: LogprobResult | None = None
+    sampling_support: SamplingSupportReport | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SamplingSupportReport:
+    """Host materialization của một captured support row.
+
+    ``token_ids`` là support đã pack (top-k theo weight, capped theo
+    ``sampling_support_max_tokens``); ``length`` là số token support thực tế
+    SAU clamp. ``selected_logprob`` là log(w/mass) của token đã sample —
+    semantics ``LogprobMode.SAMPLING``.
+    """
+
+    status: SamplingSupportStatus
+    length: int
+    selected_logprob: float
+    token_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +86,96 @@ def _materialize_reports(samples) -> dict[int, LogprobResult]:
         )
         by_row[int(row)] = LogprobResult(token_values[index], top)
     return by_row
+
+
+def _materialize_support(samples) -> dict[int, SamplingSupportReport]:
+    """Materialize every support-capture row in ONE host sync; {} when off.
+
+    Keyed by sampling-row index (packed sampling order). Range validation of
+    ``row_indices`` lives HERE — SampleOutputs validation is shape-only to
+    stay sync-free. ``token_ids`` beyond ``length`` là padding zero-weight.
+    """
+    support = samples.sampling_support
+    if support is None:
+        return {}
+    rows = support.row_indices.tolist()
+    statuses = support.statuses.tolist()
+    lengths = support.lengths.tolist()
+    selected = support.selected_logprobs.tolist()
+    packed_ids = support.token_ids.tolist()
+    limit = samples.token_ids.size(0)
+    by_row: dict[int, SamplingSupportReport] = {}
+    for index, row in enumerate(rows):
+        row = int(row)
+        if not 0 <= row < limit:
+            raise IndexError(f"sampling support row {row} outside the {limit} sampling rows")
+        length = int(lengths[index])
+        by_row[row] = SamplingSupportReport(
+            status=SamplingSupportStatus(int(statuses[index])),
+            length=length,
+            selected_logprob=float(selected[index]),
+            token_ids=tuple(int(token) for token in packed_ids[index][:length]),
+        )
+    return by_row
+    lp = samples.logprobs
+    if lp is None:
+        return {}
+    token_values = [float(value) for value in lp.token_logprob.tolist()]
+    top_ids = lp.top_token_ids.tolist()
+    top_values = lp.top_logprobs.tolist()
+    by_row: dict[int, LogprobResult] = {}
+    for index, row in enumerate(samples.logprob_rows):
+        top = tuple(
+            TokenLogprob(int(token), float(value))
+            for token, value in zip(top_ids[index], top_values[index], strict=True)
+            if token >= 0
+        )
+        by_row[int(row)] = LogprobResult(token_values[index], top)
+    return by_row
+
+
+def _materialize_ids_logprobs(samples) -> dict[int, tuple[tuple[float, ...], float]]:
+    """Materialize token_ids_logprobs values in ONE host sync; {} when off.
+
+    Keyed by sampling-row index → (values theo count, token_logprob của
+    token sample). Token id của từng value nằm ở ``request.sampling.
+    token_ids_logprobs`` (host) — merge tại publish.
+    """
+    payload = samples.token_ids_logprobs
+    if payload is None:
+        return {}
+    values = payload.logprobs.tolist()
+    selected = payload.token_logprob.tolist()
+    limit = samples.token_ids.size(0)
+    by_row: dict[int, tuple[tuple[float, ...], float]] = {}
+    for index, row in enumerate(samples.ids_logprob_rows):
+        row = int(row)
+        if not 0 <= row < limit:
+            raise IndexError(f"ids logprob row {row} outside the {limit} sampling rows")
+        count = int(samples.ids_logprob_counts[index])
+        by_row[row] = (
+            tuple(float(value) for value in values[index][:count]),
+            float(selected[index]),
+        )
+    return by_row
+
+
+def _merge_ids_logprobs(
+    lp: LogprobResult | None,
+    ids_values: tuple[tuple[float, ...], float] | None,
+    token_ids: tuple[int, ...] | None,
+) -> LogprobResult | None:
+    """Ghép ids-logprob vào LogprobResult của row (tạo mới khi row chỉ ids)."""
+    if ids_values is None:
+        return lp
+    values, token_logprob = ids_values
+    ids_result = tuple(
+        TokenLogprob(int(token), float(value))
+        for token, value in zip(token_ids or (), values, strict=True)
+    )
+    if lp is None:
+        return LogprobResult(token_logprob, (), ids_result)
+    return LogprobResult(lp.token_logprob, lp.top_logprobs, ids_result)
 
 
 def _materialize_prompt_chunks(
@@ -299,6 +407,8 @@ class CompletionCoordinator:
                     )
                 tokens = tuple(int(t) for t in samples.token_ids.tolist())
                 report_by_row = _materialize_reports(samples)
+                support_by_row = _materialize_support(samples)
+                ids_by_row = _materialize_ids_logprobs(samples)
                 chunks_by_slice = {
                     report.slice_index: chunk
                     for report, chunk in zip(
@@ -332,12 +442,18 @@ class CompletionCoordinator:
                         # resource-accounting fault.
                         if sample is not None and request.accepts_completion(step_id, scheduled):
                             request.publish_sample(step_id, scheduled, sample)
+                            merged = _merge_ids_logprobs(
+                                report_by_row.get(sample_index - 1),
+                                ids_by_row.get(sample_index - 1),
+                                request.request.sampling.token_ids_logprobs,
+                            )
                             published.append(
                                 PublishedSample(
                                     request.request_id,
                                     scheduled.sequence_epoch,
                                     sample,
-                                    report_by_row.get(sample_index - 1),
+                                    merged,
+                                    support_by_row.get(sample_index - 1),
                                 )
                             )
                         chunk = chunks_by_slice.get(slice_index)

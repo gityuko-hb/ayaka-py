@@ -18,7 +18,9 @@ from ayaka.sampling.logprobs import (
     PromptLogprobSliceReport,
     PromptLogprobTensors,
     SampleLogprobTensors,
+    TokenIdsLogprobTensors,
 )
+from ayaka.sampling.ops.sampling import SamplingSupportTensors
 from ayaka.sched.plan import PreparedStep
 from ayaka.utils.validation import require_frozen, require_int
 
@@ -127,6 +129,10 @@ class SampleOutputs:
     logprob_rows: tuple[int, ...] = ()
     prompt_logprobs: PromptLogprobTensors | None = None
     prompt_logprob_slices: tuple[PromptLogprobSliceReport, ...] = ()
+    sampling_support: SamplingSupportTensors | None = None
+    token_ids_logprobs: TokenIdsLogprobTensors | None = None
+    ids_logprob_rows: tuple[int, ...] = ()
+    ids_logprob_counts: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.token_ids, torch.Tensor):
@@ -145,6 +151,69 @@ class SampleOutputs:
                 raise ValueError("prompt_logprob_slices without a prompt_logprobs payload")
         else:
             self._validate_prompt_logprobs()
+        if self.sampling_support is not None:
+            self._validate_sampling_support()
+        if self.token_ids_logprobs is None:
+            if self.ids_logprob_rows or self.ids_logprob_counts:
+                raise ValueError("ids_logprob_rows/counts without token_ids_logprobs payload")
+        else:
+            self._validate_token_ids_logprobs()
+
+    def _validate_sampling_support(self) -> None:
+        """Shape/dtype-only validation — NO host sync.
+
+        Row range của ``row_indices`` được kiểm ở completion boundary (nơi đã
+        materialize anyway); kiểm ở đây phải ``.tolist()``/``bool()`` trên
+        device tensor ⇒ sync trước boundary, vi phạm contract.
+        """
+        support = self.sampling_support
+        assert support is not None
+        rows = support.row_indices.numel()
+        for name, tensor in (
+            ("token_ids", support.token_ids),
+            ("lengths", support.lengths),
+            ("selected_logprobs", support.selected_logprobs),
+            ("statuses", support.statuses),
+        ):
+            if tensor.size(0) != rows:
+                raise ValueError(
+                    f"sampling support {name} must have {rows} rows, got {tensor.size(0)}"
+                )
+        if support.token_ids.dim() != 2 or support.token_ids.size(1) == 0:
+            raise ValueError("sampling support token_ids must be [R, K] with K >= 1")
+        if support.token_ids.is_floating_point() or support.token_ids.is_complex():
+            raise ValueError("sampling support token_ids must be integer dtype")
+        if not support.selected_logprobs.is_floating_point():
+            raise ValueError("sampling support selected_logprobs must be float")
+        if support.lengths.is_floating_point() or support.statuses.is_floating_point():
+            raise ValueError("sampling support lengths/statuses must be integer dtype")
+        if support.row_indices.is_floating_point() or support.row_indices.is_complex():
+            raise ValueError("sampling support row_indices must be integer dtype")
+
+    def _validate_token_ids_logprobs(self) -> None:
+        """Shape/dtype-only, sync-free — range kiểm ở completion."""
+        payload = self.token_ids_logprobs
+        assert payload is not None
+        rows = payload.token_logprob.numel()
+        if payload.logprobs.dim() != 2 or payload.logprobs.size(0) != rows:
+            raise ValueError(
+                f"token_ids_logprobs.logprobs must be [{rows}, K], "
+                f"got {tuple(payload.logprobs.shape)}"
+            )
+        if (
+            not payload.logprobs.is_floating_point()
+            or not payload.token_logprob.is_floating_point()
+        ):
+            raise ValueError("token_ids_logprobs tensors must be floating-point")
+        if len(self.ids_logprob_rows) != rows or len(self.ids_logprob_counts) != rows:
+            raise ValueError("ids_logprob_rows/counts must match the payload row count")
+        if len(set(self.ids_logprob_rows)) != len(self.ids_logprob_rows):
+            raise ValueError("ids_logprob_rows must be unique")
+        for row in self.ids_logprob_rows:
+            if not 0 <= row < self.token_ids.size(0):
+                raise IndexError(
+                    f"ids logprob row {row} outside the {self.token_ids.size(0)} sampling rows"
+                )
 
     def _validate_generation_logprobs(self) -> None:
         lp = self.logprobs
