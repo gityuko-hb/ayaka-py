@@ -15,6 +15,7 @@ from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.completion import CompletionResult
 from ayaka.executor.ticket import ExecutionTicket, TerminalStatus
 from ayaka.request.lifecycle import LifecycleManager
+from ayaka.request.states import RequestState
 from ayaka.sched.budget import BatchBudget
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import (
@@ -41,6 +42,18 @@ if TYPE_CHECKING:
     from ayaka.sampling.engine import SamplingCoordinator
 
 __all__ = ["ContinuousScheduler", "ContinuousSchedulerStats"]
+
+#: Machine states from which `begin_slice` can legally claim work; anything
+#: else (freshly queued but not yet admitted, preempted/evicted, terminal) is
+#: deferred to a later step instead of failing the request at prepare time.
+_SCHEDULABLE_STATES = frozenset(
+    {
+        RequestState.ADMITTED,
+        RequestState.PREFILL,
+        RequestState.DECODING,
+        RequestState.STREAMING,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +158,7 @@ class ContinuousScheduler(SchedulerCore):
         if self._inflight is not None:
             return None
         self._round += 1
-        self._refresh_cache_hints()
+        self._drain_window()
         for plan in self._candidate_plans():
             ticket = self._prepare_and_adopt(plan)
             if ticket is not None:
@@ -170,9 +183,9 @@ class ContinuousScheduler(SchedulerCore):
                         if item.query_end < item.prompt_tokens:
                             self._requeue(lifecycle)
                         else:
-                            self._running[item.request_id] = lifecycle
+                            self._running_add(item.request_id, lifecycle)
                     else:
-                        self._running[item.request_id] = lifecycle
+                        self._running_add(item.request_id, lifecycle)
             else:
                 for request_id in settled_ids:
                     if request_id not in self._abort_pending:
@@ -245,19 +258,20 @@ class ContinuousScheduler(SchedulerCore):
         slices: list[ScheduledSlice],
         inputs: list,
     ) -> None:
-        active = [
-            lifecycle
-            for lifecycle in self._running.values()
-            if not lifecycle.is_terminal and not lifecycle.token.is_cancelled
-        ]
-        count = len(active)
+        # Direct ring walk over the dense running array: no per-step filtering
+        # list; dead entries are skipped in place and leave the ring on drop.
+        ring = self._running_ids
+        count = len(ring)
         if not count:
             return
 
         start = self._decode_cursor % count
+        running = self._running
         scheduled_count = 0
         for offset in range(count):
-            lifecycle = active[(start + offset) % count]
+            lifecycle = running[ring[(start + offset) % count]]
+            if lifecycle.is_terminal or lifecycle.token.is_cancelled:
+                continue
             if not budget.try_consume(1, phase=Phase.DECODE):
                 break
             snapshot = lifecycle.snapshot()
@@ -284,14 +298,14 @@ class ContinuousScheduler(SchedulerCore):
         slices: list[ScheduledSlice],
         inputs: list,
     ) -> None:
-        if budget.remaining_sequences <= 0 or not self._waiting:
+        if budget.remaining_sequences <= 0 or not self._hot:
             return
 
         now = self._clock()
         eligible = [
             entry
-            for entry in self._waiting
-            if not entry.lifecycle.is_terminal
+            for entry in self._hot
+            if entry.lifecycle.state in _SCHEDULABLE_STATES
             and not entry.lifecycle.token.is_cancelled
             and entry.ready_ns <= now
         ]
@@ -480,7 +494,7 @@ class ContinuousScheduler(SchedulerCore):
         if not self._preemption.preempt(victim, sequence, mode=mode):
             return None
 
-        self._running.pop(victim.request_id, None)
+        self._running_remove(victim.request_id)
         outcome = (
             RequestOutcome.PREEMPTED_SWAP if mode == "swap" else RequestOutcome.PREEMPTED_RECOMPUTE
         )
@@ -554,10 +568,10 @@ class ContinuousScheduler(SchedulerCore):
     # Prefix hints, fairness, observability
     # ------------------------------------------------------------------
 
-    def _refresh_cache_hints(self) -> None:
+    def _refresh_window_hints(self, admitted: list[QueueEntry]) -> None:
         if self._prefix_hints is None:
             return
-        for entry in self._waiting:
+        for entry in admitted:
             try:
                 value = self._prefix_hints.estimate_cached_tokens(entry.lifecycle)
             except Exception:
@@ -575,7 +589,7 @@ class ContinuousScheduler(SchedulerCore):
         last = self._last_step
         return ContinuousSchedulerStats(
             round_id=self._round,
-            waiting=len(self._waiting),
+            waiting=self.num_waiting,
             prefilling=len(self._prefilling),
             running=len(self._running),
             inflight=int(self._inflight is not None),

@@ -15,6 +15,7 @@ from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.completion import CompletionResult
 from ayaka.executor.ticket import ExecutionTicket, TerminalStatus
 from ayaka.request.lifecycle import LifecycleManager
+from ayaka.request.states import RequestState
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import OverloadedError, SequenceAllocator, StepPrepareError, StepRuntime
 from ayaka.sched.plan import BatchStepPlan, KVRequirement, Phase, PreparedStep, ScheduledSlice
@@ -30,6 +31,18 @@ __all__ = [
     "StepPrepareError",
     "StepRuntime",
 ]
+
+#: Same schedulable-state contract as the continuous scheduler: requests that
+#: have not been physically admitted (or were evicted) are deferred, never
+#: failed at prepare time.
+_SCHEDULABLE_STATES = frozenset(
+    {
+        RequestState.ADMITTED,
+        RequestState.PREFILL,
+        RequestState.DECODING,
+        RequestState.STREAMING,
+    }
+)
 
 
 class EagerScheduler(SchedulerCore):
@@ -79,7 +92,7 @@ class EagerScheduler(SchedulerCore):
         return None
 
     def _candidate_plans(self) -> Iterator[BatchStepPlan]:
-        if self._waiting:
+        if self._waiting_ids:
             plan = self._build_prefill()
             if plan is not None:
                 yield plan
@@ -139,7 +152,7 @@ class EagerScheduler(SchedulerCore):
                     if lifecycle is None or lifecycle.is_terminal or lifecycle.token.is_cancelled:
                         continue
                     if phases.get(request_id) is Phase.PREFILL:
-                        self._running[request_id] = lifecycle
+                        self._running_add(request_id, lifecycle)
             else:
                 for request_id in settled_ids:
                     if request_id not in self._abort_pending:
@@ -168,8 +181,9 @@ class EagerScheduler(SchedulerCore):
     def _build_prefill(self) -> BatchStepPlan | None:
         eligible = [
             entry
-            for entry in self._waiting
-            if not entry.lifecycle.is_terminal and not entry.lifecycle.token.is_cancelled
+            for entry in self._iter_waiting()
+            if entry.lifecycle.state in _SCHEDULABLE_STATES
+            and not entry.lifecycle.token.is_cancelled
         ]
         ranked = rank_waiting(eligible, scheduling_policy=self._plan.scheduling_policy)
         slices: list[ScheduledSlice] = []

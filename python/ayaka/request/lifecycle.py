@@ -264,7 +264,20 @@ class RequestLifecycle:
         self._validate_phase_state(scheduled)
         value = self.snapshot()
         value.validate_slice(scheduled)
-        if value != self._input_snapshot:
+        baseline = self._input_snapshot
+        assert baseline is not None  # paired with the owned slice by begin_slice
+        if (
+            value.request_id != baseline.request_id
+            or value.sequence is not baseline.sequence
+            or value.sequence_epoch != baseline.sequence_epoch
+            or value.state_version != baseline.state_version
+            or value.prompt_tokens != baseline.prompt_tokens
+            or value.computed_tokens != baseline.computed_tokens
+            or value.max_output_tokens != baseline.max_output_tokens
+            or len(value.known_tokens) != len(baseline.known_tokens)
+        ):
+            raise ValueError("request inputs or sequence binding changed during the step")
+        if __debug__ and value != baseline:
             raise ValueError("request inputs or sequence binding changed during the step")
 
     def commit_computed_range(

@@ -48,20 +48,29 @@ features and belong outside this synchronous core.
 
 1. `add_request(request)` validates length feasibility via the resolved plan,
    checks sampling/stop support, enforces request/queue ceilings, creates a
-   lifecycle and sequence handle, and enqueues an ADMITTED report.
-2. `schedule()` builds candidate `BatchStepPlan`s against a `BatchBudget`, then
-   asks `StepRuntime.prepare` to validate the plan against current KV and
-   physical memory. `StepPrepareError` may shrink the candidate transiently,
-   preempt one victim, or fail one request.
+   lifecycle and sequence handle, and enqueues an ADMITTED report. The entry
+   lands in the O(1) staging queue; it becomes schedulable only after
+   `flush_reports()` applies ADMITTED and `schedule()` drains it into the hot
+   ranking window.
+2. `schedule()` first refills the hot window (≤ `HOT_WINDOW_SIZE` = 128
+   entries, drained from staging in arrival order), then builds candidate
+   `BatchStepPlan`s against a `BatchBudget`, then asks `StepRuntime.prepare` to
+   validate the plan against current KV and physical memory.
+   `StepPrepareError` may shrink the candidate transiently, preempt one victim,
+   or fail one request. Entries whose lifecycle state cannot legally begin a
+   slice (queued but not yet admitted, preempted/evicted) are deferred to a
+   later step instead of failing at prepare time.
 3. `StepRuntime.adopt` freezes the step into an `ExecutionTicket`. Only after
    prepare/adopt succeed does logical queue ownership move.
 4. `update_from_output(CompletionResult)` settles the ticket, re-queues partial
    prefills, promotes completed prefills to running, and handles ignored or
-   aborted requests.
+   aborted requests. The running set is a dense ring (swap-with-last removal),
+   so decode round-robin walks a packed array without per-step filtering lists.
 5. `flush_reports()` applies accumulated `RequestReport`s to the
    `LifecycleManager` as one immutable `SchedulerReport` (queue counts,
    preemption counts). Engine wiring should call it after each
-   `update_from_output`.
+   `update_from_output`; scheduling in the same iteration as `add_request`
+   without flushing is legal — the request is deferred, never failed.
 
 ```python
 scheduler = create_scheduler(
@@ -91,6 +100,15 @@ while scheduler.has_unfinished:
 `max_num_scheduled_tokens` and `execution.compute.max_num_batched_tokens`, plus
 the sequence cap. `physical_token_slots` applies the runner's padding multiple,
 and `largest_fittable` binary-searches the largest prefill chunk that fits.
+
+The waiting queue is two-level: `add_request`/`_requeue` push into an O(1)
+staging deque, and `schedule()` drains the oldest staging entries into a hot
+window of at most `ayaka.sched.core.HOT_WINDOW_SIZE` (128) entries. Policy
+ranking (`rank_waiting`) and bounded-starvation aging (`order`) run only over
+that window, so per-step queue cost is O(K log K) regardless of backlog depth.
+Ranking hints (`cache_hint_tokens`) are refreshed when entries enter the
+window, not every step. EagerScheduler keeps global ranking over
+`_iter_waiting()` as the deterministic reference.
 
 `policy.rank_waiting` supports `fcfs`, `priority`, `lpm`/`longest_prefix`/
 `cache_affinity`, `lof`/`longest_output`, and `routing_key`; `order()` layers
@@ -124,6 +142,10 @@ sequence release/reporting is deferred until the ticket settles.
   and sampling off the known-token boundary.
 - `BatchStepPlan` is frozen; `sampling_rows` must exactly match slice sampling
   boundaries, and one request has at most one slice per step.
+- Host-contract validation in `sched.plan.__post_init__` is gated on
+  `__debug__`: `python -O` strips it for the hot path, and `StepRuntime.prepare`
+  stays the authoritative oracle. CI runs unoptimized, so tests always exercise
+  the checks.
 - Without a sampling coordinator (`sampling=` on the scheduler) the core stays
   greedy-only and rejects non-greedy requests with `UNSUPPORTED_SAMPLING`. With
   one, `SamplingPlan` flags and the packed active-row map come from

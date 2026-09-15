@@ -2,6 +2,10 @@
 
 These values neither allocate resources nor prove device completion. Physical
 page snapshots become usable only while their execution lease is retained.
+
+Host-contract validation in ``__post_init__`` is compiled out when the
+interpreter runs with ``-O`` (``__debug__`` false); ``StepRuntime.prepare``
+remains the authoritative oracle in that mode.
 """
 
 from dataclasses import dataclass
@@ -41,6 +45,11 @@ __all__ = [
     "StepDependency",
 ]
 
+#: Compile-time validation switch: stripped with ``python -O`` so the hot path
+#: does not pay per-token/per-slice checks at scale. CI runs unoptimized, so
+#: every contract check stays active in tests.
+_VALIDATE = __debug__
+
 
 class Phase(StrEnum):
     """Request semantics; a one-query prefill remains PREFILL."""
@@ -68,6 +77,8 @@ class PromptLogprobSlicePlan:
     positions: tuple[int, ...]
 
     def __post_init__(self) -> None:
+        if not _VALIDATE:
+            return
         require_int(self.slice_index, "prompt logprob slice_index", minimum=0)
         require_int(self.k, "prompt logprob k", minimum=0)
         if type(self.positions) is not tuple:
@@ -101,6 +112,8 @@ class ScheduledSlice:
     sample_last_query: bool = False
 
     def __post_init__(self) -> None:
+        if not _VALIDATE:
+            return
         require_text(self.request_id, "request_id")
         require_int(self.sequence_epoch, "sequence_epoch", minimum=1)
         require_int(self.expected_state_version, "expected_state_version")
@@ -138,6 +151,8 @@ class RequestStepInput:
     max_output_tokens: int
 
     def __post_init__(self) -> None:
+        if not _VALIDATE:
+            return
         require_text(self.request_id, "request_id")
         if not isinstance(self.sequence, SequenceHandle):
             raise TypeError("sequence must be SequenceHandle")
@@ -198,6 +213,8 @@ class KVRequirement:
     request_tokens: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
+        if not _VALIDATE:
+            return
         for name in ("group_id", "append_tokens", "cow_pages", "restore_bytes", "growth_bytes"):
             require_int(getattr(self, name), name)
         request_ids: list[str] = []
@@ -221,6 +238,8 @@ class StepDependency:
     kind: str
 
     def __post_init__(self) -> None:
+        if not _VALIDATE:
+            return
         require_text(self.producer_id, "producer_id")
         require_text(self.kind, "dependency kind")
 
@@ -234,6 +253,8 @@ class DistributedStepIdentity:
     worker_generation: int
 
     def __post_init__(self) -> None:
+        if not _VALIDATE:
+            return
         require_frozen(self, "distributed identity")
         require_int(self.collective_sequence, "collective_sequence")
         require_int(self.worker_generation, "worker_generation")
@@ -274,6 +295,8 @@ class BatchStepPlan:
     created_ns: int = 0
 
     def __post_init__(self) -> None:
+        if not _VALIDATE:
+            return
         require_int(self.step_id, "step_id")
         require_text(self.execution_plan_id, "execution_plan_id")
         require_int(self.padded_num_tokens, "padded_num_tokens")
@@ -416,6 +439,8 @@ class PreparedStep:
     memory_view: ExecutionMemoryView | GroupedExecutionMemoryView
 
     def __post_init__(self) -> None:
+        if not _VALIDATE:
+            return
         if not isinstance(self.execution, ExecutionPlan):
             raise TypeError("execution must be ExecutionPlan")
         if not isinstance(self.step, BatchStepPlan):

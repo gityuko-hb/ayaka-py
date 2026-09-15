@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import time
 from abc import abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING
 
 from ayaka.configs.base import ConfigError
@@ -31,7 +32,13 @@ if TYPE_CHECKING:
     from ayaka.sampling.engine import SamplingCoordinator
     from ayaka.sched.plan import ScheduledSlice
 
-__all__ = ["SchedulerCore"]
+__all__ = ["SchedulerCore", "HOT_WINDOW_SIZE"]
+
+#: Number of eligible candidates kept in the active ranking window. New
+#: requests land in the O(1) staging deque and are drained into this window in
+#: arrival order, so starvation ranking (`order`) and policy sorting only ever
+#: touch a bounded slice of the waiting queue.
+HOT_WINDOW_SIZE = 128
 
 
 class SchedulerCore(BaseScheduler):
@@ -68,11 +75,21 @@ class SchedulerCore(BaseScheduler):
         self._clock = clock or time.monotonic_ns
         self._sampling = sampling
 
-        self._waiting: list[QueueEntry] = []
+        # Two-level waiting queue: staging is an O(1)-append arrival deque;
+        # `_hot` is the bounded ranking window drained in arrival order.
+        # `_waiting_ids` is the O(1) membership/duplicate oracle for both tiers.
+        self._staging: deque[QueueEntry] = deque()
+        self._hot: list[QueueEntry] = []
+        self._waiting_ids: set[str] = set()
         self._prefilling: dict[str, RequestLifecycle] = {}
         self._running: dict[str, RequestLifecycle] = {}
+        # Dense decode ring parallel to `_running`: swap-with-last removal keeps
+        # the array packed without rebuilding per-step lists.
+        self._running_ids: list[str] = []
+        self._running_index: dict[str, int] = {}
         self._sequences: dict[str, SequenceHandle] = {}
-        self._pending: list[RequestReport] = []
+        # One observation per request, keyed for O(1) dedup on report.
+        self._pending: dict[str, RequestReport] = {}
 
         self._inflight: ExecutionTicket | None = None
         self._inflight_request_ids: frozenset[str] = frozenset()
@@ -113,7 +130,7 @@ class SchedulerCore(BaseScheduler):
         sequence = self._allocator.create(lifecycle.request_id)
         lifecycle.bind_sequence(sequence, state_version=0, computed_tokens=0)
         self._sequences[lifecycle.request_id] = sequence
-        self._waiting.append(self._new_queue_entry(lifecycle, sequence))
+        self._waiting_add(self._new_queue_entry(lifecycle, sequence))
         self._queue_report(
             RequestReport(
                 lifecycle.request_id,
@@ -154,6 +171,24 @@ class SchedulerCore(BaseScheduler):
                 "request.sampling.logprobs",
                 "UNSUPPORTED_LOGPROBS",
                 "generation logprobs require a wired SamplingCoordinator",
+            )
+        if params.return_sampling_support and self._sampling is None:
+            raise ConfigError(
+                "request.sampling.return_sampling_support",
+                "UNSUPPORTED_SAMPLING_SUPPORT",
+                "sampling support capture requires a wired SamplingCoordinator",
+            )
+        if params.logit_bias and self._sampling is None:
+            raise ConfigError(
+                "request.sampling.logit_bias",
+                "UNSUPPORTED_LOGIT_BIAS",
+                "logit bias requires a wired SamplingCoordinator",
+            )
+        if params.token_ids_logprobs is not None and self._sampling is None:
+            raise ConfigError(
+                "request.sampling.token_ids_logprobs",
+                "UNSUPPORTED_TOKEN_IDS_LOGPROBS",
+                "token_ids_logprobs require a wired SamplingCoordinator",
             )
         if request.stop.stop_strings and not self._text_stops:
             raise ConfigError(
@@ -259,12 +294,12 @@ class SchedulerCore(BaseScheduler):
         if not self._pending:
             return False
         self._report_step_id += 1
-        pending = tuple(self._pending)
+        pending = tuple(self._pending.values())
         report = SchedulerReport(
             step_id=self._report_step_id,
             reports=pending,
             num_running=len(self._running) + len(self._prefilling),
-            num_waiting=len(self._waiting),
+            num_waiting=len(self._waiting_ids),
             num_preempted_this_step=sum(
                 item.outcome in (RequestOutcome.PREEMPTED_RECOMPUTE, RequestOutcome.PREEMPTED_SWAP)
                 for item in pending
@@ -342,37 +377,102 @@ class SchedulerCore(BaseScheduler):
             sequence=sequence,
         )
 
+    def _waiting_add(self, entry: QueueEntry) -> None:
+        """Append a request to the staging tier in O(1)."""
+        self._staging.append(entry)
+        self._waiting_ids.add(entry.lifecycle.request_id)
+
+    def _waiting_remove(self, request_id: str) -> None:
+        """Drop a request from both tiers in O(window) without rebuilding."""
+        if request_id not in self._waiting_ids:
+            return
+        self._waiting_ids.discard(request_id)
+        hot = self._hot
+        for index, entry in enumerate(hot):
+            if entry.lifecycle.request_id == request_id:
+                del hot[index]
+                return
+        # Still staged: the drain skips it via `_waiting_ids`.
+
+    def _drain_window(self) -> None:
+        """Refill the ranking window from staging in arrival order."""
+        if not self._staging:
+            return
+        capacity = HOT_WINDOW_SIZE - len(self._hot)
+        if capacity <= 0:
+            return
+        admitted: list[QueueEntry] = []
+        ids = self._waiting_ids
+        staging = self._staging
+        while staging and len(admitted) < capacity:
+            entry = staging.popleft()
+            if entry.lifecycle.request_id not in ids:
+                continue  # dropped while staged
+            admitted.append(entry)
+        if admitted:
+            self._hot.extend(admitted)
+            self._refresh_window_hints(admitted)
+
+    def _refresh_window_hints(self, admitted: list[QueueEntry]) -> None:
+        """Ranking-hint refresh hook for entries entering the hot window."""
+
+    def _iter_waiting(self) -> Iterator[QueueEntry]:
+        """All waiting entries (hot ranking window first, then staging)."""
+        yield from self._hot
+        yield from self._staging
+
     def _requeue(self, lifecycle: RequestLifecycle) -> None:
         if lifecycle.is_terminal or lifecycle.token.is_cancelled:
             return
-        if any(entry.lifecycle.request_id == lifecycle.request_id for entry in self._waiting):
+        if lifecycle.request_id in self._waiting_ids:
             return
-        self._waiting.append(
+        self._waiting_add(
             self._new_queue_entry(lifecycle, self._sequences.get(lifecycle.request_id))
         )
 
     def _queue_report(self, report: RequestReport) -> None:
         """Keep at most one pending observation per request/report step."""
-        self._pending = [item for item in self._pending if item.request_id != report.request_id]
-        self._pending.append(report)
+        self._pending[report.request_id] = report
 
     def _check_capacity(self) -> None:
         cap = self._plan.max_num_requests
         if cap is not None and self._requests.num_active >= cap:
             raise OverloadedError(f"max_num_requests={cap} reached")
         queued = self._plan.max_queued_requests
-        if queued is not None and len(self._waiting) >= queued:
+        if queued is not None and len(self._waiting_ids) >= queued:
             raise OverloadedError(f"max_queued_requests={queued} reached")
 
     def _drop_waiting(self, request_id: str) -> None:
-        if self._waiting:
-            self._waiting = [
-                entry for entry in self._waiting if entry.lifecycle.request_id != request_id
-            ]
+        self._waiting_remove(request_id)
+
+    # ------------------------------------------------------------------
+    # Dense running-set maintenance (swap-with-last)
+    # ------------------------------------------------------------------
+
+    def _running_add(self, request_id: str, lifecycle: RequestLifecycle) -> None:
+        """Insert or refresh in the running set, preserving ring order."""
+        if request_id in self._running:
+            self._running[request_id] = lifecycle
+            return
+        self._running[request_id] = lifecycle
+        self._running_index[request_id] = len(self._running_ids)
+        self._running_ids.append(request_id)
+
+    def _running_remove(self, request_id: str) -> None:
+        """Remove in O(1) via swap-with-last so the decode ring stays dense."""
+        if self._running.pop(request_id, None) is None:
+            return
+        index = self._running_index.pop(request_id)
+        last = len(self._running_ids) - 1
+        if index != last:
+            moved = self._running_ids[last]
+            self._running_ids[index] = moved
+            self._running_index[moved] = index
+        self._running_ids.pop()
 
     def _drop(self, request_id: str) -> None:
         self._prefilling.pop(request_id, None)
-        self._running.pop(request_id, None)
+        self._running_remove(request_id)
         self._drop_waiting(request_id)
 
     def _seq_cap(self) -> int:
@@ -447,7 +547,7 @@ class SchedulerCore(BaseScheduler):
 
     @property
     def num_waiting(self) -> int:
-        return len(self._waiting)
+        return len(self._waiting_ids)
 
     @property
     def num_running(self) -> int:
