@@ -1,17 +1,22 @@
-"""MaskPipeline -- trai tim cua thiet ke.
+"""Multi-producer mask pipeline with parallel emit and AND-gather.
 
-A4b — đa producer per logits row:
-  * MỘT entry per (slot, producer). Entry thứ tự khai báo 0 là PRIMARY
-    (window chính, ghi row_indices); các entry sau là SCRATCH: pipeline cấp
-    window riêng sau toàn bộ primary block, producer emit vào đó rồi gather
-    INTERSECT (AND) vào window chính trước upload.
-  * Producers khai Cap.COMMUTATIVE chạy SONG SONG qua thread-pool (mỗi
-    producer một future). Slot có producer thiếu COMMUTATIVE chạy CHUỖI tuần
-    tự theo thứ tự khai báo — một future duy nhất, giữ an toàn state.
-  * draft acceptance của slot = min qua các producer (mỗi producer tự
-    rollback phần accepted của mình nên không cần rollback chéo).
-  * Caps của MaskHandle = AND caps của mọi producer; accepted_per_stream =
-    min accepted count per stream.
+This module is the core of the Tier-1 design and supports multiple producers
+per logits row:
+
+* One entry per ``(slot, producer)``. The entry in declaration order 0 is the
+  PRIMARY: it owns the main window and writes ``row_indices``. Later entries
+  are SCRATCH: the pipeline assigns them private windows after the whole
+  primary block, each producer emits there, and :meth:`MaskPipeline.gather`
+  intersects (AND) scratch windows into the primary window before upload.
+* Producers advertising :attr:`~ayaka.caps.Cap.COMMUTATIVE` run in parallel
+  through a thread pool (one future per producer). A slot with any
+  non-commutative producer runs sequentially in declaration order as a single
+  future, keeping stateful backends safe.
+* Per-slot draft acceptance is the minimum over its producers. Each producer
+  rolls back its own accepted prefix, so no cross-producer rollback is needed.
+* The :class:`~ayaka.sampling.mask.arena.MaskHandle` caps are the AND of all
+  producer caps; ``accepted_per_stream`` is the per-stream minimum accepted
+  count.
 """
 
 from __future__ import annotations
@@ -33,6 +38,24 @@ _SENTINEL_CAP = 1 << 30
 
 @dataclass(slots=True)
 class MaskEntry:
+    """One producer's work item for a single decode step.
+
+    Attributes:
+        producer: Constraint source that fills the assigned window.
+        logits_row: Logits row (slot) this entry constrains.
+        mask_row: First arena row of the assigned window (primary or
+            private scratch window).
+        stream_idx: Stream index used for the ``accepted_per_stream``
+            minimum aggregation.
+        propose_step: Number of speculative draft tokens; the window span
+            is always ``propose_step + 1`` (draft rows plus bonus row).
+        draft: Draft token ids to verify.
+        commit_tokens: Already-sampled tokens to commit before emitting.
+        scratch: True for non-primary entries. Scratch entries emit into a
+            private window that :meth:`MaskPipeline.gather` ANDs into the
+            primary window.
+    """
+
     producer: MaskProducer
     logits_row: int
     mask_row: int
@@ -40,15 +63,26 @@ class MaskEntry:
     propose_step: int = 0
     draft: tuple[int, ...] = ()
     commit_tokens: tuple[int, ...] = ()
-    # A4b — entry scratch: window riêng, AND vào window chính ở gather().
     scratch: bool = False
 
 
 class MaskPipelineError(RuntimeError):
-    pass
+    """Raised for pipeline misuse or producer failures.
+
+    Covers shutdown reuse, double ``launch()`` without ``gather()``,
+    capacity overflow, out-of-range ``stream_idx``, and aggregated
+    producer exceptions from :meth:`MaskPipeline.gather`.
+    """
 
 
 class MaskPipeline:
+    """Emit masks in parallel on CPU, then upload once to GPU.
+
+    The typical cycle per step is ``launch(entries)`` -> ``gather()`` ->
+    ``mark_consumed()``. ``launch`` only submits work to the thread pool;
+    ``gather`` blocks on it, intersects scratch windows, and uploads.
+    """
+
     __slots__ = (
         "_arena",
         "_backend",
@@ -71,6 +105,14 @@ class MaskPipeline:
         *,
         backend: DeviceBackend | None = None,
     ):
+        """Create a pipeline bound to one arena.
+
+        Args:
+            arena: Bitmask arena owning the staging buffers.
+            n_workers: Thread-pool size for parallel producer emit.
+            backend: Device backend for streams/events. Defaults to the
+                global backend.
+        """
         self._arena = arena
         self._backend = backend if backend is not None else get_backend()
         self._pool = ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="ayaka-mask")
@@ -85,6 +127,26 @@ class MaskPipeline:
         self._closed = False
 
     def launch(self, entries: list[MaskEntry], n_streams: int = 0) -> None:
+        """Begin a step by submitting producer work to the pool.
+
+        Groups entries by ``logits_row`` in declaration order, sorts each
+        group primary-first (stable), and submits either one future per
+        producer (all commutative) or a single sequential-chain future
+        (any non-commutative producer). Computes the AND of all producer
+        caps for the resulting handle.
+
+        Args:
+            entries: Work items for this step. May be empty, which resets
+                the pending state.
+            n_streams: Number of streams sized into the
+                ``accepted_per_stream`` accumulator.
+
+        Raises:
+            MaskPipelineError: If the pipeline is shut down, if a previous
+                ``launch()`` has no matching ``gather()``, if primary plus
+                scratch rows exceed arena capacity, or if any
+                ``stream_idx`` is outside ``[0, max(n_streams, 1))``.
+        """
         if self._closed:
             raise MaskPipelineError("pipeline da shutdown")
         if self._pending is not None:
@@ -116,8 +178,8 @@ class MaskPipeline:
         for e in entries:
             handle_caps &= getattr(e.producer, "caps", Cap.NONE)
 
-        # Nhóm theo logits_row, giữ THỨ TỰ KHAI BÁO (insertion order của dict
-        # + sort stable primary-trước).
+        # Group by logits row while preserving declaration order (dict
+        # insertion order plus a stable primary-first sort).
         groups: dict[int, list[MaskEntry]] = {}
         for e in entries:
             groups.setdefault(e.logits_row, []).append(e)
@@ -132,9 +194,7 @@ class MaskPipeline:
             if commutative:
                 for e in ordered:
                     futures.append(
-                        self._pool.submit(
-                            self._emit_entry, e, rows, row_indices, caps, self._lock
-                        )
+                        self._pool.submit(self._emit_entry, e, rows, row_indices, caps, self._lock)
                     )
             else:
                 futures.append(
@@ -166,11 +226,21 @@ class MaskPipeline:
         caps: np.ndarray,
         lock: threading.Lock,
     ) -> None:
+        """Emit one entry: commit, verify draft, fold acceptance, map rows.
+
+        Args:
+            e: Entry to emit.
+            rows: Arena CPU view for the active parity buffer.
+            row_indices: CPU row-index array to fill for primary entries.
+            caps: Per-stream accepted-count accumulator (min-reduced).
+            lock: Guards the read-modify-write min update, which races
+                when two producers share a stream.
+        """
         if e.commit_tokens:
             e.producer.commit(e.commit_tokens)
         span = e.propose_step + 1
         cap = e.producer.emit(e.draft, rows.window(e.mask_row, span))
-        with lock:  # min read-modify-write — 2 producer cùng stream có race
+        with lock:
             caps[e.stream_idx] = min(int(caps[e.stream_idx]), int(cap))
         if not e.scratch:
             for k in range(span):
@@ -185,7 +255,19 @@ class MaskPipeline:
         caps: np.ndarray,
         lock: threading.Lock,
     ) -> None:
-        """Chuỗi tuần tự (thứ tự khai báo); acceptance = min qua producers."""
+        """Emit a non-commutative slot sequentially in declaration order.
+
+        Args:
+            entries: Primary-first ordered entries of one slot.
+            rows: Arena CPU view for the active parity buffer.
+            row_indices: CPU row-index array; only the primary window is
+                mapped.
+            caps: Per-stream accepted-count accumulator (min-reduced).
+            lock: Guards the min update for consistency with
+                :meth:`_emit_entry`.
+
+        Acceptance for the slot is the minimum over its producers.
+        """
         accepted_min = _SENTINEL_CAP
         for e in entries:
             if e.commit_tokens:
@@ -194,12 +276,31 @@ class MaskPipeline:
             cap = e.producer.emit(e.draft, rows.window(e.mask_row, span))
             accepted_min = min(accepted_min, int(cap))
         primary = entries[0]
-        with lock:  # min read-modify-write nhất quán với _emit_entry
+        with lock:
             caps[primary.stream_idx] = min(int(caps[primary.stream_idx]), accepted_min)
         for k in range(primary.propose_step + 1):
             row_indices[primary.mask_row + k] = primary.logits_row + k
 
     def gather(self, compute_stream: Any = None) -> MaskHandle | None:
+        """Wait for pending producers, intersect scratch, and upload.
+
+        Scratch windows are ANDed into their primary window on the same
+        parity buffer handed out by ``launch`` (no second ``begin_step``),
+        then the primary rows are uploaded on the copy stream.
+
+        Args:
+            compute_stream: Optional compute stream that must wait on the
+                upload readiness event before consuming the handle.
+
+        Returns:
+            A :class:`MaskHandle` with GPU tensors, aggregate caps, and
+            per-stream acceptance; None when nothing was launched or the
+            step has zero rows.
+
+        Raises:
+            MaskPipelineError: If any producer future raised; the first
+                error is chained as the cause.
+        """
         if self._pending is None:
             return None
         futs, self._pending = self._pending, None
@@ -209,8 +310,6 @@ class MaskPipeline:
         n_rows = self._n_rows
         if n_rows == 0:
             return None
-        # A4b — intersect scratch windows vào window chính (AND) TRƯỚC upload;
-        # cùng parity buffer với launch — không gọi begin_step lần hai.
         rows_ref = self._rows_np
         if self._scratch_groups and rows_ref is not None:
             for primary_base, span, scratch_bases in self._scratch_groups:
@@ -231,9 +330,19 @@ class MaskPipeline:
         )
 
     def mark_consumed(self, compute_stream: Any = None) -> None:
+        """Forward the consumed marker to the arena.
+
+        Args:
+            compute_stream: Stream whose completion releases the active
+                parity buffer. None selects the default.
+        """
         self._arena.mark_consumed(compute_stream)
 
     def shutdown(self) -> None:
+        """Shut down the worker pool and destroy the copy stream.
+
+        Idempotent: repeated calls are no-ops.
+        """
         if self._closed:
             return
         self._closed = True

@@ -1,74 +1,454 @@
-"""Repetition / frequency / presence penalty — COORDINATE-BASED, không dense.
+"""ayaka/sampling/ops — logit adjustment before mask/temperature/sample.
 
-SGLang materialize logit_bias thành tensor (batch_size, vocab_size) trên GPU.
-Với B=256, V=152K, fp32 = 155 MB cho dữ liệu 99.99% là 0. rtp-llm làm tệ hơn:
-dense u8 [B,V] trên PAGEABLE memory, cấp phát lại mỗi step.
+The four sections below follow pipeline execution order:
 
-Ở đây state là (row, token, count) thưa. Chi phí O(số token duy nhất đã sinh)
-thay vì O(B×V).
-
---- BẢN VÁ (so với file gốc đã review) ---
-
-1. unrecord() — rollback cho speculative decoding. record() optimistic-update
-   khi draft token được đề xuất; nếu draft bị reject, phải undo. Fail-closed:
-   unrecord token chưa từng record là lỗi logic ở caller — raise thay vì im
-   lặng bỏ qua. Không cho count âm.
-
-2. Repetition penalty (sign-branch) áp trên log-softmax đã chuẩn hoá thay vì
-   logit thô — loại gauge dependence (arXiv 2607.09791): TRỪ logsumexp(row)
-   trước khi so dấu/nhân-chia, rồi CỘNG LẠI để giữ scale cho phần logit không
-   đụng tới. logsumexp TOÀN ROW cho row có rep > 0 — tính qua row_logsumexp
-   (ops/fused_stats.py, Triton 1-pass, một lượt đọc/row).
-
-3. A1 — delta-flush, KHÔNG dict Python per-slot. record/unrecord/reset/move
-   chỉ ENQUEUE delta trên host, O(delta), không lookup. coords()/coords_
-   padded() gọi _flush() MỘT lần/step: gộp delta theo (slot, token) → lookup
-   vị trí entry trên bảng device → index_put_(accumulate=True) cho entry cũ,
-   cấp entry mới cho token chưa có, compact các entry count→0 (tổng quát hoá
-   swap-remove). Bảng device: cols [B, cap] int64, cnts [B, cap] fp32, n_used
-   [B] int64; entry thật gọn trong [0, n_used), không thứ tự.
-
-   SEMANTIC DELTA so với bản dict (tuyến tính nên CHỈ khác ở điểm raise):
-   count CUỐI khớp chạy tuần tự từng delta; "unrecord token chưa từng
-   record" raise LÚC FLUSH và CHỈ khi net âm với token vắng mặt — pattern
-   (record t; unrecord t) cùng step là net 0 ⇒ no-op, không raise (đúng nhu
-   cầu optimistic draft-reject).
-
-4. coords_padded() — shape TỈNH [n_active, cap] + valid — cho CUDA graph
-   capture. Không còn max_unique: bảng device chính là bound.
-
-5. A2 — promote dense: slot có occupancy chạm per_slot_cap được SCATTER sang
-   một row dense [max_dense_slots, V] (mặc định 4); delta về sau đi thẳng
-   vào dense (new = old + net). coords()/coords_padded() LOẠI row dense khỏi
-   phần thưa. per_slot_cap mặc định = promote_fraction × vocab (0.25·V) —
-   "ngưỡng" thể hiện qua kích thước bảng, không phải một phép kiểm tra
-   runtime riêng (và nhờ vậy flush không phải sync đọc occupancy mỗi step).
-   Pool đầy → fail-closed raise.
-
-6. MỘT nguồn công thức duy nhất: apply_penalties_ dựng coords rồi đi vào
-   cùng _apply_penalties_core với apply_penalties_padded_ — công thức
-   rep/freq/pres viết đúng một lần, ở đường graph-capturable.
+    FUSED_STATS (shared primitive, never runs on its own — only called)
+        ↓
+    BIAS        — "custom ops → BIAS → penalties → mask → ..."
+        ↓
+    PENALTIES   — "... → BIAS → penalties → mask → ..."
+        ↓
+    DRY         — n-gram repetition penalty, in the same "logit adjustment"
+                  group as penalties (except it follows HISTORY ORDER, not
+                  frequency) — NO canonical bit-exact reference yet, see the
+                  original note in the DRY section.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 
 import torch
 
 from ayaka.sampling.metadata import SamplingMetadata
-from ayaka.sampling.ops.fused_stats import row_logsumexp
 
-__all__ = ["PenaltyState", "apply_penalties_", "apply_penalties_padded_"]
+try:  # pragma: no cover
+    from ayaka.kernel.triton.sampling.fused import _HAS_TRITON_FUSED, row_logsumexp_gpu
+except Exception:  # pragma: no cover
+    _HAS_TRITON_FUSED = False
+    row_logsumexp_gpu = None
+
+__all__ = [
+    "row_logsumexp",
+    "BiasState",
+    "apply_bias_",
+    "apply_bias_padded_",
+    "PenaltyState",
+    "apply_penalties_",
+    "apply_penalties_padded_",
+    "dry_bias",
+    "apply_dry_",
+]
+
+
+# row_logsumexp — ONE source for per-row penalty stats
+# Dispatch: Triton (kernel/triton/sampling/fused.py) on CUDA, torch fallback
+# otherwise. Both paths share semantics:
+#   * row_gate=None: logsumexp over all rows;
+#   * row_gate given: only rows with gate > 0 are read and get nonzero lse;
+#     remaining rows get lse = 0 — AVOIDS the old nonzero + index_select copy.
+#
+# fp32 accumulation regardless of input logits dtype (matches old version:
+# sub.to(float32)).
+
+
+def _row_logsumexp_torch(logits: torch.Tensor, row_gate: torch.Tensor | None) -> torch.Tensor:
+    """Pure-torch fallback — oracle for the Triton path, no host sync.
+
+    Args:
+        logits: [n_rows, vocab] logits of any float dtype.
+        row_gate: Optional [n_rows] gate; only rows with gate > 0 are
+            computed, the rest get lse = 0. None computes every row.
+
+    Returns:
+        Float32 [n_rows] per-row logsumexp (0 for gated-off rows).
+    """
+    n = logits.size(0)
+    if row_gate is None:
+        return torch.logsumexp(logits.to(torch.float32), dim=-1)
+    gate = row_gate != 0
+    lse = torch.zeros(n, dtype=torch.float32, device=logits.device)
+    if bool(gate.any()):
+        lse[gate] = torch.logsumexp(logits[gate].to(torch.float32), dim=-1)
+    return lse
+
+
+def row_logsumexp(logits: torch.Tensor, *, row_gate: torch.Tensor | None = None) -> torch.Tensor:
+    """Per-row logsumexp with optional gating — see the module docstring.
+
+    Args:
+        logits: [n_rows, vocab] logits of any float dtype.
+        row_gate: [n_rows] gate (bool or numeric) — only rows with gate > 0
+            are computed; None computes all rows.
+
+    Returns:
+        Float32 [n_rows]; lse is 0 for gated-off rows.
+
+    Raises:
+        ValueError: If ``logits`` is not 2-D or ``row_gate`` length
+            mismatches the row count.
+    """
+    if logits.dim() != 2:
+        raise ValueError(f"logits must be 2-D [n, V], got shape {tuple(logits.shape)}")
+    if row_gate is not None and row_gate.size(0) != logits.size(0):
+        raise ValueError(f"row_gate size {row_gate.size(0)} != logits rows {logits.size(0)}")
+    if _HAS_TRITON_FUSED and row_logsumexp_gpu is not None and logits.is_cuda:  # pragma: no cover
+        result: torch.Tensor = row_logsumexp_gpu(logits, row_gate)
+        return result
+    return _row_logsumexp_torch(logits, row_gate)
+
+
+class BiasState:
+    """Per-slot (token, bias) table, device [B, cap] table plus host pending.
+
+    Set-once semantics: :meth:`set` overwrites the whole slot entry (no
+    accumulated delta). :meth:`move`/:meth:`reset` mirror PenaltyState for
+    the slot lifecycle.
+
+    Attributes:
+        max_batch_size: Maximum slot count (device table rows).
+        per_slot_cap: Maximum bias entries per slot (device table columns).
+        vocab_size: Optional vocabulary size used to validate token ids.
+    """
+
+    __slots__ = (
+        "_cols",
+        "_device",
+        "_pending",
+        "_vals",
+        "max_batch_size",
+        "per_slot_cap",
+        "vocab_size",
+    )
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        *,
+        vocab_size: int | None = None,
+        per_slot_cap: int = 128,
+        device: torch.device | None = None,
+    ) -> None:
+        """Create an empty bias table.
+
+        Args:
+            max_batch_size: Number of slots (device table rows).
+            vocab_size: Optional vocabulary size for token-id validation.
+            per_slot_cap: Maximum bias entries per slot.
+            device: Device holding the tables. Defaults to CPU.
+
+        Raises:
+            ValueError: If ``max_batch_size`` or ``per_slot_cap`` is not > 0.
+        """
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be > 0")
+        if per_slot_cap <= 0:
+            raise ValueError("per_slot_cap must be > 0")
+        self.max_batch_size = max_batch_size
+        self.vocab_size = vocab_size
+        self.per_slot_cap = per_slot_cap
+        self._device = (
+            torch.device(device) if isinstance(device, str) else device
+        ) or torch.device("cpu")
+        self._cols = torch.full(
+            (max_batch_size, per_slot_cap), -1, dtype=torch.int64, device=self._device
+        )
+        self._vals = torch.zeros(
+            max_batch_size, per_slot_cap, dtype=torch.float32, device=self._device
+        )
+        self._pending: dict[str, list[tuple]] = {}
+
+    # ------------------------------------------------------------------
+    # Structural contract
+    # ------------------------------------------------------------------
+    def set(self, slot: int, bias: Mapping[int, float]) -> None:
+        """Record ``(token, bias)`` entries for one slot.
+
+        Overwrites the slot's previous entry.
+
+        Args:
+            slot: Slot index to overwrite.
+            bias: Mapping of token id to additive bias.
+
+        Raises:
+            IndexError: If ``slot`` is out of range.
+            ValueError: If the entry count exceeds ``per_slot_cap``, a token
+                id is outside ``vocab_size``, or a bias is non-finite.
+        """
+        if not 0 <= slot < self.max_batch_size:
+            raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
+        items = sorted((int(token), float(value)) for token, value in bias.items())
+        if len(items) > self.per_slot_cap:
+            raise ValueError(
+                f"logit_bias has {len(items)} tokens exceeding per_slot_cap="
+                f"{self.per_slot_cap} — raise per_slot_cap when constructing BiasState"
+            )
+        for token, value in items:
+            if self.vocab_size is not None and not 0 <= token < self.vocab_size:
+                raise ValueError(f"token id {token} out of range [0, vocab_size={self.vocab_size})")
+            if not torch.isfinite(torch.tensor(value)).item():
+                raise ValueError(f"bias for token {token} must be finite")
+        self._pending.setdefault("ops", []).append(("set", slot, items))
+
+    def reset(self, slot: int) -> None:
+        """Clear all bias entries for one slot (deferred until flush).
+
+        Args:
+            slot: Slot index to clear.
+
+        Raises:
+            IndexError: If ``slot`` is out of range.
+        """
+        if not 0 <= slot < self.max_batch_size:
+            raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
+        self._pending.setdefault("ops", []).append(("reset", slot))
+
+    def move(self, src: int, dst: int) -> None:
+        """Move the bias entry from ``src`` slot to ``dst`` slot.
+
+        Args:
+            src: Source slot index.
+            dst: Destination slot index.
+
+        Raises:
+            IndexError: If either slot is out of range.
+        """
+        if not (0 <= src < self.max_batch_size and 0 <= dst < self.max_batch_size):
+            raise IndexError("move slot out of range")
+        if src != dst:
+            self._pending.setdefault("ops", []).append(("move", src, dst))
+
+    def count(self, slot: int) -> int:
+        """Return the biased-token count for one slot.
+
+        Flushes pending ops before reading.
+
+        Args:
+            slot: Slot index to query.
+
+        Returns:
+            Number of bias entries currently stored for the slot.
+
+        Raises:
+            IndexError: If ``slot`` is out of range.
+        """
+        self._flush()
+        if not 0 <= slot < self.max_batch_size:
+            raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
+        return int((self._cols[slot] >= 0).sum().item())
+
+    # ------------------------------------------------------------------
+    # Coords
+    # ------------------------------------------------------------------
+    def bias_coords_padded(
+        self, active_slots: Sequence[int] | int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return static [n_active, cap] coords (packed rows, slot-space cols).
+
+        Mirrors :meth:`PenaltyState.coords_padded`: rows are PACKED; entries
+        are gathered by ``active_slots`` (or int n = identity). Padding uses
+        cols=0, vals=0 — apply forces padding delta to 0 via ``valid``.
+
+        Args:
+            active_slots: Slot ids in packed order, or int n for identity
+                slots ``[0, n)``.
+            device: Device for the returned tensors.
+
+        Returns:
+            Tuple ``(rows, cols, vals, valid)`` of static [n_active, cap]
+            tensors; ``valid`` marks real entries.
+        """
+        self._flush()
+        if isinstance(active_slots, int):
+            slots = torch.arange(active_slots, dtype=torch.long, device=self._device)
+        else:
+            slots = torch.tensor(
+                [int(s) for s in active_slots], dtype=torch.long, device=self._device
+            )
+        n = slots.numel()
+        cap = self.per_slot_cap
+        rows = torch.arange(n, device=self._device, dtype=torch.long).unsqueeze(1).expand(n, cap)
+        if n:
+            cols = self._cols.index_select(0, slots)
+            vals = self._vals.index_select(0, slots)
+        else:
+            cols = self._cols.narrow(0, 0, 0)
+            vals = self._vals.narrow(0, 0, 0)
+        valid = (cols >= 0) if n else torch.zeros((0, cap), dtype=torch.bool, device=self._device)
+        if device != self._device:
+            rows = rows.to(device)
+            cols = cols.to(device)
+            vals = vals.to(device)
+            valid = valid.to(device)
+        return rows, cols, vals, valid
+
+    # ------------------------------------------------------------------
+    # Flush pipeline (pending host → device tables)
+    # ------------------------------------------------------------------
+    def _flush(self) -> None:
+        """Flush queued host ops into the device tables."""
+        ops = self._pending.pop("ops", None)
+        if not ops:
+            return
+        for op in ops:
+            if op[0] == "set":
+                _, slot, items = op
+                self._cols[slot].fill_(-1)
+                self._vals[slot].zero_()
+                if items:
+                    toks = torch.tensor(
+                        [t for t, _ in items], dtype=torch.long, device=self._device
+                    )
+                    bias = torch.tensor(
+                        [b for _, b in items], dtype=torch.float32, device=self._device
+                    )
+                    self._cols[slot, : len(items)] = toks
+                    self._vals[slot, : len(items)] = bias
+            elif op[0] == "reset":
+                _, slot = op
+                self._cols[slot].fill_(-1)
+                self._vals[slot].zero_()
+            else:  # move
+                _, src, dst = op
+                self._cols[dst] = self._cols[src]
+                self._vals[dst] = self._vals[src]
+                self._cols[src].fill_(-1)
+                self._vals[src].zero_()
+
+
+def apply_bias_(logits: torch.Tensor, md: SamplingMetadata, state: BiasState) -> torch.Tensor:
+    """Add bias into logits in place. Runs BEFORE mask and BEFORE penalties.
+
+    Delta-through-index_put_(accumulate=True) — same pattern as penalties:
+    padding (valid=False) forces delta 0 so aliased padding (row, col) pairs
+    are harmless; real (row, col) pairs are unique per set so accumulate never
+    double-counts.
+
+    Rows are PACKED; entries are per SLOT via
+    ``bias_coords_padded(md.active_rows)``.
+
+    Args:
+        logits: [n_active, V] logits to adjust in place.
+        md: Sampling metadata giving the active batch.
+        state: Bias table to apply.
+
+    Returns:
+        The same ``logits`` tensor, adjusted in place.
+
+    Raises:
+        ValueError: If ``logits`` rows do not match ``md.n_active``.
+    """
+    n = md.n_active
+    if logits.size(0) != n:
+        raise ValueError(
+            f"logits.size(0)={logits.size(0)} != md.n_active={n} — logits must "
+            "match the metadata batch (packed sampling order)"
+        )
+    if n == 0:
+        return logits
+    rows, cols, vals, valid = state.bias_coords_padded(md.active_rows or n, logits.device)
+    if not bool(valid.any().item()):
+        return logits
+    delta = torch.where(valid, vals, torch.zeros_like(vals))
+    flat_rows = rows.reshape(-1)
+    flat_cols = cols.reshape(-1)
+    flat_delta = delta.reshape(-1).to(logits.dtype)
+    if flat_rows.numel():
+        logits.index_put_((flat_rows, flat_cols), flat_delta, accumulate=True)
+    return logits
+
+
+def apply_bias_padded_(
+    logits: torch.Tensor,
+    md: SamplingMetadata,
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    vals: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """Graph-capturable variant — takes ``bias_coords_padded`` output directly.
+
+    Accepts the static [B, cap] output of :meth:`BiasState.bias_coords_padded`
+    directly instead of gathering coords inside the captured region.
+
+    Args:
+        logits: [n_active, V] logits to adjust in place.
+        md: Sampling metadata giving the active batch.
+        rows: Static [B, cap] packed row indices.
+        cols: Static [B, cap] token columns.
+        vals: Static [B, cap] bias values.
+        valid: Static [B, cap] mask marking real entries.
+
+    Returns:
+        The same ``logits`` tensor, adjusted in place.
+
+    Raises:
+        ValueError: If ``logits`` rows do not match ``md.n_active``.
+    """
+    if logits.size(0) != md.n_active:
+        raise ValueError("logits rows must match md.n_active")
+    delta = torch.where(valid, vals, torch.zeros_like(vals)).reshape(-1)
+    flat_rows = rows.reshape(-1)
+    flat_cols = cols.reshape(-1)
+    if flat_rows.numel():
+        logits.index_put_((flat_rows, flat_cols), delta.to(logits.dtype), accumulate=True)
+    return logits
+
+
+# Repetition / frequency / presence penalty over a sparse (row, token, count)
+# table: per-step cost scales with O(unique generated tokens), not O(B x V).
+#
+# Design notes:
+#
+# 1. `unrecord()` rolls back optimistic `record()` calls from speculative
+#    decoding. Unrecording a never-recorded token is a caller bug and raises
+#    fail-closed; counts never go negative.
+#
+# 2. The repetition penalty (sign branch) runs on normalized log-softmax, not
+#    raw logits: subtract the row logsumexp before the sign compare /
+#    multiply-divide, then add it back to preserve the scale of untouched
+#    logits. The logsumexp comes from `row_logsumexp` in the FUSED_STATS
+#    section above.
+#
+# 3. Delta-flush with no per-slot Python dict: `record` / `unrecord` /
+#    `reset` / `move` only enqueue host deltas — O(delta), no lookup.
+#    `coords()` / `coords_padded()` call `_flush()` once per step to merge
+#    deltas by (slot, token), update the device tables (`cols` [B, cap] int64,
+#    `cnts` [B, cap] fp32, `n_used` [B] int64; live entries packed in
+#    [0, n_used), unordered), and compact entries whose count reaches zero.
+#    "Unrecord a never-recorded token" raises at flush time, and only for a
+#    net-negative delta on an absent token — (record t; unrecord t) within one
+#    step nets to zero and is a no-op.
+#
+# 4. `coords_padded()` returns a static [n_active, cap] shape plus a `valid`
+#    mask for CUDA graph capture; the device table itself is the bound.
+#
+# 5. Dense promotion: a slot whose occupancy reaches `per_slot_cap` (default
+#    `promote_fraction x vocab`) is scattered to a dense row of
+#    `[max_dense_slots, V]`; later deltas apply straight to dense. `coords()`
+#    / `coords_padded()` exclude promoted rows from the sparse part. A full
+#    pool raises fail-closed.
+#
+# 6. Single formula source: `apply_penalties_` builds coords and enters the
+#    same `_apply_penalties_core` as `apply_penalties_padded_` — the
+#    rep/freq/pres formula is written exactly once, on the graph-capturable
+#    path.
 
 
 class PenaltyState:
-    """Đếm token đã sinh, per-slot, bảng device [B, cap] + delta host.
+    """Generated-token counts, per slot, device [B, cap] tables plus host delta.
 
-    Hợp đồng structural (record/unrecord/reset/move) giữ nguyên từ bản port;
-    state nội bộ là bảng device — host work mỗi step phẳng theo |delta|,
-    không theo số unique token tích luỹ.
+    The structural contract (record/unrecord/reset/move) is unchanged from the
+    port; the internal state is device tables — per-step host work scales with
+    |delta|, not with the accumulated unique-token count.
+
+    Attributes:
+        max_batch_size: Maximum slot count.
+        per_slot_cap: Maximum sparse entries per slot before dense promotion.
+        promote_fraction: Fraction of ``vocab_size`` used as the default
+            ``per_slot_cap``.
+        vocab_size: Optional vocabulary size for dense-pool allocation.
     """
 
     __slots__ = (
@@ -97,10 +477,28 @@ class PenaltyState:
         max_dense_slots: int = 4,
         device: torch.device | None = None,
     ) -> None:
+        """Create an empty penalty table.
+
+        Args:
+            max_batch_size: Number of slots.
+            vocab_size: Optional vocabulary size; required to allocate the
+                dense pool on promotion.
+            per_slot_cap: Maximum sparse entries per slot. Defaults to
+                ``ceil(promote_fraction * vocab_size)`` (or 512 without
+                ``vocab_size``).
+            promote_fraction: Fraction of vocab used for the default cap.
+            max_dense_slots: Dense-pool rows; 0 disables dense promotion.
+            device: Device holding the tables. Defaults to CPU.
+
+        Raises:
+            ValueError: If ``max_batch_size`` is not > 0, ``vocab_size`` or
+                ``per_slot_cap`` is not > 0 when given, or ``max_dense_slots``
+                is negative.
+        """
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be > 0")
         if vocab_size is not None and vocab_size <= 0:
-            raise ValueError("vocab_size phải > 0 khi có")
+            raise ValueError("vocab_size must be > 0 when given")
         self.max_batch_size = max_batch_size
         self.vocab_size = vocab_size
         self.promote_fraction = promote_fraction
@@ -110,10 +508,10 @@ class PenaltyState:
         if per_slot_cap is None:
             per_slot_cap = max(1, math.ceil(promote_fraction * vocab_size)) if vocab_size else 512
         if per_slot_cap <= 0:
-            raise ValueError("per_slot_cap phải > 0")
+            raise ValueError("per_slot_cap must be > 0")
         self.per_slot_cap = per_slot_cap
         if max_dense_slots < 0:
-            raise ValueError("max_dense_slots phải >= 0")
+            raise ValueError("max_dense_slots must be >= 0")
 
         cap = per_slot_cap
         self._cols = torch.zeros(max_batch_size, cap, dtype=torch.int64, device=self._device)
@@ -128,9 +526,18 @@ class PenaltyState:
         self._pending: list[tuple] = []
 
     # ------------------------------------------------------------------
-    # Structural contract — enqueue host delta, O(delta), không lookup
+    # Structural contract — enqueue host deltas, O(delta), no lookup
     # ------------------------------------------------------------------
     def record(self, slot: int, tokens: Iterable[int]) -> None:
+        """Record generated tokens for one slot (deferred until flush).
+
+        Args:
+            slot: Slot index.
+            tokens: Token ids to count (+1 each).
+
+        Raises:
+            IndexError: If ``slot`` is out of range.
+        """
         if not 0 <= slot < self.max_batch_size:
             raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
         pending = self._pending
@@ -138,9 +545,19 @@ class PenaltyState:
             pending.append(("delta", slot, int(token), 1))
 
     def unrecord(self, slot: int, tokens: Iterable[int]) -> None:
-        """Undo record() — rollback speculative decode. Delta -1 được enqueue;
-        token thiếu (net âm với token vắng trong bảng) raise LÚC _flush() —
-        xem SEMANTIC DELTA ở docstring module."""
+        """Undo :meth:`record` — speculative-decode rollback.
+
+        A -1 delta is enqueued; a missing token (net-negative delta for an
+        absent token) raises at :meth:`_flush` time — see note 3 in the
+        PENALTIES section header.
+
+        Args:
+            slot: Slot index.
+            tokens: Token ids to un-count (-1 each).
+
+        Raises:
+            IndexError: If ``slot`` is out of range.
+        """
         if not 0 <= slot < self.max_batch_size:
             raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
         pending = self._pending
@@ -148,18 +565,47 @@ class PenaltyState:
             pending.append(("delta", slot, int(token), -1))
 
     def reset(self, slot: int) -> None:
+        """Clear all counts for one slot, including any dense row.
+
+        Args:
+            slot: Slot index to clear.
+
+        Raises:
+            IndexError: If ``slot`` is out of range.
+        """
         if not 0 <= slot < self.max_batch_size:
             raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
         self._pending.append(("reset", slot))
 
     def move(self, src: int, dst: int) -> None:
+        """Move counts from ``src`` slot to ``dst`` slot.
+
+        Keeps dense ownership: a promoted row changes ownership to ``dst``
+        with counts preserved.
+
+        Args:
+            src: Source slot index.
+            dst: Destination slot index.
+
+        Raises:
+            IndexError: If either slot is out of range.
+        """
         if not (0 <= src < self.max_batch_size and 0 <= dst < self.max_batch_size):
             raise IndexError("move slot out of range")
         if src != dst:
             self._pending.append(("move", src, dst))
 
     def unique_tokens(self, n_active: int) -> int:
-        """Số token unique đang đếm của n_active row đầu (sparse + dense)."""
+        """Return the unique counted tokens of the first ``n_active`` rows.
+
+        Covers both sparse and dense parts.
+
+        Args:
+            n_active: Number of leading rows to count.
+
+        Returns:
+            Total unique-token count over those rows.
+        """
         if n_active <= 0:
             return 0
         self._flush()
@@ -173,7 +619,20 @@ class PenaltyState:
         return sparse + dense
 
     def count(self, slot: int, token: int) -> int:
-        """Occurrences of ``token`` recorded for ``slot`` (prompt + output)."""
+        """Return occurrences of ``token`` recorded for ``slot``.
+
+        Covers prompt plus output tokens.
+
+        Args:
+            slot: Slot index to query.
+            token: Token id to look up.
+
+        Returns:
+            Recorded count (0 when absent).
+
+        Raises:
+            IndexError: If ``slot`` is out of range.
+        """
         if not 0 <= slot < self.max_batch_size:
             raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
         self._flush()
@@ -190,23 +649,65 @@ class PenaltyState:
         return int(self._cnts[slot, int(hit[0])].item())
 
     # ------------------------------------------------------------------
-    # Coords — MỘT flush/step, boolean-index trên device
+    # Coords — ONE flush/step, boolean-index on device
     # ------------------------------------------------------------------
+    @staticmethod
+    def _as_slots(active_slots: Sequence[int] | int) -> torch.Tensor:
+        """Normalize ``active_slots`` to a 1-D slot tensor.
+
+        Args:
+            active_slots: Slot ids in packed order, or int n for identity
+                slots ``[0, n)``.
+
+        Returns:
+            Long tensor of slot ids.
+
+        Raises:
+            ValueError: If any slot id is negative.
+        """
+        if isinstance(active_slots, int):
+            return torch.arange(active_slots, dtype=torch.long)
+        slots = torch.tensor([int(s) for s in active_slots], dtype=torch.long)
+        if bool(torch.any(slots < 0).item()):
+            raise ValueError("active_slots must be >= 0")
+        return slots
+
     def coords(
-        self, n_active: int, device: torch.device
+        self, active_slots: Sequence[int] | int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compact [N] coords cho phần THƯA; row promoted cho rỗng (dense xử
-        lý riêng qua dense branch). N = tổng unique sparse."""
+        """Return compact [N] coords for the SPARSE part.
+
+        Promoted rows yield empty coords (dense rows apply separately via the
+        dense branch). N = total sparse uniques.
+
+        ``active_slots`` is a SLOT list in packed order (or int n = identity
+        slots [0, n)). Returned rows are PACKED indices (0..n-1) — callers
+        index straight into packed logits/md.active. State is stored per slot;
+        LIFO/mixed-batch slot reuse makes packed != slot, hence this list.
+
+        Args:
+            active_slots: Slot ids in packed order, or int n for identity.
+            device: Device for the returned tensors.
+
+        Returns:
+            Tuple ``(rows, cols, cnts)`` of compact 1-D coords.
+        """
         self._flush()
-        if n_active <= 0:
+        slots = self._as_slots(active_slots)
+        n = slots.numel()
+        if n <= 0:
             empty = torch.empty(0, dtype=torch.long, device=device)
             cnts = torch.empty(0, dtype=torch.float32, device=device)
             return empty, empty, cnts
-        keep = self._keep_mask(n_active)
-        b_idx = keep.nonzero(as_tuple=True)[0].to(torch.long)
-        rows = b_idx
-        cols = self._cols.narrow(0, 0, n_active)[keep]
-        cnts = self._cnts.narrow(0, 0, n_active)[keep]
+        cols_sel = self._cols.index_select(0, slots)
+        cnts_sel = self._cnts.index_select(0, slots)
+        used = self._n_used.index_select(0, slots)
+        keep = (
+            torch.arange(self.per_slot_cap, device=self._device).unsqueeze(0) < used.unsqueeze(1)
+        ) & (cnts_sel > 0)
+        rows = keep.nonzero(as_tuple=True)[0].to(torch.long)
+        cols = cols_sel[keep]
+        cnts = cnts_sel[keep]
         if device != self._device:
             rows = rows.to(device)
             cols = cols.to(device)
@@ -214,28 +715,42 @@ class PenaltyState:
         return rows, cols, cnts
 
     def coords_padded(
-        self, n_active: int, device: torch.device
+        self, active_slots: Sequence[int] | int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Shape TỈNH [n_active, cap] + valid — cho CUDA graph capture.
+        """Return static [n_active, cap] coords + valid for CUDA graph capture.
 
-        `valid` [n_active, cap] bool: True cho entry thật. Padding đặt
-        cols=0/cnts=0; apply_penalties_padded_ ép delta padding = 0 qua
-        `valid`, KHÔNG dựa vào (row, col) padding trỏ tới đâu. Không cần
-        max_unique: bảng device chính là bound — occupancy một slot không
-        thể vượt per_slot_cap (promote/fail-closed trước khi tràn).
+        Rows are PACKED indices (0..n-1); entries are gathered by
+        ``active_slots`` (slot space — uses index_select, not narrow, so slot
+        reuse keeps working). ``valid`` [n_active, cap] bool marks real
+        entries. Padding uses cols=0/cnts=0; apply_penalties_padded_ forces
+        padding delta to 0 via ``valid`` instead of relying on where padding
+        (row, col) points. No max_unique needed: the device table itself is
+        the bound — one slot's occupancy cannot exceed per_slot_cap
+        (promote/fail-closed happens first).
+
+        Args:
+            active_slots: Slot ids in packed order, or int n for identity.
+            device: Device for the returned tensors.
+
+        Returns:
+            Tuple ``(rows, cols, cnts, valid)`` of static [n_active, cap]
+            tensors.
         """
         self._flush()
-        n = max(n_active, 0)
+        slots = self._as_slots(active_slots)
+        n = slots.numel()
         rows = (
-            torch.arange(n, device=self._device, dtype=torch.long)
+            torch.arange(max(n, 0), device=self._device, dtype=torch.long)
             .unsqueeze(1)
-            .expand(n, self.per_slot_cap)
+            .expand(max(n, 0), self.per_slot_cap)
         )
-        cols = self._cols.narrow(0, 0, n)
-        cnts = self._cnts.narrow(0, 0, n)
-        valid = torch.arange(self.per_slot_cap, device=self._device).unsqueeze(
-            0
-        ) < self._n_used.narrow(0, 0, n).unsqueeze(1)
+        cols = self._cols.index_select(0, slots) if n else self._cols.narrow(0, 0, 0)
+        cnts = self._cnts.index_select(0, slots) if n else self._cnts.narrow(0, 0, 0)
+        valid = torch.arange(self.per_slot_cap, device=self._device).unsqueeze(0) < (
+            self._n_used.index_select(0, slots)
+            if n
+            else torch.empty(0, dtype=torch.long, device=self._device)
+        ).unsqueeze(1)
         if device != self._device:
             rows = rows.to(device)
             cols = cols.to(device)
@@ -244,31 +759,48 @@ class PenaltyState:
         return rows, cols, cnts, valid
 
     # ------------------------------------------------------------------
-    # Dense pool (A2)
+    # Dense pool
     # ------------------------------------------------------------------
     @property
     def dense_slot_ids(self) -> torch.Tensor:
-        """[max_dense_slots] int64 — logits row của mỗi dense slot, -1 = trống."""
+        """[max_dense_slots] int64 — logits row of each dense slot, -1 = free."""
         return self._dense_slot_ids
 
     @property
     def dense_counts(self) -> torch.Tensor | None:
-        """[max_dense_slots, vocab] fp32, hoặc None khi pool chưa cấp."""
+        """[max_dense_slots, vocab] fp32, or None when the pool is unallocated."""
         return self._dense_cnts
 
     def _dense_index_of(self, slot: int) -> int | None:
+        """Return the dense-pool row for ``slot``.
+
+        Args:
+            slot: Slot index to look up.
+
+        Returns:
+            Dense-pool index, or None when the slot is still sparse.
+        """
         for i in range(self._dense_slot_ids.size(0)):
             if int(self._dense_slot_ids[i].item()) == slot:
                 return i
         return None
 
     def _ensure_dense_pool(self) -> torch.Tensor:
+        """Allocate the dense pool on first promotion and return it.
+
+        Returns:
+            The ``[max_dense_slots, vocab]`` dense-count table.
+
+        Raises:
+            ValueError: If the state was built without ``vocab_size`` so a
+                dense row cannot be represented.
+        """
         if self._dense_cnts is None:
             if not self.vocab_size:
                 raise ValueError(
-                    "PenaltyState được tạo mà không có vocab_size nên không "
-                    "thể promote sang dense — tăng per_slot_cap hoặc truyền "
-                    "vocab_size khi dựng state."
+                    "PenaltyState was created without vocab_size so it cannot "
+                    "promote to dense — raise per_slot_cap or pass "
+                    "vocab_size when constructing the state."
                 )
             self._dense_cnts = torch.zeros(
                 self._dense_slot_ids.size(0),
@@ -279,11 +811,22 @@ class PenaltyState:
         return self._dense_cnts
 
     def _promote(self, slot: int) -> int:
-        """Scatter bảng thưa của slot sang một row dense; trả dense index."""
+        """Scatter one slot's sparse table into a dense row.
+
+        Args:
+            slot: Slot index to promote.
+
+        Returns:
+            Dense-pool index assigned to the slot.
+
+        Raises:
+            ValueError: If the dense pool is full (fail-closed) or a token id
+                lies outside ``[0, vocab_size)``.
+        """
         if self._dense_used >= self._dense_slot_ids.size(0):
             raise ValueError(
-                f"dense pool đầy ({self._dense_used} slot) — fail-closed, "
-                "không âm thầm bỏ penalty; tăng max_dense_slots."
+                f"dense pool is full ({self._dense_used} slots) — fail-closed, "
+                "refusing to silently drop penalties; raise max_dense_slots."
             )
         dense = self._ensure_dense_pool()
         d_idx = self._dense_used
@@ -292,8 +835,8 @@ class PenaltyState:
             toks = self._cols[slot, :used]
             if int(toks.max().item()) >= (self.vocab_size or 0) or int(toks.min().item()) < 0:
                 raise ValueError(
-                    "token id ngoài [0, vocab_size) khi promote — state không "
-                    "thể biểu diễn dense cho token này"
+                    "token id out of [0, vocab_size) during promote — the state "
+                    "cannot represent this token densely"
                 )
             dense[d_idx].index_add_(0, toks, self._cnts[slot, :used])
         self._n_used[slot] = 0
@@ -306,6 +849,11 @@ class PenaltyState:
     # Flush pipeline
     # ------------------------------------------------------------------
     def _flush(self) -> None:
+        """Flush queued host deltas, resets, and moves into device tables.
+
+        Deltas are batched between structural ops; compaction runs once at
+        the end.
+        """
         if not self._pending:
             return
         pending = self._pending
@@ -313,6 +861,7 @@ class PenaltyState:
         batch: list[tuple[int, int, int]] = []
 
         def apply_batch() -> None:
+            """Flush the accumulated delta batch into the device tables."""
             if batch:
                 self._apply_delta_batch(batch)
                 batch.clear()
@@ -330,6 +879,13 @@ class PenaltyState:
         self._compact()
 
     def _apply_reset(self, slot: int) -> None:
+        """Apply one queued reset for ``slot``.
+
+        Frees any dense row owned by the slot.
+
+        Args:
+            slot: Slot index to reset.
+        """
         self._n_used[slot] = 0
         self._cnts[slot].zero_()
         d_idx = self._dense_index_of(slot)
@@ -341,6 +897,14 @@ class PenaltyState:
             self._dense_members.discard(slot)
 
     def _apply_move(self, src: int, dst: int) -> None:
+        """Apply one queued move from ``src`` to ``dst``.
+
+        A dense row (if any) transfers ownership to ``dst`` with counts kept.
+
+        Args:
+            src: Source slot index.
+            dst: Destination slot index.
+        """
         d_idx = self._dense_index_of(src)
         self._cols[dst].copy_(self._cols[src])
         self._cnts[dst].copy_(self._cnts[src])
@@ -348,24 +912,39 @@ class PenaltyState:
         self._n_used[src] = 0
         self._cnts[src].zero_()
         if d_idx is not None:
-            # Row dense chuyển QUYỀN cho dst — counts giữ nguyên, không xoá.
+            # A dense row transfers OWNERSHIP to dst — counts kept, not cleared.
             self._dense_slot_ids[d_idx] = dst
             self._dense_members.discard(src)
             self._dense_members.add(dst)
 
     def _keep_mask(self, n_active: int) -> torch.Tensor:
-        """[n_active, cap] bool — entry thật của phần thưa."""
+        """Return the ``[n_active, cap]`` live-entry mask of the sparse part.
+
+        Args:
+            n_active: Number of leading rows to mask.
+
+        Returns:
+            Bool mask marking live sparse entries.
+        """
         return (
             torch.arange(self.per_slot_cap, device=self._device).unsqueeze(0)
             < self._n_used.narrow(0, 0, n_active).unsqueeze(1)
         ) & (self._cnts.narrow(0, 0, n_active) > 0)
 
     def _apply_delta_batch(self, batch: list[tuple[int, int, int]]) -> None:
-        """Gộp delta theo (slot, token), lookup trên bảng device, cập nhật.
+        """Merge deltas by (slot, token), look up on the device table, update.
 
-        Sync CHỈ khi có net âm (unrecord) hoặc bound chạm cap — đường
-        record-thuần (steady state) không sync. Lookup là so sánh thuần
-        device ([U, cap]); U = |delta gộp| của step nên O(delta).
+        Syncs ONLY on net-negative (unrecord) deltas or when the allocation
+        bound hits cap — the pure-record steady-state path never syncs.
+        Lookup is pure-device comparison ([U, cap]); U = merged |delta| of the
+        step, hence O(delta).
+
+        Args:
+            batch: List of ``(slot, token, count)`` deltas.
+
+        Raises:
+            KeyError: If an unrecord delta exceeds the stored count.
+            ValueError: If promotion fails (propagated from :meth:`_promote`).
         """
         net: dict[tuple[int, int], int] = {}
         for slot, token, c in batch:
@@ -379,7 +958,7 @@ class PenaltyState:
         toks = torch.tensor([p[1] for p in pairs], dtype=torch.long, device=self._device)
         nets = torch.tensor([p[2] for p in pairs], dtype=torch.long, device=self._device)
 
-        # Lookup: token nằm trong entry đang dùng của slot? (thuần device)
+        # Lookup: is the token in the slot's live entries? (pure device)
         rows = self._cols.index_select(0, slots)
         in_used = torch.arange(self.per_slot_cap, device=self._device).unsqueeze(
             0
@@ -388,8 +967,9 @@ class PenaltyState:
         found = match.any(dim=1)
         pos = match.to(torch.long).argmax(dim=1)
 
-        # Overflow: bound host (mọi pair net>0 đều có thể là alloc mới) chạm
-        # cap mới kiểm tra thật; slot thật sự cần cấp thêm → promote dense.
+        # Overflow: a host bound (every net>0 pair may need a fresh entry)
+        # hitting cap triggers the real check; slots truly needing more
+        # entries → dense promotion.
         alloc_bound = torch.bincount(slots[nets > 0], minlength=self.max_batch_size)
         pressure = (self._n_used + alloc_bound) > self.per_slot_cap
         if bool(pressure.any().item()):
@@ -408,8 +988,8 @@ class PenaltyState:
             if is_dense[i]
         ]
 
-        # Validation phần sparse (dense tự validate trong _apply_dense_pairs):
-        # net âm phải khớp count hiện có, không cho count âm.
+        # Sparse-side validation (dense validates itself in _apply_dense_pairs):
+        # net-negative deltas must fit the stored count, never go negative.
         if bool((nets < 0).any().item()):
             old = torch.zeros(len(pairs), dtype=torch.float32, device=self._device)
             fi = [i for i in range(len(pairs)) if (not is_dense[i]) and f_list[i]]
@@ -424,12 +1004,12 @@ class PenaltyState:
             if bool(bad.any().item()):
                 i = int(torch.nonzero(bad)[0])
                 raise KeyError(
-                    f"unrecord token {int(t_list[i])} ở slot {int(s_list[i])} "
-                    "nhưng không đủ count trong bảng (chưa từng record hoặc "
-                    "đã unrecord hết) — khả năng cao là bug ở caller."
+                    f"unrecord token {int(t_list[i])} at slot {int(s_list[i])} "
+                    "with insufficient count in the table (never recorded or "
+                    "fully unrecorded) — likely a caller bug."
                 )
 
-        # Sparse: cập nhật entry cũ (pos unique per slot).
+        # Sparse: update old entries (positions unique per slot).
         upd = [
             i for i in range(len(pairs)) if (not is_dense[i]) and f_list[i] and int(n_list[i]) != 0
         ]
@@ -443,8 +1023,9 @@ class PenaltyState:
             )
             self._cnts.index_put_((u_slot, u_pos), u_new, accumulate=True)
 
-        # Sparse: cấp entry mới cho token chưa có — vị trí = n_used + rank
-        # trong nhóm cùng slot (sort stable), không đụng entry cũ.
+        # Sparse: allocate new entries for unseen tokens — position = n_used +
+        # rank within the same-slot group (stable sort), never colliding with
+        # old entries.
         alloc = [
             i
             for i in range(len(pairs))
@@ -485,8 +1066,16 @@ class PenaltyState:
             self._apply_dense_pairs(dense_pairs)
 
     def _apply_dense_pairs(self, dense_pairs: list[tuple[int, int, int]]) -> None:
-        """Delta cho slot đã promote: new = old + net qua index_put_ thường
-        (pair unique theo (slot, token) nên không cần accumulate)."""
+        """Apply deltas for promoted slots via plain index_put_.
+
+        Pairs are unique per (slot, token), so no accumulation is needed.
+
+        Args:
+            dense_pairs: List of ``(slot, token, net)`` deltas for dense rows.
+
+        Raises:
+            KeyError: If a delta would drive a dense count negative.
+        """
         dense = self._ensure_dense_pool()
         ids = self._dense_slot_ids.tolist()
         d_rows = [ids.index(s) for s, _, _ in dense_pairs]
@@ -500,17 +1089,18 @@ class PenaltyState:
         if bool((new < 0).any().item()):
             i = int(torch.nonzero(new < 0)[0])
             raise KeyError(
-                f"unrecord token {int(toks[i])} ở slot {int(self._dense_slot_ids[d_idx[i]])} "
-                "nhưng không đủ count trong bảng dense — khả năng cao là bug ở caller."
+                f"unrecord token {int(toks[i])} at slot {int(self._dense_slot_ids[d_idx[i]])} "
+                "with insufficient count in the dense table — likely a caller bug."
             )
         dense.index_put_((d_idx, toks), new)
 
     def _compact(self) -> None:
-        """Compact per slot: entry count→0 bị loại, phần còn lại dồn về đầu.
+        """Compact per slot: drop zero-count entries, pack survivors to front.
 
-        Tổng quát hoá swap-remove cho nhiều lần xoá trong cùng một flush —
-        sort stable theo key "còn sống đứng trước" giữ thứ tự tương đối;
-        toàn bộ trên device, không host sync."""
+        Generalizes swap-remove to multiple deletions in one flush — stable
+        sort by a "live-first" key keeps relative order; fully on device, no
+        host sync.
+        """
         b, cap = self._cols.shape
         if b == 0 or cap == 0:
             return
@@ -530,12 +1120,40 @@ class PenaltyState:
 
 
 def _canonicalize_rep_logsumexp(logits: torch.Tensor, rep_full: torch.Tensor) -> torch.Tensor:
-    """logsumexp theo row cho các row có rep_penalty > 0, 0 cho row còn lại.
+    """Per-row logsumexp for rows with rep_penalty > 0, 0 for the rest.
 
-    A3 — MỘT lượt đọc/row: row_logsumexp (ops/fused_stats.py) nhận row_gate
-    trực tiếp trên device — KHÔNG torch.nonzero (host sync ngầm) và KHÔNG
-    index_select materialize bản copy [active × V] như bản cũ."""
+    ONE read per row: `row_logsumexp` in the FUSED_STATS section above takes
+    row_gate directly on device — NO torch.nonzero (implicit host sync) and NO
+    index_select materializing an [active x V] copy like the old version.
+
+    Args:
+        logits: [n_rows, V] logits.
+        rep_full: [n_rows] per-row repetition penalties used as the gate.
+
+    Returns:
+        Float32 [n_rows] logsumexp (0 for rows without repetition penalty).
+    """
     return row_logsumexp(logits, row_gate=rep_full)
+
+
+def _slot_map(md: SamplingMetadata) -> torch.Tensor | None:
+    """Return the slot → packed-row map [max_batch_size], or None when identity.
+
+    BiasState/PenaltyState store state per SLOT; logits/md.active are per
+    PACKED row. When ``set_active_rows`` is non-identity (LIFO slot reuse,
+    mixed batch), this map is required — otherwise penalty/bias hits the
+    wrong row.
+
+    Args:
+        md: Sampling metadata holding the active-row mapping.
+
+    Returns:
+        Long slot→packed map, or None for the identity mapping.
+    """
+    active = md.active_rows
+    if active is None:
+        return None
+    return torch.tensor(active, dtype=torch.long, device=md.device)
 
 
 def _apply_penalties_core(
@@ -547,13 +1165,29 @@ def _apply_penalties_core(
     valid: torch.Tensor,
     dense_cnts: torch.Tensor | None,
     dense_slot_ids: torch.Tensor | None,
+    slot_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Công thức penalty — MỘT bản duy nhất, dùng chung hai đường.
+    """Penalty formula — ONE single copy shared by both paths.
 
-    rows/cols/cnt: [N] hoặc [B, S]; valid cùng shape. Padding (valid=False)
-    có thể alias entry thật → ghi DELTA (new - old) qua
-    index_put_(accumulate=True): cộng dồn có thứ tự cho index trùng, delta
-    padding ép 0 — cộng 0 vào đâu cũng an toàn."""
+    rows/cols/cnt: [N] or [B, S]; valid has the same shape. Padding
+    (valid=False) may alias a real entry → write DELTA (new - old) via
+    index_put_(accumulate=True): ordered accumulation for duplicate indices,
+    padding delta forced to 0 — adding 0 anywhere is safe.
+
+    Args:
+        logits: [n_active, V] logits adjusted in place.
+        md: Sampling metadata with per-row penalty weights.
+        rows: Packed row indices ([N] or [B, S]).
+        cols: Token columns matching ``rows``.
+        cnt: Per-coord generation counts.
+        valid: Same-shape mask marking real entries.
+        dense_cnts: Optional dense-pool counts for promoted slots.
+        dense_slot_ids: Optional dense-pool slot ids.
+        slot_map: Optional slot → packed map for dense ids.
+
+    Returns:
+        The same ``logits`` tensor, adjusted in place.
+    """
     rep_full = md.active("rep_penalty")
     freq_full = md.active("freq_penalty")
     pres_full = md.active("pres_penalty")
@@ -576,19 +1210,24 @@ def _apply_penalties_core(
     new_vals = torch.where(rep_row > 0, penalized + lse_row, old_vals)
     new_vals = new_vals - freq * cnt_f - pres * (cnt_f > 0).to(new_vals.dtype)
 
-    # inf/nan có thể xuất hiện ở nhánh KHÔNG được chọn — an toàn vì
-    # torch.where không lan NaN/Inf từ nhánh không chọn, và delta ép 0 ngay.
+    # inf/nan may appear in the UNTAKEN branch — safe because torch.where does
+    # not propagate NaN/Inf from the untaken branch, and delta is forced to 0.
     delta = torch.where(valid_f, new_vals - old_vals, torch.zeros_like(new_vals))
     if rows_f.numel():
         logits.index_put_((rows_f, cols_f), delta.to(logits.dtype), accumulate=True)
 
-    # A2 — dense branch: row đã promote áp trực tiếp trên toàn [V].
+    # dense branch: promoted rows apply directly over the full [V].
     if dense_cnts is not None and dense_slot_ids is not None:
         d = dense_slot_ids.size(0)
         n_rows = logits.size(0)
         if d and n_rows:
-            act = (dense_slot_ids >= 0) & (dense_slot_ids < n_rows)
             sid = dense_slot_ids.clamp_min(0)
+            if slot_map is not None:
+                # Dense ids are SLOTs — map to packed logits rows.
+                sid = slot_map.index_select(0, sid.clamp_max(slot_map.size(0) - 1))
+            act = (dense_slot_ids >= 0) & (
+                dense_slot_ids < (slot_map.size(0) if slot_map is not None else n_rows)
+            )
             rep = rep_full.index_select(0, sid) * act.to(rep_full.dtype)
             freq_d = freq_full.index_select(0, sid) * act.to(freq_full.dtype)
             pres_d = pres_full.index_select(0, sid) * act.to(pres_full.dtype)
@@ -599,8 +1238,8 @@ def _apply_penalties_core(
             penalized_d = torch.where(
                 shifted_d < 0, shifted_d * rep.unsqueeze(1), shifted_d / rep.unsqueeze(1)
             )
-            # rep branch CHỈ đụng token đã được đếm (cnt > 0) — khớp sparse:
-            # coords chỉ tồn tại cho token có count.
+            # The rep branch ONLY touches counted tokens (cnt > 0) — matches
+            # sparse: coords exist only for tokens with count.
             counted = (cnt_d > 0) & (rep.unsqueeze(1) > 0)
             v_new = torch.where(counted, penalized_d + lse_d, v_old)
             v_new = (
@@ -626,30 +1265,48 @@ def _apply_penalties_core(
 def apply_penalties_(
     logits: torch.Tensor, md: SamplingMetadata, state: PenaltyState
 ) -> torch.Tensor:
-    """In-place. CHẠY TRƯỚC MASK — xem ghi chú NEG_INF trong ops/bitmask.py.
+    """Apply penalties in place. Runs BEFORE mask — see NEG_INF in ops/sampling
+    (BITMASK section).
 
-    rep: sign-branch áp trên log-softmax đã chuẩn hoá (xem docstring module).
-    freq/pres: giữ nguyên additive/subtractive như bản gốc.
+    rep: sign-branch on normalized log-softmax (see the module docstring).
+    freq/pres: unchanged additive/subtractive form from the original.
 
-    Thân hàm dựng coords (1D compact, đã flush) rồi đi vào
-    _apply_penalties_core — cùng đường với apply_penalties_padded_."""
+    Builds compact 1-D coords (flushed) then enters _apply_penalties_core —
+    the same path as apply_penalties_padded_. State coords are in SLOT space;
+    md.active is PACKED — `_slot_map` translates slot → packed when the
+    active-row map is non-identity.
+
+    Args:
+        logits: [n_active, V] logits adjusted in place.
+        md: Sampling metadata with penalty weights.
+        state: Penalty counts to apply.
+
+    Returns:
+        The same ``logits`` tensor, adjusted in place.
+
+    Raises:
+        ValueError: If ``logits`` rows do not match ``md.n_active``.
+    """
     n = md.n_active
     if logits.size(0) != n:
         raise ValueError(
-            f"logits.size(0)={logits.size(0)} != md.n_active={n} — caller đưa "
-            "nhầm logits không khớp batch của metadata (vd đã slice logits mà "
-            "quên slice md/state theo cùng tập row). Fail-closed thay vì "
-            "IndexError khó hiểu ở bước sau."
+            f"logits.size(0)={logits.size(0)} != md.n_active={n} — caller passed "
+            "mismatched logits for the metadata batch (e.g. sliced logits without "
+            "slicing md/state over the same row set). Fail-closed instead of a "
+            "confusing downstream IndexError."
         )
     if n == 0 or not md.any_penalty:
         return logits
-    rows, cols, cnt = state.coords(n, logits.device)
+    rows, cols, cnt = state.coords(md.active_rows or n, logits.device)
     dense_cnts = state.dense_counts if state._dense_used else None
     dense_ids = state.dense_slot_ids if state._dense_used else None
     if rows.numel() == 0 and dense_cnts is None:
         return logits
     valid = torch.ones(rows.numel(), dtype=torch.bool, device=rows.device)
-    return _apply_penalties_core(logits, md, rows, cols, cnt, valid, dense_cnts, dense_ids)
+    slot_map = _slot_map(md)
+    return _apply_penalties_core(
+        logits, md, rows, cols, cnt, valid, dense_cnts, dense_ids, slot_map
+    )
 
 
 def apply_penalties_padded_(
@@ -663,13 +1320,148 @@ def apply_penalties_padded_(
     dense_cnts: torch.Tensor | None = None,
     dense_slot_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Biến thể graph-capturable của apply_penalties_ — nhận trực tiếp output
-    của PenaltyState.coords_padded() (2D [B, S] tĩnh) thay vì tự gọi coords()
-    (coords() dynamic-shape, không được gọi trong graph).
+    """Graph-capturable variant of apply_penalties_ — takes padded coords directly.
 
-    Slot đã promote sang dense KHÔNG xuất hiện trong coords_padded — caller
-    PHẢI truyền dense_cnts/dense_slot_ids (cùng shape tĩnh) để phần dense
-    được áp trong vùng capture; thiếu chúng thì penalty của row dense bị bỏ
-    qua — với apply_penalties_ điều đó không thể xảy ra (nó luôn truyền).
+    Takes the static 2-D [B, S] output of :meth:`PenaltyState.coords_padded`
+    instead of calling ``coords()`` (``coords()`` is dynamic-shape and must
+    not run inside a graph).
+
+    Slots promoted to dense do NOT appear in coords_padded — the caller MUST
+    pass dense_cnts/dense_slot_ids (same static shape) so the dense part still
+    applies inside the capture region; omitting them silently drops dense-row
+    penalties — with apply_penalties_ that cannot happen (it always passes
+    them).
+
+    Args:
+        logits: [n_active, V] logits adjusted in place.
+        md: Sampling metadata with penalty weights.
+        rows: Static packed row indices.
+        cols: Static token columns.
+        cnt: Static per-coord counts.
+        valid: Static mask marking real entries.
+        dense_cnts: Optional static dense-pool counts.
+        dense_slot_ids: Optional static dense-pool slot ids.
+
+    Returns:
+        The same ``logits`` tensor, adjusted in place.
     """
     return _apply_penalties_core(logits, md, rows, cols, cnt, valid, dense_cnts, dense_slot_ids)
+
+
+# DRY ("Don't Repeat Yourself") — penalizes the token that would EXTEND a
+# repeated n-gram, unlike the PENALTIES section above (which penalizes by
+# token FREQUENCY, ignoring order/pattern).
+#
+# NO canonical reference for bit-exact comparison yet (Ayaka has no Rust or
+# reference DRY build — unlike the GUMBEL/MIROSTAT sections of ops/sampling,
+# which are ports from ayaka-sampling). The (multiplier, base, allowed_length) parameters follow the
+# common llama.cpp/koboldcpp convention — RE-VERIFY if exact parity with a
+# specific implementation is required.
+#
+# Algorithm: for each history position i (0 <= i < T-1), measure the backward
+# match length k between history[i-k:i] and history[T-k:T] (the current tail).
+# When k reaches allowed_length, token history[i] (the token that once
+# "followed" that matched pattern) gets
+# penalty = multiplier * base^(k - allowed_length). When several positions
+# penalize one token, take the MAX (no accumulation).
+#
+# DELIBERATELY written as a Python loop (O(B x T x max_ngram), not vectorized)
+# — this is a reference oracle, not the hot path. Unlike PenaltyState (which
+# already delta-flushes on device tables), DRY needs HISTORY ORDER, so it keeps
+# the host loop; it is a later optimization/kernelization candidate only if
+# profiling says so, not now.
+
+
+def dry_bias(
+    history: list[list[int]],
+    vocab_size: int,
+    multiplier: torch.Tensor,
+    base: torch.Tensor,
+    allowed_length: torch.Tensor,
+    *,
+    max_ngram: int = 32,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Compute the [B, V] DRY bias (<= 0) to ADD into logits.
+
+    Unlike `apply_penalties_` this is never a sign-branch — DRY is always
+    additive, so it has no gauge-dependence concern.
+
+    Args:
+        history: Per-request generated token ids, in EXACT ORDER (unlike
+            PenaltyState — DRY needs order, not just frequency).
+        vocab_size: Vocabulary size (bias width).
+        multiplier: [B] per-row penalty scale.
+        base: [B] per-row exponential base.
+        allowed_length: [B] per-row match length before penalizing.
+        max_ngram: Maximum backward match length to consider.
+        device: Device for the returned bias. Defaults to CPU.
+
+    Returns:
+        ``[B, V]`` non-positive bias to add into logits.
+    """
+    b = len(history)
+    bias = torch.zeros(b, vocab_size, device=device)
+    mult = multiplier.tolist()
+    bse = base.tolist()
+    allow = allowed_length.tolist()
+
+    for row, hist in enumerate(history):
+        t = len(hist)
+        if t < 2:
+            continue
+        cap = min(max_ngram, t - 1)
+        al = int(allow[row])
+        for i in range(t - 1):
+            k = 0
+            while (
+                k < cap
+                and i - 1 - k >= 0
+                and (t - 1 - k) >= 0
+                and hist[i - 1 - k] == hist[t - 1 - k]
+            ):
+                k += 1
+            if k >= al:
+                tok = hist[i]
+                penalty = mult[row] * (bse[row] ** (k - al))
+                if -penalty < bias[row, tok]:
+                    bias[row, tok] = -penalty
+    return bias
+
+
+def apply_dry_(
+    logits: torch.Tensor,
+    history: list[list[int]],
+    multiplier: torch.Tensor,
+    base: torch.Tensor,
+    allowed_length: torch.Tensor,
+    *,
+    max_ngram: int = 32,
+) -> torch.Tensor:
+    """Apply DRY penalties in place, additively.
+
+    Needs no canonicalization like the rep branch of apply_penalties_ because
+    this is not a sign-branch on raw logits.
+
+    Args:
+        logits: [B, V] logits adjusted in place.
+        history: Per-request generated token ids in exact order.
+        multiplier: [B] per-row penalty scale.
+        base: [B] per-row exponential base.
+        allowed_length: [B] per-row match length before penalizing.
+        max_ngram: Maximum backward match length to consider.
+
+    Returns:
+        The same ``logits`` tensor, adjusted in place.
+    """
+    bias = dry_bias(
+        history,
+        logits.size(1),
+        multiplier,
+        base,
+        allowed_length,
+        max_ngram=max_ngram,
+        device=logits.device,
+    )
+    logits += bias
+    return logits

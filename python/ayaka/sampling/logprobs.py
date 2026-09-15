@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
+from ayaka.sampling.ops.sampling import filter_probs
 import torch
 
 from ayaka.utils.import_utils import CapabilityError
@@ -349,8 +350,6 @@ def compute_sampling_logprobs(
         )
     if len(ks) != processed_logits.size(0):
         raise ValueError(f"ks must have {processed_logits.size(0)} entries, got {len(ks)}")
-
-    from ayaka.sampling.ops.topk_topp import filter_probs
 
     selected = selected_tokens.to(torch.long)
     scaled = processed_logits.to(torch.float32) / temperature.clamp_min(1e-6).unsqueeze(1)

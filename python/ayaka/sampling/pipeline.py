@@ -20,13 +20,16 @@ trên distribution thật dùng để sample.
 
 from __future__ import annotations
 
+from ayaka.sampling.ops.sampling import (
+    apply_allow_bitmask_,
+    gumbel_sample,
+    softmax_stats_scaled,
+    topk_topp_sample,
+)
 import torch
 
 from ayaka.sampling.metadata import SamplingMetadata
-from ayaka.sampling.ops.bitmask import apply_allow_bitmask_
-from ayaka.sampling.ops.gumbel import gumbel_sample
 from ayaka.sampling.ops.penalties import PenaltyState, apply_penalties_
-from ayaka.sampling.ops.topk_topp import softmax_stats_scaled, topk_topp_sample
 
 STAGES = ("penalty", "bitmask", "temperature", "stats", "filter_sample")
 
