@@ -65,6 +65,7 @@ class SamplingMetadata:
         "_rows_stg",
         "_stg",
         "all_greedy",
+        "any_logprobs",
         "any_penalty",
         "device",
         "max_batch_size",
@@ -92,6 +93,7 @@ class SamplingMetadata:
         self.n_active = 0
         self.all_greedy = True
         self.any_penalty = False
+        self.any_logprobs = False
 
         self._reset_range(0, max_batch_size)
         self._dirty.clear()
@@ -247,6 +249,7 @@ class SamplingMetadata:
         if n == 0:
             self.all_greedy = True
             self.any_penalty = False
+            self.any_logprobs = False
             return
         rows = self._rows_cpu()
 
@@ -263,6 +266,21 @@ class SamplingMetadata:
             or torch.any(column("freq_penalty") != 0.0).item()
             or torch.any(column("pres_penalty") != 0.0).item()
         )
+        self.any_logprobs = bool(torch.any(column("logprobs_k") >= 0).item())
+
+    def host_scalar(self, name: str, slot: int) -> int | float:
+        """Host staging value for one slot — no device sync, no active-row map.
+
+        The runner reads reporting parameters (logprobs k, mode) straight from
+        staging: they are decided at admission and only need host visibility.
+        """
+        if not 0 <= slot < self.max_batch_size:
+            raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
+        try:
+            staging = self._stg[name]
+        except KeyError:
+            raise KeyError(f"no sampling column {name!r}; columns are {ALL_COLUMNS}") from None
+        return staging[slot].item()
 
     def flush(self, stream: Any = None) -> int:
         if self.n_active == 0:

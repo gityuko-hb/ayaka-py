@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+from ayaka.sampling.logprobs import LogprobMode
+
 TOP_K_DISABLED: Final[int] = -1
 
 
@@ -13,6 +15,11 @@ class SamplingParams:
     ``seed=None`` means "draw from the engine RNG"; a concrete int makes the
     request bitwise reproducible only when it also lands alone in its batch,
     because reduction order in a batched kernel is not stable across shapes.
+
+    ``logprobs``/``prompt_logprobs`` are reporting requests, never sampling
+    inputs: enabling them must not change sampled tokens. See
+    ``ayaka.sampling.logprobs`` for mode semantics; unsupported combinations
+    are rejected at admission, never silently ignored.
     """
 
     temperature: float = 1.0
@@ -26,6 +33,7 @@ class SamplingParams:
     n: int = 1
     logprobs: int | None = None  # top-k logprobs to return, None = off
     prompt_logprobs: int | None = None
+    logprob_mode: LogprobMode = LogprobMode.RAW
 
     def __post_init__(self) -> None:
         if self.temperature < 0.0:
@@ -38,6 +46,15 @@ class SamplingParams:
             raise ValueError("min_p must be in [0, 1]")
         if self.n < 1:
             raise ValueError("n must be >= 1")
+        if self.logprobs is not None and self.logprobs < 0:
+            raise ValueError("logprobs must be None or >= 0")
+        if self.prompt_logprobs is not None and self.prompt_logprobs < 0:
+            raise ValueError("prompt_logprobs must be None or >= 0")
+        if not isinstance(self.logprob_mode, LogprobMode):
+            if isinstance(self.logprob_mode, str):
+                object.__setattr__(self, "logprob_mode", LogprobMode(self.logprob_mode))
+            else:
+                raise TypeError("logprob_mode must be LogprobMode")
 
     @property
     def is_greedy(self) -> bool:

@@ -4,6 +4,7 @@ from typing import Final
 
 import torch
 
+from ayaka.sampling.logprobs import LOGPROBS_DISABLED, MODE_ORDINALS
 from ayaka.sampling.params import SamplingParams
 from ayaka.sampling.rng import derive_seed as _derive_seed
 
@@ -15,7 +16,12 @@ F32_COLUMNS: Final[tuple[str, ...]] = (
     "freq_penalty",
     "pres_penalty",
 )
-I32_COLUMNS: Final[tuple[str, ...]] = ("top_k",)
+I32_COLUMNS: Final[tuple[str, ...]] = (
+    "top_k",
+    "logprobs_k",
+    "prompt_logprobs_k",
+    "logprob_mode",
+)
 I64_COLUMNS: Final[tuple[str, ...]] = ("seed", "offset")
 
 ALL_COLUMNS: Final[tuple[str, ...]] = F32_COLUMNS + I32_COLUMNS + I64_COLUMNS
@@ -41,6 +47,11 @@ def columns_of(params: SamplingParams, *, request_index: int = 0) -> ColumnValue
         "freq_penalty": params.frequency_penalty,
         "pres_penalty": params.presence_penalty,
         "top_k": TOP_K_DISABLED if params.top_k < 0 else params.top_k,
+        "logprobs_k": LOGPROBS_DISABLED if params.logprobs is None else params.logprobs,
+        "prompt_logprobs_k": (
+            LOGPROBS_DISABLED if params.prompt_logprobs is None else params.prompt_logprobs
+        ),
+        "logprob_mode": MODE_ORDINALS[params.logprob_mode],
         "seed": seed,
         "offset": 0,
     }

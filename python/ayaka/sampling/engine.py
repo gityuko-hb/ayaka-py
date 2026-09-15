@@ -8,7 +8,8 @@ request) to the persistent slot store in ``SamplingMetadata``:
   * each step calls ``plan_for(slices)`` to pin the active-row map -- stable
     slot indices in packed sampling order -- and to freeze the ``SamplingPlan``
     *before* the forward pass;
-  * the runner calls ``flush`` then ``sample`` on the logits rows;
+  * the runner calls ``flush`` then ``sample`` on the logits rows; results stay
+    device-resident until the completion boundary materializes them;
   * after ``CompletionCoordinator`` commits output tokens, the scheduler calls
     ``record_published`` so penalty state sees prompt + output tokens (vLLM
     semantics) without optimistic recording or rollback.
@@ -26,6 +27,7 @@ from typing import Any, Protocol
 import torch
 
 from ayaka.plan import SamplingPlan
+from ayaka.sampling.logprobs import MODE_ORDINALS, LogprobMode
 from ayaka.sampling.metadata import SamplingMetadata
 from ayaka.sampling.ops.penalties import PenaltyState
 from ayaka.sampling.params import SamplingParams
@@ -81,6 +83,7 @@ class SamplingCoordinator:
         max_batch_size: int,
         *,
         device: torch.device | None = None,
+        vocab_size: int | None = None,
         penalty_state: PenaltyState | None = None,
         need_stats: bool = False,
     ) -> None:
@@ -88,7 +91,11 @@ class SamplingCoordinator:
             raise ValueError("max_batch_size must be > 0")
         self.max_batch_size = max_batch_size
         self.md = SamplingMetadata(max_batch_size, device=device)
-        self.penalty_state = penalty_state or PenaltyState(max_batch_size)
+        self.penalty_state = penalty_state or PenaltyState(
+            max_batch_size,
+            vocab_size=vocab_size,
+            device=self.md.device,
+        )
         self.planner = SamplingPlanner(max_batch_size)
         self.sampler = Sampler(penalty_state=self.penalty_state, need_stats=need_stats)
         self._request_to_slot: dict[str, int] = {}
@@ -178,8 +185,12 @@ class SamplingCoordinator:
         plan: SamplingPlan,
         *,
         force_reference: bool = False,
-    ) -> tuple[int, ...]:
-        """Sample one token per active row; advances each row's RNG offset."""
+    ) -> torch.Tensor:
+        """Sample one token per active row; advances each row's RNG offset.
+
+        Returns device-resident token ids in packed sampling order. The
+        completion boundary materializes host values; nothing here syncs.
+        """
         if logits.size(0) != plan.num_rows:
             raise ValueError(
                 f"logits has {logits.size(0)} rows but the plan declares {plan.num_rows}; "
@@ -187,7 +198,7 @@ class SamplingCoordinator:
             )
         output = self.sampler(logits, self.md, plan, None, force_reference=force_reference)
         self.md.step_rng()
-        return tuple(int(token) for token in output.token_ids.tolist())
+        return output.token_ids
 
     def record_published(self, published: Sequence[_PublishedToken]) -> None:
         """Count committed output tokens for penalties (prompt counted at add)."""
@@ -199,6 +210,25 @@ class SamplingCoordinator:
                     "owns a sampling slot; record before terminal settlement"
                 )
             self.penalty_state.record(slot, (int(item.token_id),))
+
+    def logprob_k_for(self, request_id: str) -> int | None:
+        """Generation-logprobs top-k for one request (host staging); None = off."""
+        slot = self._request_to_slot.get(request_id)
+        if slot is None:
+            raise KeyError(f"request {request_id!r} has no sampling slot")
+        value = int(self.md.host_scalar("logprobs_k", slot))
+        return None if value < 0 else value
+
+    def logprob_mode_for(self, request_id: str) -> LogprobMode:
+        """Logprob reporting mode for one request (host staging)."""
+        slot = self._request_to_slot.get(request_id)
+        if slot is None:
+            raise KeyError(f"request {request_id!r} has no sampling slot")
+        ordinal = int(self.md.host_scalar("logprob_mode", slot))
+        for mode, value in MODE_ORDINALS.items():
+            if value == ordinal:
+                return mode
+        raise ValueError(f"unknown logprob_mode ordinal {ordinal} for {request_id!r}")
 
     def _slot_for(self, request_id: str) -> int:
         slot = self._request_to_slot.get(request_id)
