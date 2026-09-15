@@ -252,6 +252,7 @@ class EagerScheduler(SchedulerCore):
             padded_num_tokens=self._plan.capabilities.physical_token_slots(total),
             sampling_rows=tuple(sampling_rows),
             sampling=self._sampling_plan(slices),
+            prompt_logprobs=self._prompt_logprob_plan(slices, inputs),
             kv_requirements=tuple(
                 KVRequirement(group, total, request_tokens=request_tokens)
                 for group in range(groups)

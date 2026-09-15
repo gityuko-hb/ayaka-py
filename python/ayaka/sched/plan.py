@@ -35,6 +35,7 @@ __all__ = [
     "KVRequirement",
     "Phase",
     "PreparedStep",
+    "PromptLogprobSlicePlan",
     "RequestStepInput",
     "ScheduledSlice",
     "StepDependency",
@@ -46,6 +47,39 @@ class Phase(StrEnum):
 
     PREFILL = "prefill"
     DECODE = "decode"
+
+
+@dataclass(frozen=True, slots=True)
+class PromptLogprobSlicePlan:
+    """Scheduler-decided prompt-token scoring for one slice (host data, no tensors).
+
+    The scheduler resolves which absolute prompt positions this slice's
+    forward can score: position ``p`` is scored through the hidden row at
+    ``p - 1`` (causal shift), so ``p - 1`` must be produced by this step —
+    either as a query row of this slice or, at a chunk boundary, carried from
+    the previous chunk. Positions whose predecessor lies in the prefix-cached
+    region are excluded here and surface as no-value markers downstream.
+
+    ``positions`` is ascending and unique, inside the slice's prompt range.
+    """
+
+    slice_index: int
+    k: int
+    positions: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        require_int(self.slice_index, "prompt logprob slice_index", minimum=0)
+        require_int(self.k, "prompt logprob k", minimum=0)
+        if type(self.positions) is not tuple:
+            raise TypeError("prompt logprob positions must be a tuple")
+        previous = -1
+        for position in self.positions:
+            require_int(position, "prompt logprob position")
+            if position <= previous:
+                raise ValueError("prompt logprob positions must be ascending")
+            previous = position
+        if not self.positions:
+            raise ValueError("prompt logprob slice needs at least one scored position")
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +262,7 @@ class BatchStepPlan:
     padded_num_tokens: int
     sampling_rows: tuple[int, ...] = ()
     sampling: SamplingPlan = EMPTY_SAMPLING_PLAN
+    prompt_logprobs: tuple[PromptLogprobSlicePlan, ...] = ()
     memory: MemoryPlan = EMPTY_MEMORY_PLAN
     kv_requirements: tuple[KVRequirement, ...] = ()
     dependencies: tuple[StepDependency, ...] = ()
@@ -247,6 +282,8 @@ class BatchStepPlan:
             raise TypeError("slices and inputs must be tuples")
         if type(self.sampling_rows) is not tuple or type(self.trace_ids) is not tuple:
             raise TypeError("sampling_rows and trace_ids must be tuples")
+        if type(self.prompt_logprobs) is not tuple:
+            raise TypeError("prompt_logprobs must be a tuple")
         if type(self.kv_requirements) is not tuple or type(self.dependencies) is not tuple:
             raise TypeError("kv_requirements and dependencies must be tuples")
         if not isinstance(self.sampling, SamplingPlan):
@@ -293,6 +330,25 @@ class BatchStepPlan:
             raise ValueError("sampling rows must exactly match scheduled sample boundaries")
         if self.sampling.num_rows != len(self.sampling_rows):
             raise ValueError("sampling row count disagrees with explicit sampling rows")
+        previous_slice = -1
+        for entry in self.prompt_logprobs:
+            if not isinstance(entry, PromptLogprobSlicePlan):
+                raise TypeError("prompt_logprobs must contain PromptLogprobSlicePlan")
+            if entry.slice_index >= len(self.slices):
+                raise IndexError("prompt logprob slice_index outside the step's slices")
+            if entry.slice_index <= previous_slice:
+                raise ValueError("prompt logprob entries must be ordered by slice_index")
+            previous_slice = entry.slice_index
+            scheduled = self.slices[entry.slice_index]
+            prompt_tokens = self.inputs[entry.slice_index].prompt_tokens
+            lo = scheduled.query_start
+            hi = min(scheduled.query_end, prompt_tokens)
+            for position in entry.positions:
+                if not lo <= position < hi:
+                    raise IndexError(
+                        f"prompt logprob position {position} outside slice {entry.slice_index} "
+                        f"prompt range [{lo}, {hi})"
+                    )
         groups = [requirement.group_id for requirement in self.kv_requirements]
         if len(set(groups)) != len(groups):
             raise ValueError("KV requirements must be unique by group")

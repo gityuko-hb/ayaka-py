@@ -42,7 +42,7 @@ class BatchBudget:
     decode_tokens: int = 0
 
     @classmethod
-    def from_plan(cls, plan: ResolvedSchedulerPlan) -> "BatchBudget":
+    def from_plan(cls, plan: ResolvedSchedulerPlan) -> BatchBudget:
         return cls(
             max_physical_tokens=min(
                 plan.max_num_scheduled_tokens,
@@ -159,7 +159,11 @@ class TimeEstimator:
             for s in step.slices
             for g in self.runner.attention.execution.attention_groups
         )
-        logits = len(step.sampling_rows) * h * getattr(c, "vocab_size", 0)
+        # Projection rows: sampling rows plus prompt-logprob scoring rows (M2).
+        projection_rows = len(step.sampling_rows) + sum(
+            len(entry.positions) for entry in step.prompt_logprobs
+        )
+        logits = projection_rows * h * getattr(c, "vocab_size", 0)
         return max(1, dense + attention + logits + pages * h + transfer_bytes)
 
     def predict(self, step: BatchStepPlan, *, transfer_bytes: int = 0) -> int:

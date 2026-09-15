@@ -66,13 +66,13 @@ features and belong outside this synchronous core.
 ```python
 scheduler = create_scheduler(
     "continuous",
-    plan,              # ResolvedSchedulerPlan
-    lifecycle_manager, # LifecycleManager
-    runtime,           # StepRuntime: prepare / adopt / cancel
-    allocator,         # SequenceAllocator: create / release / advance_epoch
-    admission=admission,      # optional AdmissionAdvisor
-    preemption=preemption,    # optional PreemptionController
-    prefix_hints=hints,       # optional PrefixHintProvider
+    plan,  # ResolvedSchedulerPlan
+    lifecycle_manager,  # LifecycleManager
+    runtime,  # StepRuntime: prepare / adopt / cancel
+    allocator,  # SequenceAllocator: create / release / advance_epoch
+    admission=admission,  # optional AdmissionAdvisor
+    preemption=preemption,  # optional PreemptionController
+    prefix_hints=hints,  # optional PrefixHintProvider
 )
 
 scheduler.add_request(request)
@@ -80,7 +80,7 @@ while scheduler.has_unfinished:
     ticket = scheduler.schedule()
     if ticket is None:
         break
-    result = run_and_settle(ticket)   # executor + CompletionCoordinator
+    result = run_and_settle(ticket)  # executor + CompletionCoordinator
     scheduler.update_from_output(result)
     scheduler.flush_reports()
 ```

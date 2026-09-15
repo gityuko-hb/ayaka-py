@@ -11,8 +11,8 @@ from ayaka.sched.continuous import ContinuousScheduler
 from ayaka.sched.eager import EagerScheduler
 from ayaka.sched.interfaces import (
     AdmissionAdvisor,
-    PrefixHintProvider,
     PreemptionController,
+    PrefixHintProvider,
     SequenceAllocator,
     StepRuntime,
 )

@@ -20,9 +20,11 @@ from ayaka.handles import SequenceHandle
 from ayaka.plan import SamplingPlan
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.schema import Request
+from ayaka.sampling.logprobs import LogprobMode
 from ayaka.sched.base import BaseScheduler
 from ayaka.sched.interfaces import OverloadedError, SequenceAllocator, StepRuntime
 from ayaka.sched.outcome import FinishReason, RequestOutcome, RequestReport, SchedulerReport
+from ayaka.sched.plan import PromptLogprobSlicePlan, RequestStepInput
 from ayaka.sched.policy import QueueEntry
 
 if TYPE_CHECKING:
@@ -134,6 +136,24 @@ class SchedulerCore(BaseScheduler):
                 "request.sampling",
                 "UNSUPPORTED_SAMPLING",
                 "non-greedy sampling requires a wired SamplingCoordinator",
+            )
+        if params.prompt_logprobs is not None and self._sampling is None:
+            raise ConfigError(
+                "request.sampling.prompt_logprobs",
+                "UNSUPPORTED_PROMPT_LOGPROBS",
+                "prompt logprobs require a wired SamplingCoordinator",
+            )
+        if params.logprob_mode is LogprobMode.SAMPLING and params.logprobs is None:
+            raise ConfigError(
+                "request.sampling.logprob_mode",
+                "INVALID_LOGPROB_MODE",
+                "logprob_mode=sampling needs logprobs to be enabled",
+            )
+        if params.logprobs is not None and self._sampling is None:
+            raise ConfigError(
+                "request.sampling.logprobs",
+                "UNSUPPORTED_LOGPROBS",
+                "generation logprobs require a wired SamplingCoordinator",
             )
         if request.stop.stop_strings and not self._text_stops:
             raise ConfigError(
@@ -370,6 +390,40 @@ class SchedulerCore(BaseScheduler):
             num_rows = sum(1 for scheduled in slices if scheduled.sample_last_query)
             return SamplingPlan(num_rows=num_rows, all_greedy=True)
         return self._sampling.plan_for(slices)
+
+    def _prompt_logprob_plan(
+        self, slices: Sequence[ScheduledSlice], inputs: Sequence[RequestStepInput]
+    ) -> tuple[PromptLogprobSlicePlan, ...]:
+        """Resolve which prompt positions each slice's forward can score.
+
+        Scheduler-owned decision (the invariant boundary): position ``p`` is
+        scored through hidden row ``p - 1``, so only positions whose
+        predecessor is produced by this step are planned. Positions inside the
+        prefix-cached region ``[0, num_cached_tokens)`` and position 0 are
+        excluded — they surface downstream as no-value markers and are never
+        re-forwarded just for reporting.
+        """
+        if self._sampling is None:
+            return ()
+        entries: list[PromptLogprobSlicePlan] = []
+        for index, (scheduled, value) in enumerate(zip(slices, inputs, strict=True)):
+            lifecycle = self._requests.find(scheduled.request_id)
+            if lifecycle is None:
+                continue
+            params = lifecycle.request.sampling
+            if params.prompt_logprobs is None:
+                continue
+            cached = lifecycle.machine.num_cached_tokens
+            lo = max(scheduled.query_start, cached + 1, 1)
+            hi = min(scheduled.query_end, value.prompt_tokens)
+            positions = tuple(range(lo, hi))
+            if positions:
+                entries.append(
+                    PromptLogprobSlicePlan(
+                        slice_index=index, k=params.prompt_logprobs, positions=positions
+                    )
+                )
+        return tuple(entries)
 
     def _next_step_id(self) -> int:
         self._step_id += 1
