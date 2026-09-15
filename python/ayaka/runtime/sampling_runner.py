@@ -6,12 +6,13 @@ smallest complete bridge between ``BatchStepPlan`` and ``ayaka.sampling``:
   * a ``LogitsProvider`` supplies raw ``[num_sampling_rows, vocab]`` logits in
     packed sampling order -- the order of ``BatchStepPlan.sampling_rows``;
   * ``SamplingRunner`` flushes the coordinator (dirty columns + active-row map)
-    and samples one token per row, returning ids in that same order;
+    and samples one token per row, returning device-resident ``SampleOutputs``;
   * ``SamplingExecutor`` is a minimal ``Executor`` whose backend hook runs the
     runner and publishes the packed samples via ``set_samples``.
 
 A future GPU runner replaces the provider with the model forward; the
 flush-before-read ordering and the ``set_samples`` contract stay identical.
+Host materialization happens only at the completion boundary.
 """
 
 from __future__ import annotations
@@ -21,9 +22,11 @@ from typing import Protocol
 import torch
 
 from ayaka.executor.base import Executor
-from ayaka.executor.ticket import ExecutionTicket, FenceResult, WorkState
+from ayaka.executor.ticket import ExecutionTicket, FenceResult, SampleOutputs, WorkState
 from ayaka.sampling.engine import SamplingCoordinator
+from ayaka.sampling.logprobs import LogprobMode
 from ayaka.sched.plan import BatchStepPlan, PreparedStep
+from ayaka.utils.import_utils import CapabilityError
 
 __all__ = ["LogitsProvider", "SamplingExecutor", "SamplingRunner"]
 
@@ -51,10 +54,36 @@ class SamplingRunner:
         self._force_reference = force_reference
         self._closed = False
 
-    def __call__(self, prepared: PreparedStep) -> tuple[int, ...]:
+    def __call__(self, prepared: PreparedStep) -> SampleOutputs:
         if self._closed:
             raise RuntimeError("sampling runner is closed")
-        plan = prepared.step.sampling
+        step = prepared.step
+        plan = step.sampling
+        if step.prompt_logprobs:
+            raise CapabilityError(
+                "prompt_logprobs",
+                detail=(
+                    "the provider-based sampling runner cannot produce prompt "
+                    "logprobs; it never sees model hidden states"
+                ),
+                remedy="wire the model runner (ModelSamplingRunner) for prompt scoring",
+            )
+        for scheduled in step.slices:
+            if not scheduled.sample_last_query:
+                continue
+            if (
+                self._coordinator.logprob_k_for(scheduled.request_id) is not None
+                and self._coordinator.logprob_mode_for(scheduled.request_id) is LogprobMode.SAMPLING
+            ):
+                raise CapabilityError(
+                    "logprob_mode",
+                    detail=(
+                        "the provider-based sampling runner cannot report "
+                        "sampling-distribution logprobs; it never sees the model's "
+                        "pre-transform logits"
+                    ),
+                    remedy="wire the model runner (ModelSamplingRunner) for logprobs",
+                )
         logits = self._provider(prepared.step)
         if not isinstance(logits, torch.Tensor):
             raise TypeError("logits provider must return a torch.Tensor")
@@ -64,7 +93,8 @@ class SamplingRunner:
                 f"got {tuple(logits.shape)}"
             )
         self._coordinator.flush()
-        return self._coordinator.sample(logits, plan, force_reference=self._force_reference)
+        token_ids = self._coordinator.sample(logits, plan, force_reference=self._force_reference)
+        return SampleOutputs(token_ids=token_ids)
 
     def close(self) -> None:
         self._closed = True
