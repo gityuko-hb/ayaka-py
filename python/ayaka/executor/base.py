@@ -10,6 +10,7 @@ from ayaka.executor.ticket import (
     ExecutionResources,
     ExecutionTicket,
     FenceResult,
+    SampleOutputs,
     TerminalOutcome,
     TerminalStatus,
     TicketId,
@@ -124,15 +125,24 @@ class Executor(abc.ABC):
             raise TypeError("fence must provide a nonblocking query")
         ticket._fences.append(fence)
 
-    def set_samples(self, ticket: ExecutionTicket, samples: tuple[int, ...]) -> None:
-        """Backend hook: set packed sampling results, validated before publication."""
+    def set_samples(self, ticket: ExecutionTicket, samples: SampleOutputs) -> None:
+        """Backend hook: set packed sampling results, validated before publication.
+
+        Results stay device-resident; the completion boundary materializes them.
+        Row count is validated here against the prepared sampling rows without
+        syncing the device (shape only).
+        """
         self._require_owned(ticket)
         if ticket.state not in (TicketState.SUBMITTED, TicketState.DRAINING):
             raise ValueError("ticket is not awaiting execution output")
-        if type(samples) is not tuple:
-            raise TypeError("samples must be a tuple")
-        for sample in samples:
-            require_int(sample, "sample token")
+        if not isinstance(samples, SampleOutputs):
+            raise TypeError("samples must be SampleOutputs")
+        expected = len(ticket.prepared.step.sampling_rows)
+        if samples.token_ids.size(0) != expected:
+            raise ValueError(
+                f"sampling output has {samples.token_ids.size(0)} rows, "
+                f"prepared plan declares {expected}"
+            )
         ticket._samples = samples
 
     def launch(self, ticket: ExecutionTicket) -> None:
@@ -223,7 +233,7 @@ class Executor(abc.ABC):
                 raise
 
     def _finish(self, ticket: ExecutionTicket, status: TerminalStatus) -> None:
-        samples = ticket._samples if status is TerminalStatus.SUCCEEDED else ()
+        samples = ticket._samples if status is TerminalStatus.SUCCEEDED else None
         ticket._terminal = TerminalOutcome(ticket.id, status, samples, ticket._error)
         self.metrics.terminal(ticket)
         self._transition(ticket, TicketState.COMPLETED)
@@ -264,8 +274,8 @@ class Executor(abc.ABC):
             self._finish(ticket, TerminalStatus.FAILED)
         elif ticket._cancelled:
             self._finish(ticket, TerminalStatus.CANCELLED)
-        elif len(ticket._samples) != len(ticket.prepared.step.sampling_rows):
-            ticket._error = "sampling output count disagrees with prepared rows"
+        elif ticket._samples is None:
+            ticket._error = "sampling output missing for succeeded work"
             self._finish(ticket, TerminalStatus.FAILED)
         else:
             self._finish(ticket, TerminalStatus.SUCCEEDED)

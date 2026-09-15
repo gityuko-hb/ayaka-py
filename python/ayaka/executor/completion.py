@@ -14,6 +14,7 @@ from ayaka.executor.ticket import (
     TicketState,
 )
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
+from ayaka.sampling.logprobs import LogprobResult, TokenLogprob
 from ayaka.sched.plan import PreparedStep, ScheduledSlice
 from ayaka.utils.validation import require_int
 
@@ -23,6 +24,104 @@ class PublishedSample:
     request_id: str
     sequence_epoch: int
     token_id: int
+    logprobs: LogprobResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PromptLogprobChunk:
+    """One slice's prompt-logprob report, keyed by request incarnation.
+
+    Covers absolute prompt positions ``[start, end)``: every position appears
+    once; ``None`` marks no-value positions (first prompt token, positions
+    whose predecessor lies in the prefix-cached region). Positions are never
+    re-forwarded just for reporting, so a cached prefix legitimately produces
+    None — a chunk boundary never does.
+    """
+
+    request_id: str
+    sequence_epoch: int
+    start: int
+    end: int
+    token_ids: tuple[int, ...]
+    logprobs: tuple[float | None, ...]
+    top_logprobs: tuple[tuple[TokenLogprob, ...] | None, ...]
+
+
+def _materialize_reports(samples) -> dict[int, LogprobResult]:
+    """Materialize every logprob report row in ONE host sync; {} when disabled.
+
+    Keyed by sampling-row index. Padding entries (token id -1) end the row's
+    top list; the selected token's logprob is identical wherever it appears.
+    """
+    lp = samples.logprobs
+    if lp is None:
+        return {}
+    token_values = [float(value) for value in lp.token_logprob.tolist()]
+    top_ids = lp.top_token_ids.tolist()
+    top_values = lp.top_logprobs.tolist()
+    by_row: dict[int, LogprobResult] = {}
+    for index, row in enumerate(samples.logprob_rows):
+        top = tuple(
+            TokenLogprob(int(token), float(value))
+            for token, value in zip(top_ids[index], top_values[index], strict=True)
+            if token >= 0
+        )
+        by_row[int(row)] = LogprobResult(token_values[index], top)
+    return by_row
+
+
+def _materialize_prompt_chunks(
+    samples, bindings: tuple[tuple[RequestLifecycle, ScheduledSlice], ...]
+) -> tuple[PromptLogprobChunk, ...]:
+    """Materialize every prompt-logprob chunk in ONE host sync; () when disabled.
+
+    Chunk coverage ``[start, end)`` comes from the runner's descriptors; the
+    prompt token ids come from the step's input snapshots. Scored positions
+    are looked up in the packed device tensors; every other position in the
+    range is a no-value marker.
+    """
+    lp = samples.prompt_logprobs
+    if lp is None:
+        return ()
+    token_values = [float(value) for value in lp.token_logprob.tolist()]
+    top_ids = lp.top_token_ids.tolist()
+    top_values = lp.top_logprobs.tolist()
+    chunks: list[PromptLogprobChunk] = []
+    row = 0
+    for report in samples.prompt_logprob_slices:
+        request, _scheduled = bindings[report.slice_index]
+        by_position = {position: index for index, position in enumerate(report.scored_positions)}
+        logprobs: list[float | None] = []
+        tops: list[tuple[TokenLogprob, ...] | None] = []
+        token_ids: list[int] = []
+        for position in range(report.start, report.end):
+            token_ids.append(int(request.request.prompt_token_ids[position]))
+            index = by_position.get(position)
+            if index is None:
+                logprobs.append(None)
+                tops.append(None)
+                continue
+            global_row = row + index
+            top = tuple(
+                TokenLogprob(int(token), float(value))
+                for token, value in zip(top_ids[global_row], top_values[global_row], strict=True)
+                if token >= 0
+            )
+            logprobs.append(token_values[global_row])
+            tops.append(top)
+        row += len(report.scored_positions)
+        chunks.append(
+            PromptLogprobChunk(
+                request_id=request.request_id,
+                sequence_epoch=_scheduled.sequence_epoch,
+                start=report.start,
+                end=report.end,
+                token_ids=tuple(token_ids),
+                logprobs=tuple(logprobs),
+                top_logprobs=tuple(tops),
+            )
+        )
+    return tuple(chunks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +131,7 @@ class CompletionResult:
     published: tuple[PublishedSample, ...] = ()
     ignored_requests: tuple[str, ...] = ()
     error: str = ""
+    prompt_logprobs: tuple[PromptLogprobChunk, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +258,7 @@ class CompletionCoordinator:
         ticket._settling = True
         published: list[PublishedSample] = []
         ignored: list[str] = []
+        prompt_logprobs: list[PromptLogprobChunk] = []
         step_id = ticket.prepared.step.step_id
         try:
             if outcome.status is TerminalStatus.SUCCEEDED:
@@ -186,9 +287,32 @@ class CompletionCoordinator:
                     require_int(version, "committed KV version")
                 if versions != expected:
                     raise ValueError("resource commit returned unexpected KV versions")
+                # Publication boundary: the single host materialization of the
+                # step's device-resident sampling results. Everything upstream
+                # (sampler, coordinator, ticket) keeps tensors; everything
+                # downstream (publish, reporting) reads host values only.
+                samples = outcome.samples
+                if samples is None:
+                    raise RuntimeError(
+                        "succeeded outcome without sampling results; the executor "
+                        "must validate samples before completing a ticket"
+                    )
+                tokens = tuple(int(t) for t in samples.token_ids.tolist())
+                report_by_row = _materialize_reports(samples)
+                chunks_by_slice = {
+                    report.slice_index: chunk
+                    for report, chunk in zip(
+                        samples.prompt_logprob_slices,
+                        _materialize_prompt_chunks(samples, bindings),
+                        strict=True,
+                    )
+                }
+                prompt_logprobs.clear()
                 sample_index = 0
-                for (request, scheduled), version in zip(bindings, versions, strict=True):
-                    sample = outcome.samples[sample_index] if scheduled.sample_last_query else None
+                for slice_index, ((request, scheduled), version) in enumerate(
+                    zip(bindings, versions, strict=True)
+                ):
+                    sample = tokens[sample_index] if scheduled.sample_last_query else None
                     sample_index += int(scheduled.sample_last_query)
                     if not request.accepts_completion(step_id, scheduled):
                         ignored.append(request.request_id)
@@ -213,8 +337,12 @@ class CompletionCoordinator:
                                     request.request_id,
                                     scheduled.sequence_epoch,
                                     sample,
+                                    report_by_row.get(sample_index - 1),
                                 )
                             )
+                        chunk = chunks_by_slice.get(slice_index)
+                        if chunk is not None:
+                            prompt_logprobs.append(chunk)
                     except ValueError:
                         if not (
                             request.token.is_cancelled
@@ -263,7 +391,12 @@ class CompletionCoordinator:
                 raise
             return None
         return CompletionResult(
-            ticket.id, outcome.status, tuple(published), tuple(ignored), outcome.error
+            ticket.id,
+            outcome.status,
+            tuple(published),
+            tuple(ignored),
+            outcome.error,
+            tuple(prompt_logprobs),
         )
 
     def poll(self, *, now_ns: int | None = None) -> tuple[CompletionResult, ...]:
