@@ -1,17 +1,18 @@
-"""Triton kernel cho seeded_gumbel — P1 kernel-workflow template.
+"""Seeded Gumbel-argmax kernel over pre-filtered top-k candidates.
 
-THIẾT KẾ (đã thảo luận, không phải mặc định ngẫu nhiên): sinh gumbel noise
-CHỈ cho TOPK_BOUND vị trí đầu (sau khi đã sort+filter bởi filter_probs),
-KHÔNG cho toàn V. Input là (sp, si) — output CỦA filter_probs (đã sort giảm
-dần, đã lọc). Lý do tách khỏi việc filter (không tự làm top_k/top_p/min_p ở
-đây): filter là phần phức tạp, nhiều pass, đã có bản torch đúng và test kỹ
-(topk_topp.py); kernel này CHỈ làm phần mới (noise + argmax), tái dùng filter
-đã có qua đường gọi ở gumbel.py (dispatch), không phải reimplement.
+Generates Gumbel noise only for the first ``TOPK_BOUND`` positions after
+``filter_probs`` has sorted and filtered them, never for the full ``V``.
+Inputs ``(sp, si)`` are the ``filter_probs`` outputs in descending order.
+Filtering stays on the torch side on purpose: it is multi-pass, already
+correct, and covered by ``topk_topp`` tests, so this kernel implements only
+the new part (noise plus argmax) and reuses the filter via dispatch instead
+of reimplementing it.
 
-Convention import triton trực tiếp (không try/except) giống
-ayaka/kernel/triton/paged_attention.py: triton nằm trong extra ``cuda``, nên
-module này chỉ import được khi có triton; phía gọi (ops/gumbel.py) tự bắt
-ImportError và fallback về oracle torch.
+Follows the direct-``triton`` import convention of
+``ayaka.kernel.triton.paged_attention``: ``triton`` lives in the ``cuda``
+extra, so this module imports only with Triton present while the caller in
+``ayaka.sampling.ops.gumbel`` catches ``ImportError`` and falls back to the
+torch oracle.
 """
 
 from __future__ import annotations
@@ -22,7 +23,9 @@ import torch
 import triton
 import triton.language as tl
 
+from ayaka.kernel.ops import custom_op
 from ayaka.kernel.triton.sampling.philox import philox_u01
+from ayaka.sampling.rng import counter_uniform_cols
 
 HAS_TRITON_GUMBEL = True
 
@@ -38,13 +41,28 @@ def _gumbel_argmax_kernel(
     TOPK_BOUND: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """MỘT program/row. Đọc TOPK_BOUND phần tử đầu của sp/si (đã sort
-    giảm dần bởi filter_probs), sinh noise cho từng vị trí, argmax, ghi
-    token id thật (không phải rank) vào out.
+    """Gumbel-argmax over one filtered row per program.
 
-    sp=0 ở một vị trí (đã bị filter loại) ⇒ log(sp)=-inf ⇒ không bao giờ
-    thắng argmax dù noise là gì — khớp bất biến "không chọn token bị lọc"
-    đã test ở gumbel.py's oracle.
+    Args:
+        sp_ptr: Pointer to ``[B, TOPK_BOUND]`` filtered probabilities.
+        si_ptr: Pointer to ``[B, TOPK_BOUND]`` token ids aligned with
+            ``sp_ptr``.
+        out_ptr: Pointer to ``[B]`` int64 sampled token ids.
+        seed_ptr: Pointer to ``[B]`` per-row Philox seeds.
+        offset_ptr: Pointer to ``[B]`` per-row base offsets.
+        stride_row: Row stride (in elements) of ``sp_ptr``/``si_ptr``.
+        TOPK_BOUND: Number of valid candidates per row.
+        BLOCK: Tile width covering ``TOPK_BOUND``.
+
+    Note:
+        The per-column address is ``flat = offset_base * TOPK_BOUND + col``,
+        matching ``counter_uniform_cols`` linear addressing. This keeps the
+        Gumbel stream disjoint from one-dimensional ``counter_uniform``
+        calls. Uniforms are clamped to ``[1e-12, 1 - 1e-7]`` before
+        ``-log(-log(u))``; masked lanes score ``-inf`` so ``argmax`` only
+        selects valid candidates. A filtered-out position with ``sp == 0``
+        maps to ``log(sp) == -inf`` and can never win regardless of noise,
+        preserving the "never pick a filtered token" oracle invariant.
     """
     row = tl.program_id(0)
     seed = tl.load(seed_ptr + row)
@@ -56,9 +74,10 @@ def _gumbel_argmax_kernel(
 
     logp = tl.where(sp > 0, tl.log(sp), float("-inf"))
 
-    offset = offset_base * TOPK_BOUND + col  # dia chi hoa rieng cho gumbel,
-    # giong het counter_uniform_cols ben gumbel.py (khong dung offset+col
-    # truc tiep de tranh dam do voi cac loi goi counter_uniform 1-chieu khac)
+    # Dedicated address space for gumbel, mirroring counter_uniform_cols in
+    # gumbel.py (never offset+col directly, to avoid colliding with other
+    # one-dimensional counter_uniform call sites).
+    offset = offset_base * TOPK_BOUND + col
     u = philox_u01(seed, offset)
     u = tl.minimum(tl.maximum(u, 1e-12), 1.0 - 1e-7)
     gumbel = -tl.log(-tl.log(u))
@@ -69,6 +88,53 @@ def _gumbel_argmax_kernel(
     tl.store(out_ptr + row, winner_id)
 
 
+def _fused_gumbel_ref(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
+    topk_bound: int = 512,
+) -> torch.Tensor:
+    """Plain-torch reference mirroring the Triton truncation and RNG stream."""
+    from ayaka.sampling.ops.topk_topp import filter_probs
+
+    sp, si = filter_probs(logits, top_k, top_p, min_p)
+    bound = min(topk_bound, sp.size(1))
+    sp = sp[:, :bound]
+    si = si[:, :bound]
+    u = counter_uniform_cols(seed, offset, bound)
+    u = u.clamp(min=1e-12, max=1.0 - 1e-7)
+    gumbel = (-torch.log(-torch.log(u))).to(sp.dtype)
+    log_sp = torch.where(
+        sp > 0,
+        torch.log(sp.clamp_min(torch.finfo(sp.dtype).tiny)),
+        torch.full_like(sp, float("-inf")),
+    )
+    winner = torch.argmax(log_sp + gumbel, dim=-1)
+    return si.gather(1, winner.unsqueeze(1)).squeeze(1)
+
+
+def _fused_gumbel_fake(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
+    topk_bound: int = 512,
+) -> torch.Tensor:
+    """Meta kernel: fresh int64 ``[B]`` without touching memory."""
+    return torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+
+
+@custom_op(
+    namespace="ayaka",
+    reference=_fused_gumbel_ref,
+    fake_impl=_fused_gumbel_fake,
+    dispatch_key="CUDA",
+)
 def fused_gumbel_sample(
     logits: torch.Tensor,
     top_k: torch.Tensor,
@@ -79,12 +145,55 @@ def fused_gumbel_sample(
     *,
     topk_bound: int = 512,
 ) -> torch.Tensor:
-    """Entry point gọi từ gumbel.py. Vẫn gọi filter_probs (torch) cho phần
-    filter — chỉ kernel hoá phần noise+argmax.
+    """Sample token ids with fused filter plus Gumbel-argmax.
 
-    topk_bound PHẢI >= max thực tế của top_k đang dùng trong batch, nếu
-    không candidate ngoài topk_bound bị cắt oan ÂM THẦM.
+    Args:
+        logits: ``[B, V]`` unnormalized logits.
+        top_k: ``[B]`` per-row top-k limits applied by ``filter_probs``.
+        top_p: ``[B]`` per-row nucleus thresholds applied by
+            ``filter_probs``.
+        min_p: ``[B]`` per-row relative thresholds applied by
+            ``filter_probs``.
+        seed: ``[B]`` int64 Philox seeds, one stream per row.
+        offset: ``[B]`` int64 base offsets, batch-invariant across rows.
+        topk_bound: Maximum candidates kept per row by ``filter_probs``.
+            Must cover the largest effective ``top_k`` in the batch;
+            candidates beyond it are silently truncated.
+
+    Returns:
+        Fresh int64 ``[B]`` tensor of sampled token ids on the same device
+        as ``logits``.
+
+    Note:
+        Pure function: ``logits`` and filter tensors are never mutated.
+        Deterministic in ``(seed, offset)`` with no generator state, hence
+        CUDA-graph safe. Reference: ``filter_probs`` followed by a torch
+        Gumbel-argmax, suitable for ``verify_against_reference``.
     """
+    if not isinstance(logits, torch.Tensor):
+        raise TypeError("logits must be a torch.Tensor")
+    if not logits.is_cuda:
+        raise ValueError("logits must be a CUDA tensor")
+    if not logits.is_floating_point():
+        raise TypeError(f"logits must be a float dtype; got {logits.dtype}")
+    if logits.dim() != 2:
+        raise ValueError(f"logits must have shape [B, V]; got {tuple(logits.shape)}")
+    batch = logits.size(0)
+    for tensor, tensor_name in (
+        (top_k, "top_k"),
+        (top_p, "top_p"),
+        (min_p, "min_p"),
+        (seed, "seed"),
+        (offset, "offset"),
+    ):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{tensor_name} must be a torch.Tensor")
+        if tensor.dim() != 1 or tensor.size(0) != batch:
+            raise ValueError(f"{tensor_name} must have shape [B] matching logits batch")
+        if tensor.device != logits.device:
+            raise ValueError(f"{tensor_name} and logits must be on the same device")
+    if not isinstance(topk_bound, int) or topk_bound <= 0:
+        raise ValueError("topk_bound must be a positive integer")
     from ayaka.sampling.ops.topk_topp import filter_probs
 
     sp, si = filter_probs(logits, top_k, top_p, min_p)

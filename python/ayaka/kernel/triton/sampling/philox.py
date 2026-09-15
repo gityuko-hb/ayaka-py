@@ -1,18 +1,9 @@
-"""Philox4x32-10 cho Triton — TWIN BIT-EXACT của ayaka.sampling.rng.
+"""Philox4x32-10 counter-based RNG for Triton sampling kernels.
 
-Hai module PHẢI cho cùng kết quả cho cùng (seed, address): torch int64
-(ayaka.sampling.rng.philox4x32_10) và Triton int64 (module này) đều làm số học
-two's-complement trên giá trị u32 đóng gói trong int64, nên bitwise/mask/shift
-cho kết quả bit-identical. Khoảng cách giữa hai bản là cách bug trốn — battery
-test (tests/test_sampling_kernel_gpu.py) bắt buộc phải so chéo.
-
-Địa chỉ hoá: `flat = offset * n_cols + col` (linear addressing, batch-invariant).
-Một counter Philox (4x u32) cho 4 word (w0..w3) → 2 uniform: draw chẵn từ
-(w0, w1), draw lẻ từ (w2, w3); counter = flat >> 1, draw = flat & 1.
-
-Ghi chú style: các helper jit dưới đây trả MỘT giá trị duy nhất (thay vì tuple)
-— pyright coi call của JITFunction là NoReturn, nên unpack tuple trong jit code
-sẽ thành lỗi typecheck giả; single-return cũng gọn cho Triton CSE.
+Triton twin of ``ayaka.sampling.rng``: it must stay bit-identical to the
+torch implementation for the same ``(seed, flat)`` address. The seed is the
+2x u32 Philox key, ``flat >> 1`` is the 64-bit counter, and ``flat & 1``
+selects one of the two uniform draws packed from each counter output.
 """
 
 from __future__ import annotations
@@ -29,7 +20,19 @@ _MASK32 = tl.constexpr(0xFFFFFFFF)
 
 @triton.jit
 def _mullo32(a, b):
-    """Low 32 bit của tích u32×u32 — 16-bit chunks, mọi trung gian < 2^51."""
+    """Return the low 32 bits of a u32-by-u32 product.
+
+    Args:
+        a: First u32 operand held in an int64 lane.
+        b: Second u32 operand held in an int64 lane.
+
+    Returns:
+        Low 32 bits of ``a * b`` as a u32 in an int64 lane.
+
+    Note:
+        Reconstructed from 16-bit halves so every intermediate stays below
+        ``2**51`` and never overflows signed int64.
+    """
     a_lo = a & 0xFFFF
     a_hi = a >> 16
     b_lo = b & 0xFFFF
@@ -41,8 +44,19 @@ def _mullo32(a, b):
 
 @triton.jit
 def _mulhi32(a, b):
-    """High 32 bit của tích u32×u32 — cùng phép nhân với _mullo32, chỉ khác
-    phần lấy carry; CSE của Triton gộp được hai lời gọi nếu cùng operand."""
+    """Return the high 32 bits of a u32-by-u32 product.
+
+    Args:
+        a: First u32 operand held in an int64 lane.
+        b: Second u32 operand held in an int64 lane.
+
+    Returns:
+        High 32 bits of ``a * b`` as a u32 in an int64 lane.
+
+    Note:
+        Same 16-bit-half product as ``_mullo32``; only the carry handling
+        differs, so Triton CSE can merge calls sharing operands.
+    """
     a_lo = a & 0xFFFF
     a_hi = a >> 16
     b_lo = b & 0xFFFF
@@ -55,11 +69,31 @@ def _mulhi32(a, b):
 
 @triton.jit
 def philox4x32_10(c0, c1, c2, c3, k0, k1):
-    """Philox4x32, 10 rounds — bit-exact với philox4x32_10 trong rng.py và KAT
-    Random123 (tests/test_sampling_rng.py pin 3 vector chính thức)."""
-    # Một số caller nạp seed/offset dạng uint64 (topk_topp port) — bitcast về
-    # int64 để kiểu loop-carried nhất quán; two's-complement làm bitwise/add
-    # wrap-around bit-identical giữa hai kiểu.
+    """Advance Philox4x32 for 10 rounds.
+
+    Args:
+        c0: Counter word 0 (u32 in an int64 lane).
+        c1: Counter word 1 (u32 in an int64 lane).
+        c2: Counter word 2 (u32 in an int64 lane).
+        c3: Counter word 3 (u32 in an int64 lane).
+        k0: Key word 0 (u32 in an int64 lane).
+        k1: Key word 1 (u32 in an int64 lane).
+
+    Returns:
+        Tuple ``(c0, c1, c2, c3)`` of the four output words after 10
+        rounds.
+
+    Note:
+        Bit-exact with ``philox4x32_10`` in ``ayaka.sampling.rng`` and the
+        official Random123 KAT pinned by ``tests/test_sampling_rng.py``.
+        Callers passing uint64 lanes are bitcast to int64 first so the
+        loop-carried types agree; two's-complement wrap-around keeps
+        bitwise and additive steps bit-identical across the two types.
+        Round one uses the given key; later rounds bump it by ``(W0, W1)``.
+    """
+    # Some callers pass seed/offset as uint64 (topk_topp port) — bitcast to
+    # int64 for consistent loop-carried types; two's-complement keeps
+    # bitwise/add wrap-around bit-identical across the two types.
     c0 = tl.cast(c0, tl.int64, bitcast=True)
     c1 = tl.cast(c1, tl.int64, bitcast=True)
     c2 = tl.cast(c2, tl.int64, bitcast=True)
@@ -83,8 +117,18 @@ def philox4x32_10(c0, c1, c2, c3, k0, k1):
 
 @triton.jit
 def _philox_u53_bits(seed, counter, odd):
-    """Chạy trọn 10 rounds cho MỘT counter, trả u53-mantissa bits của draw
-    được chọn (odd: 0 lấy (w0,w1), 1 lấy (w2,w3)). Trả int64 [0, 2^53)."""
+    """Run 10 Philox rounds for one counter and select a draw.
+
+    Args:
+        seed: 64-bit Philox key split into ``(k0, k1)`` u32 halves.
+        counter: 64-bit counter split into ``(c0, c1)`` u32 halves; the
+            upper counter words are zero.
+        odd: Draw selector; ``0`` packs ``(w0, w1)`` and ``1`` packs
+            ``(w2, w3)``.
+
+    Returns:
+        Int64 mantissa bits in ``[0, 2**53)`` for the selected draw.
+    """
     w0, w1, w2, w3 = philox4x32_10(  # pyright: ignore[reportGeneralTypeIssues]
         counter & _MASK32,
         (counter >> 32) & _MASK32,
@@ -100,10 +144,19 @@ def _philox_u53_bits(seed, counter, odd):
 
 @triton.jit
 def philox_u01(seed, flat):
-    """Uniform float64 trong [0, 1) tại địa chỉ `flat` của stream `seed`.
+    """Return a float64 uniform in ``[0, 1)`` for a stream address.
 
-    counter = flat >> 1, draw = flat & 1. Phải khớp bit
-    counter_uniform/counter_uniform_cols trong ayaka.sampling.rng.
+    Args:
+        seed: Philox key identifying the per-row stream.
+        flat: Flat stream address; ``flat >> 1`` is the counter and
+            ``flat & 1`` is the draw index.
+
+    Returns:
+        53-bit-precision uniform as float64.
+
+    Note:
+        Must stay bit-identical to ``counter_uniform`` and
+        ``counter_uniform_cols`` in ``ayaka.sampling.rng``.
     """
     counter = flat >> 1
     v = _philox_u53_bits(seed, counter, flat & 1)
@@ -112,11 +165,22 @@ def philox_u01(seed, flat):
 
 @triton.jit
 def philox_u01_f32(seed, flat):
-    """Biến thể float32 24-bit cho đường CDF-scan (topk_topp.py).
+    """Return a float32 uniform in ``[0, 1)`` for a stream address.
 
-    Lấy 24 bit cao của draw để u luôn biểu diễn được CHÍNH XÁC trong float32
-    (53-bit cast xuống float32 có thể tròn thành 1.0 — vô hại ở gumbel-argmax
-    nhưng đổi semantics CDF-scan so với bản FlashInfer port).
+    Args:
+        seed: Philox key identifying the per-row stream.
+        flat: Flat stream address; ``flat >> 1`` is the counter and
+            ``flat & 1`` is the draw index.
+
+    Returns:
+        24-bit-precision uniform as float32.
+
+    Note:
+        CDF-scan path used by ``topk_topp.py``. Keeps the high 24 bits of
+        the draw so ``u`` is always exactly representable in float32.
+        Casting the 53-bit value down could round to ``1.0``: harmless for
+        Gumbel-argmax but a semantics change for the CDF scan versus the
+        ported FlashInfer behavior.
     """
     counter = flat >> 1
     v = _philox_u53_bits(seed, counter, flat & 1)
