@@ -4,6 +4,7 @@ import enum
 from dataclasses import dataclass, field
 
 from ayaka.attention.spec import AttentionGroupSpec
+from ayaka.caps import Cap
 from ayaka.types import (
     DType,
     KVLayoutKind,
@@ -406,6 +407,10 @@ class SamplingPlan:
     all_greedy: bool = True
     any_penalty: bool = False
     custom_ops: tuple[str, ...] = ()
+    # A4 — caps của từng custom op (custom_ops_caps[i] ↔ custom_ops[i]) và
+    # flag "mọi producer mask đều ARGMAX_INVARIANT" (AND caps của producers).
+    custom_ops_caps: tuple[Cap, ...] = ()
+    argmax_invariant: bool = False
 
     def __post_init__(self) -> None:
         if self.num_rows < 0 or self.num_mask_rows < 0:
@@ -415,6 +420,8 @@ class SamplingPlan:
                 f"num_mask_rows {self.num_mask_rows} < num_rows {self.num_rows}: "
                 "every constrained row needs at least one mask row"
             )
+        if len(self.custom_ops_caps) != len(self.custom_ops):
+            raise ValueError("custom_ops_caps must align 1:1 with custom_ops")
 
     @property
     def any_mask(self) -> bool:
@@ -422,13 +429,15 @@ class SamplingPlan:
 
     @property
     def graph_capturable(self) -> bool:
-        """Tier-2 custom ops run arbitrary user code and cannot be captured.
+        """Tier-2 custom ops phải tự khai CUDAGRAPH_SAFE mới capture được.
 
-        Stated as a property of the plan rather than discovered at capture
+        Trước đây mọi custom op bị cấm capture vô điều kiện; giờ quyết định
+        đọc từ caps mà op tự khai báo (ayaka.caps.Cap) tại thời điểm build —
+        stated as a property of the plan rather than discovered at capture
         time: TensorRT-LLM discovers it at capture time and the failure is a
         cryptic driver error inside a context manager.
         """
-        return not self.custom_ops
+        return all(cap & Cap.CUDAGRAPH_SAFE for cap in self.custom_ops_caps)
 
 
 @dataclass(frozen=True, slots=True)

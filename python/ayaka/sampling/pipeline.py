@@ -1,9 +1,9 @@
 """Pipeline sampling THAM CHIẾU — spec thứ tự các bước, KHÔNG phải runtime path.
 
 Sau M0 đường runtime duy nhất là ``ayaka.sampling.plan.Sampler``. File này giữ
-lại một bản cài đặt độc lập của CÙNG thứ tự, để tests so parity giữa bản
-runtime và bản spec (tests/sampling/test_pipeline_order.py). Đổi Sampler mà
-không đổi bản này (hoặc ngược lại) phải làm parity test đỏ.
+một bản cài đặt độc lập của CÙNG thứ tự để tests so parity giữa bản runtime và
+bản spec (tests/test_pipeline_order.py). Đổi Sampler mà không đổi bản này (hoặc
+ngược lại) phải làm parity test đỏ.
 
 THỨ TỰ CANONICAL (Sampler.__call__ cài đúng thứ tự này; đổi ở đây thì PHẢI đổi
 docstring Sampler và test_pipeline_order.py cùng lúc):

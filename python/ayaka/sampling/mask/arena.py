@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from ayaka.caps import Cap
 from ayaka.device.backend import DeviceBackend, get_backend
 from ayaka.sampling.footprint import SamplingFootprint, measure
 from ayaka.sampling.mask.producer import MaskRows
@@ -25,7 +26,12 @@ class MaskHandle:
     row_indices: torch.Tensor
     n_rows: int
     vocab_size: int
-    spec_caps: np.ndarray | None = None
+    # A4 — aggregate Cap (AND) của mọi producer đã ghi mask; consumer
+    # (Sampler greedy fast-path, spec verifier) đọc để quyết định fast path.
+    caps: Cap = Cap.NONE
+    # Số token accepted tối thiểu per stream (speculative verification gate)
+    # — từng là spec_caps, đổi tên cho đúng nghĩa.
+    accepted_per_stream: np.ndarray | None = None
 
 
 class BitmaskArena:

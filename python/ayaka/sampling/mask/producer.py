@@ -3,18 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from enum import Flag, auto
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from ayaka.caps import Cap
 
-class Cap(Flag):
-    NONE = 0
-    ARGMAX_INVARIANT = auto()
-    CUDAGRAPH_SAFE = auto()
-    SPEC_VERIFIABLE = auto()
-    COMMUTATIVE = auto()
+__all__ = ["Cap", "MaskRows", "MaskProducer"]
 
 
 class MaskRows:

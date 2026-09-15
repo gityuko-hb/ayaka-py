@@ -19,7 +19,11 @@ class ConstraintMatcher(Protocol):
 
 
 class GrammarMaskProducer:
-    caps = Cap.SPEC_VERIFIABLE | Cap.CUDAGRAPH_SAFE
+    # A4 — ARGMAX_INVARIANT: mask grammar chỉ có thể ĐỔI argmax khi winner
+    # unmasked bị chặn — khi winner allowed, argmax trên tập allowed giữ
+    # nguyên winner (bitmask chỉ loại token, không thêm). Sampler dùng cap
+    # này cho greedy fast-path (argmax trước, fallback khi winner bị chặn).
+    caps = Cap.SPEC_VERIFIABLE | Cap.CUDAGRAPH_SAFE | Cap.ARGMAX_INVARIANT
 
     __slots__ = ("_committed", "_eos", "_m")
 

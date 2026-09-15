@@ -13,6 +13,7 @@ from typing import (
     cast,
 )
 
+from ayaka.caps import Cap
 from ayaka.utils.import_utils import CapabilityError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -88,12 +89,14 @@ class OpHandle:
         kernel: Callable[..., Any],
         reference: Callable[..., Any] | None,
         mutates_args: list[str],
+        caps: Cap | None = None,
     ) -> None:
         self.name = name
         self.namespace = namespace
         self.kernel = kernel
         self.reference = reference
         self.mutates_args = mutates_args
+        self.caps = caps if caps is not None else Cap.NONE
         self._qualified = f"{namespace}::{name}"
         self._dispatch: Callable[..., Any] | None = None
         functools.update_wrapper(self, kernel)
@@ -288,6 +291,7 @@ def custom_op(
     reference: Callable[..., Any] | None = None,
     computed_args: dict[str, Callable[..., Any]] | None = None,
     dispatch_key: str = "CUDA",
+    caps: Cap | None = None,
 ) -> Any:
     """Register `fn` as a torch custom op.
 
@@ -321,6 +325,10 @@ def custom_op(
             than appearing in the schema.
         dispatch_key: Backend to bind to. ``CUDA`` unless you are
             registering a CPU or XPU variant.
+        caps: Ayaka capability bitmask (ayaka.caps.Cap) mà planner đọc khi
+            resolve custom ops cho sampling: CUDAGRAPH_SAFE cho phép op chạy
+            trong CUDA graph; ARGMAX_INVARIANT/COMMUTATIVE cho consumer
+            sampling tương ứng. Mặc định NONE — fail-closed.
 
     Returns:
         An `OpHandle`, callable like the original function.
@@ -343,6 +351,7 @@ def custom_op(
             kernel=registered_func,
             reference=reference,
             mutates_args=mutates_args or [],
+            caps=caps,
         )
         mutations = mutates_args or []
         signature = inspect.signature(registered_func)
@@ -448,6 +457,7 @@ def wrap_extern_op(
     reference: Callable[..., Any] | None = None,
     computed_args: dict[str, Callable[..., Any]] | None = None,
     dispatch_key: str = "CUDA",
+    caps: Cap | None = None,
 ) -> OpHandle:
     """Wrap a third-party kernel so Dynamo treats it as opaque.
 
@@ -468,6 +478,7 @@ def wrap_extern_op(
         reference=reference,
         computed_args=computed_args,
         dispatch_key=dispatch_key,
+        caps=caps,
     )
 
 
