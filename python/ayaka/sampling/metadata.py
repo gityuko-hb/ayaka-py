@@ -65,8 +65,10 @@ class SamplingMetadata:
         "_rows_stg",
         "_stg",
         "all_greedy",
+        "any_bias",
         "any_logprobs",
         "any_penalty",
+        "any_support_capture",
         "device",
         "max_batch_size",
         "n_active",
@@ -94,6 +96,8 @@ class SamplingMetadata:
         self.all_greedy = True
         self.any_penalty = False
         self.any_logprobs = False
+        self.any_support_capture = False
+        self.any_bias = False
 
         self._reset_range(0, max_batch_size)
         self._dirty.clear()
@@ -192,6 +196,18 @@ class SamplingMetadata:
             self._dirty.add(name)
 
     def apply_batch_update(self, upd: BatchUpdate) -> None:
+        """Apply a batch mutation delta updating allocated and active slots.
+
+        Processes deallocations, admissions, and slot migrations in O(|delta|)
+        time, avoiding full batch scans. Updates `n_active` and recomputes batch flags.
+
+        Args:
+            upd: Batch update delta containing added, removed, and moved requests.
+
+        Raises:
+            ValueError: If `upd.batch_size` exceeds `max_batch_size`.
+            IndexError: If an added slot index is out of bounds.
+        """
         if upd.batch_size > self.max_batch_size:
             raise ValueError(
                 f"batch_size {upd.batch_size} exceeds capacity {self.max_batch_size}; "
@@ -228,6 +244,7 @@ class SamplingMetadata:
         self._reset_range(slot, slot + 1)
 
     def set_slot(self, slot: int, params: SamplingParams, *, request_index: int = 0) -> None:
+        """Configure parameters for a slot, automatically updating `n_active` if necessary."""
         if not 0 <= slot < self.max_batch_size:
             raise IndexError(f"slot {slot} out of range [0, {self.max_batch_size})")
         self._write(slot, columns_of(params, request_index=request_index))
@@ -235,6 +252,11 @@ class SamplingMetadata:
         self._recompute_flags()
 
     def step_rng(self) -> None:
+        """Increment the RNG offset by 1 for all currently active batch rows.
+
+        Marks the offset column dirty to ensure updated offsets mirror to device
+        on the next flush.
+        """
         if not self.n_active:
             return
         rows = self._rows_cpu()
@@ -250,6 +272,8 @@ class SamplingMetadata:
             self.all_greedy = True
             self.any_penalty = False
             self.any_logprobs = False
+            self.any_support_capture = False
+            self.any_bias = False
             return
         rows = self._rows_cpu()
 
@@ -267,6 +291,8 @@ class SamplingMetadata:
             or torch.any(column("pres_penalty") != 0.0).item()
         )
         self.any_logprobs = bool(torch.any(column("logprobs_k") >= 0).item())
+        self.any_support_capture = bool(torch.any(column("return_support") != 0).item())
+        self.any_bias = bool(torch.any(column("bias_count") > 0).item())
 
     def host_scalar(self, name: str, slot: int) -> int | float:
         """Host staging value for one slot — no device sync, no active-row map.
@@ -283,6 +309,16 @@ class SamplingMetadata:
         return staging[slot].item()
 
     def flush(self, stream: Any = None) -> int:
+        """Synchronize dirty host staging columns and active-row indices to device memory.
+
+        Executes asynchronous non-blocking copies on CUDA streams when available.
+
+        Args:
+            stream: Optional CUDA stream context to order copy operations.
+
+        Returns:
+            Number of distinct column buffers copied from host to device.
+        """
         if self.n_active == 0:
             self._dirty.clear()
             self._rows_dirty = False
@@ -318,10 +354,13 @@ class SamplingMetadata:
         return count
 
     def footprint(self) -> SamplingFootprint:
+        """Measure the aggregate memory allocation footprint of all managed tensors."""
         return measure([*self._dev.values(), *self._stg.values(), self._rows_dev, self._rows_stg])
 
     def data_ptrs(self) -> dict[str, tuple[int, int]]:
+        """Return memory buffer pointers for device and host tensors per column."""
         return {n: (self._dev[n].data_ptr(), self._stg[n].data_ptr()) for n in ALL_COLUMNS}
 
     def dirty_columns(self) -> frozenset[str]:
+        """Return the set of column names currently marked dirty in host staging."""
         return frozenset(self._dirty)
