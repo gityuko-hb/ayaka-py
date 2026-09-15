@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from ayaka.caps import Cap
 from ayaka.plan import SamplingPlan
+from ayaka.sampling.custom.executor import apply_custom_ops
 from ayaka.sampling.mask.arena import MaskHandle
 from ayaka.sampling.mask.pipeline import MaskEntry
 from ayaka.sampling.mask.producer import MaskProducer
 from ayaka.sampling.metadata import SamplingMetadata
+from ayaka.sampling.ops import bias as _bias
 from ayaka.sampling.ops import penalties as _pen
 from ayaka.sampling.ops.bitmask import apply_allow_bitmask_
-from ayaka.sampling.ops.topk_topp import softmax_stats_scaled, topk_topp_sample
+from ayaka.sampling.ops.topk_topp import (
+    softmax_stats_scaled,
+    topk_first_hint,
+    topk_topp_sample,
+)
+from ayaka.sampling.trace import trace_sampler
 from ayaka.utils.import_utils import CapabilityError
 
 __all__ = ["MaskSchedule", "Sampler", "SamplerOutput", "SamplingPlanner"]
@@ -22,32 +30,40 @@ __all__ = ["MaskSchedule", "Sampler", "SamplerOutput", "SamplingPlanner"]
 
 @dataclass(frozen=True, slots=True)
 class MaskSchedule:
-    """Các entry mask của step — MỘT entry per (slot, producer).
+    """Schedule of mask entries to materialize for a sampling step.
 
-    A4b — một slot có thể mang NHIỀU producer: entry đầu (thứ tự khai báo)
-    là primary (window chính, ghi row_indices), các entry sau là scratch
-    (emit riêng rồi intersect AND vào window chính).
+    A single slot may be bound to multiple mask producers: the initial entry
+    (in registration order) serves as the primary window recorded in `row_indices`,
+    while subsequent entries represent scratch space emitted independently and
+    intersected via bitwise AND into the primary window.
+
+    Attributes:
+        entries: Ordered sequence of mask entries scheduled for the step.
     """
 
     entries: tuple[MaskEntry, ...] = ()
 
     @property
     def num_rows(self) -> int:
+        """Return total primary mask rows across all non-scratch scheduled entries."""
         return sum(e.propose_step + 1 for e in self.entries if not e.scratch)
 
     @property
     def num_scratch_rows(self) -> int:
+        """Return total scratch mask rows scheduled across secondary producers."""
         return sum(e.propose_step + 1 for e in self.entries if e.scratch)
 
     @property
     def caps(self) -> Cap:
-        """Aggregate theo AND: capability chỉ đúng khi MỌI producer có."""
+        """Aggregate producer capabilities via bitwise AND across all entries."""
         return _aggregate_caps(self.entries)
 
     def matches(self, plan: SamplingPlan) -> bool:
+        """Check whether the schedule row count matches the declared plan row count."""
         return self.num_rows == plan.num_mask_rows
 
     def require_match(self, plan: SamplingPlan) -> None:
+        """Assert that the schedule row count matches the plan; raise otherwise."""
         if not self.matches(plan):
             raise ValueError(
                 f"mask schedule has {self.num_rows} rows but the plan declares "
@@ -56,6 +72,7 @@ class MaskSchedule:
 
 
 def _aggregate_caps(entries: tuple[MaskEntry, ...]) -> Cap:
+    """Compute aggregate capability flags by intersecting all producer capabilities."""
     caps = Cap.ARGMAX_INVARIANT | Cap.SPEC_VERIFIABLE | Cap.COMMUTATIVE
     for entry in entries:
         producer_caps = getattr(entry.producer, "caps", Cap.NONE)
@@ -65,12 +82,23 @@ def _aggregate_caps(entries: tuple[MaskEntry, ...]) -> Cap:
 
 @dataclass(slots=True)
 class SamplerOutput:
+    """Output container produced by the sampling execution pipeline.
+
+    Attributes:
+        token_ids: Tensor of sampled token ids of shape `[batch_size]`.
+        stats: Optional tuple `(max_prob, entropy, exp_entropy)` if requested.
+    """
+
     token_ids: torch.Tensor
     stats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 class SamplingPlanner:
-    """Attach NHIỀU producer per slot (A4b); build freeze plan + schedule."""
+    """Plans mask scheduling, custom operator validation, and sampling plan freezing.
+
+    Supports binding multiple mask producers per slot and freezing deterministic
+    execution plans prior to launching the forward pass.
+    """
 
     __slots__ = ("_producers", "max_batch_size")
 
@@ -100,11 +128,29 @@ class SamplingPlanner:
         commits: dict[int, tuple[int, ...]] | None = None,
         custom_ops: tuple[str, ...] = (),
     ) -> tuple[SamplingPlan, MaskSchedule]:
+        """Build and freeze the sampling execution plan and mask schedule for a step.
+
+        Validates requested custom operators against the registry, enforces speculative
+        decoding capability invariants on attached mask producers, and constructs
+        immutable `SamplingPlan` and `MaskSchedule` instances.
+
+        Args:
+            md: Sampling metadata for the current engine state.
+            drafts: Optional mapping of slot indices to speculative draft token sequences.
+            commits: Optional mapping of slot indices to committed token sequences.
+            custom_ops: Names of registered custom operators to execute in this step.
+
+        Returns:
+            A tuple of `(plan, schedule)` frozen for the upcoming forward pass.
+
+        Raises:
+            CapabilityError: If a custom op is unregistered or if a draft is provided
+                for a producer lacking `Cap.SPEC_VERIFIABLE`.
+        """
         drafts = drafts or {}
         commits = commits or {}
 
-        # Tier-2: resolve custom ops qua registry — op chưa đăng ký là lỗi
-        # capability (không còn raise vô điều kiện với MỌI custom op).
+        # Resolve custom operators via the registry; unregistered operators raise a CapabilityError.
         if custom_ops:
             from ayaka.kernel.ops import registered_ops
 
@@ -132,14 +178,14 @@ class SamplingPlanner:
 
         entries: list[MaskEntry] = []
         mask_row = 0
-        scratch_row = 0  # cấp sau toàn bộ primary block
+        scratch_row = 0  # Secondary entries allocated after the primary block.
         argmax_invariant = True
         for slot in sorted(self._producers):
             if slot >= md.n_active:
                 continue
             draft = drafts.get(slot, ())
             if draft and len(draft) > 0:
-                # Tier-1: draft của producer thiếu SPEC_VERIFIABLE → từ chối.
+                # Reject speculative draft tokens if any attached producer lacks SPEC_VERIFIABLE.
                 for producer in self._producers[slot]:
                     caps = getattr(producer, "caps", Cap.NONE)
                     if not caps & Cap.SPEC_VERIFIABLE:
@@ -191,6 +237,7 @@ class SamplingPlanner:
             num_mask_rows=schedule.num_rows,
             all_greedy=md.all_greedy,
             any_penalty=md.any_penalty,
+            any_bias=md.any_bias,
             custom_ops=custom_ops,
             custom_ops_caps=custom_ops_caps,
             argmax_invariant=argmax_invariant and bool(self._producers),
@@ -200,15 +247,17 @@ class SamplingPlanner:
 
 
 class Sampler:
-    __slots__ = ("need_stats", "penalty_state")
+    __slots__ = ("bias_state", "need_stats", "penalty_state")
 
     def __init__(
         self,
         penalty_state: _pen.PenaltyState | None = None,
         need_stats: bool = False,
+        bias_state: Any | None = None,
     ) -> None:
         self.penalty_state = penalty_state
         self.need_stats = need_stats
+        self.bias_state = bias_state
 
     def __call__(
         self,
@@ -219,22 +268,38 @@ class Sampler:
         *,
         force_reference: bool = False,
     ) -> SamplerOutput:
-        """Canonical sampling order, the single runtime semantics (M0).
+        """Execute the canonical sampling stage pipeline on logits.
 
-        raw logits
-          -> penalties (rep/freq/pres, in-place)
-          -> allowed-token / grammar mask (in-place, NEG_INF)
-             [A4 fast-path: mọi producer ARGMAX_INVARIANT + all_greedy →
-              argmax trên logits CHƯA mask; winner bị bitmask chặn → fallback
-              đường apply-mask đầy đủ]
-          -> temperature scaling (exactly once, before stats and filtering)
-          -> sampling-distribution stats
-          -> greedy argmax | top-k/top-p/min-p + sample
-          -> per-row greedy override for mixed batches
+        Stage Execution Order:
+            1. Custom operators: Applied sequentially (in-place or functional rebind).
+            2. Penalties: Repetition, frequency, and presence penalties applied in place.
+            3. Allowed-token / grammar bitmask: Applied in place (unmasked values -> -inf).
+               Fast path: When all producers are ARGMAX_INVARIANT, the batch is all greedy,
+               and no statistics are requested, evaluate unmasked argmax. If the candidate
+               is allowed by the bitmask, bypass full mask tensor application.
+            4. Temperature scaling: Scaled exactly once prior to statistics and filtering.
+            5. Sampling statistics: Softmax distribution statistics computed on scaled logits.
+            6. Draw: Greedy argmax or stochastic top-k / top-p / min-p selection.
+            7. Per-row greedy override: Enforce deterministic argmax for temperature=0 rows
+               in mixed batches.
 
-        Greedy is NOT an early exit before penalty/mask: those transforms can
-        change argmax. Greedy only skips the stochastic filter/sample stage.
-        Fail-closed validation happens before any in-place mutation.
+        Notes:
+            Greedy decoding does NOT exit early before custom operators, penalties,
+            or masking, as those transforms can alter the argmax index. Greedy execution
+            only bypasses stochastic filtering and random drawing stages.
+
+        Args:
+            logits: Model logits tensor of shape `[batch_size, vocab_size]`.
+            md: Sampling metadata container.
+            plan: Frozen sampling plan declaring stage requirements.
+            mask: Optional handle containing bitmasks and row indices.
+            force_reference: Whether to force CPU reference kernel implementations.
+
+        Returns:
+            SamplerOutput containing sampled token ids and optional distribution statistics.
+
+        Raises:
+            ValueError: If logits rows or mask presence disagree with the frozen plan.
         """
         if logits.size(0) != plan.num_rows:
             raise ValueError(f"logits has {logits.size(0)} rows, plan declares {plan.num_rows}")
@@ -243,28 +308,39 @@ class Sampler:
                 f"mask={'present' if mask is not None else 'None'} disagrees with "
                 f"plan.any_mask={plan.any_mask}"
             )
+        trace_sampler(
+            "forward_enter",
+            rows=logits.size(0),
+            vocab=logits.size(1),
+            all_greedy=plan.all_greedy,
+            any_mask=plan.any_mask,
+            any_penalty=plan.any_penalty,
+            custom_ops=plan.custom_ops or None,
+        )
         if plan.custom_ops:
-            raise CapabilityError(
-                "sampling_custom_ops",
-                detail=(
-                    f"plan requires custom ops {plan.custom_ops}, but the sampling "
-                    "custom-op executor has not been ported"
-                ),
-                remedy="drop custom_ops from the plan, or port ayaka.sampling.custom",
-            )
+            logits = apply_custom_ops(logits, plan)
+            trace_sampler("custom_ops_done", ops=plan.custom_ops)
+
+        if plan.any_bias and self.bias_state is not None:
+            _bias.apply_bias_(logits, md, self.bias_state)
+            trace_sampler("bias_done")
 
         if plan.any_penalty and self.penalty_state is not None:
             _pen.apply_penalties_(logits, md, self.penalty_state)
+            trace_sampler("penalties_done")
 
         if mask is not None:
             fast_path = plan.argmax_invariant and plan.all_greedy and not self.need_stats
             if fast_path:
                 winner = _greedy_winner_with_mask_check(logits, mask)
                 if winner is not None:
-                    # Mọi winner đều allowed → mask không đổi argmax ⇒ bỏ
-                    # qua apply O(n×V). RNG offset vẫn do caller advance.
+                    # All greedy winners are permitted by mask; skip O(N x V) bitmask application.
+                    # RNG offset advancement remains the caller's responsibility.
+                    trace_sampler("mask_fast_path_hit")
                     return SamplerOutput(token_ids=winner, stats=None)
+                trace_sampler("mask_fast_path_miss")
             apply_allow_bitmask_(logits, mask.masks, mask.row_indices, mask.vocab_size)
+            trace_sampler("mask_applied")
 
         temperature = md.active("temperature")
         scaled = logits / temperature.clamp_min(1e-6).unsqueeze(1)
@@ -272,8 +348,11 @@ class Sampler:
         stats = softmax_stats_scaled(scaled) if self.need_stats else None
 
         if plan.all_greedy:
+            trace_sampler("greedy_returned", rows=logits.size(0))
             return SamplerOutput(token_ids=scaled.argmax(dim=-1), stats=stats)
 
+        host_top_k = md.staging("top_k")
+        allow_topk_first = topk_first_hint(host_top_k, scaled.size(1))
         tok = topk_topp_sample(
             scaled,
             md.active("top_k"),
@@ -282,6 +361,7 @@ class Sampler:
             md.active("seed"),
             md.active("offset"),
             force_reference=force_reference,
+            allow_topk_first=allow_topk_first,
         )
         # Mixed batches need per-row greedy: a temperature-0 row must be argmax
         # (first maximal index), not a softmax draw among tied maxima at 1e-6.
@@ -290,15 +370,27 @@ class Sampler:
         greedy_rows = (temperature == 0.0) | (md.active("top_k") == 1)
         if bool(greedy_rows.any()):
             tok = torch.where(greedy_rows, scaled.argmax(dim=-1).to(tok.dtype), tok)
+        trace_sampler("forward_returned", dtype=str(tok.dtype))
         return SamplerOutput(token_ids=tok, stats=stats)
 
     forward = __call__
 
 
 def _greedy_winner_with_mask_check(logits: torch.Tensor, mask: MaskHandle) -> torch.Tensor | None:
-    """Argmax unmasked + kiểm winner trong bitmask; None nếu có row vi phạm
-    (caller fallback apply-mask). argmax trên logits GỐC — scaling temperature
-    không đổi argmax (clamp 1e-6 chỉ chạm temperature == 0 → chia constant)."""
+    """Evaluate unmasked argmax and verify winner compliance against bitmask.
+
+    Performs argmax directly on unmasked logits. If all selected tokens are allowed
+    by the mask bitmask, returns the winning token ids. If any row is rejected,
+    returns None to trigger the full mask application fallback path.
+
+    Args:
+        logits: Raw unmasked logits tensor.
+        mask: Mask handle containing bitmasks and row mapping indices.
+
+    Returns:
+        Tensor of shape `[batch_size]` containing valid argmax token ids if all comply,
+        or None if any token violates the mask constraint.
+    """
     winner = logits.argmax(dim=-1)
     masks = mask.masks
     rows = mask.row_indices.to(torch.long)
