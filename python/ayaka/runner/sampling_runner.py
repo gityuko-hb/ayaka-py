@@ -84,6 +84,15 @@ class SamplingRunner:
                     ),
                     remedy="wire the model runner (ModelSamplingRunner) for logprobs",
                 )
+            if self._coordinator.token_ids_logprobs_for(scheduled.request_id) is not None:
+                raise CapabilityError(
+                    "token_ids_logprobs",
+                    detail=(
+                        "the provider-based sampling runner cannot score specific "
+                        "token logprobs; it never sees the model's pre-transform logits"
+                    ),
+                    remedy="wire the model runner (ModelSamplingRunner) for logprobs",
+                )
         logits = self._provider(prepared.step)
         if not isinstance(logits, torch.Tensor):
             raise TypeError("logits provider must return a torch.Tensor")
@@ -93,8 +102,10 @@ class SamplingRunner:
                 f"got {tuple(logits.shape)}"
             )
         self._coordinator.flush()
-        token_ids = self._coordinator.sample(logits, plan, force_reference=self._force_reference)
-        return SampleOutputs(token_ids=token_ids)
+        token_ids, support = self._coordinator.sample_with_support(
+            logits, plan, force_reference=self._force_reference
+        )
+        return SampleOutputs(token_ids=token_ids, sampling_support=support)
 
     def close(self) -> None:
         self._closed = True

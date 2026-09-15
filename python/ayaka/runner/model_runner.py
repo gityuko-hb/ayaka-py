@@ -55,9 +55,12 @@ from ayaka.sampling.logprobs import (
     LogprobPlan,
     PromptLogprobSliceReport,
     SampleLogprobTensors,
+    TokenIdsLogprobTensors,
     compute_prompt_logprobs,
     compute_raw_logprobs,
     compute_sampling_logprobs,
+    compute_token_ids_raw_logprobs,
+    compute_token_ids_sampling_logprobs,
 )
 from ayaka.sched.plan import PreparedStep
 
@@ -73,6 +76,15 @@ class _SamplingReportRow:
 
 
 @dataclass(frozen=True, slots=True)
+class _IdsReportRow:
+    """One row requesting logprobs for specific token ids."""
+
+    sampling_row: int
+    tokens: tuple[int, ...]
+    mode: LogprobMode
+
+
+@dataclass(frozen=True, slots=True)
 class _GenerationReport:
     """Generation report rows split by mode (the two distributions are
     observed at different pipeline points: raw needs the pre-mutation
@@ -80,6 +92,8 @@ class _GenerationReport:
 
     raw: tuple[LogprobEntry, ...]
     sampling: tuple[_SamplingReportRow, ...]
+    ids: tuple[_IdsReportRow, ...] = ()
+    ids_raw_count: int = 0
 
 
 class ModelSamplingRunner:
@@ -131,6 +145,7 @@ class ModelSamplingRunner:
         gen_logprobs = None
         gen_rows: tuple[int, ...] = ()
         prompt_logprobs = None
+        support = None
         if total_rows > 0:
             logits = self._logits(hidden_packed, logits_plan)
 
@@ -142,7 +157,7 @@ class ModelSamplingRunner:
             if plan.num_rows:
                 # Sampler consumes only the sampling-row prefix of the packed
                 # logits (LogitsPlan contract); prompt rows live beyond it.
-                token_ids = self._coordinator.sample(
+                token_ids, support = self._coordinator.sample_with_support(
                     logits.narrow(0, 0, plan.num_rows),
                     plan,
                     force_reference=self._force_reference,
@@ -151,16 +166,20 @@ class ModelSamplingRunner:
                 token_ids = torch.empty(0, dtype=torch.long, device=logits.device)
 
             gen_logprobs, gen_rows = self._generation_logprobs(logits, token_ids, report, snapshot)
+            ids_logprobs, ids_rows, ids_counts = self._ids_logprobs(
+                logits, token_ids, report, snapshot
+            )
 
             prompt_rows = sum(len(entry.positions) for entry in step.prompt_logprobs)
             if prompt_rows and snapshot is not None:
                 prompt_logprobs = compute_prompt_logprobs(
-                    snapshot[len(report.raw) :],
+                    snapshot[len(report.raw) + report.ids_raw_count :],
                     torch.tensor(prompt_targets, dtype=torch.long, device=logits.device),
                     prompt_ks,
                 )
         else:
             token_ids = torch.empty(0, dtype=torch.long)
+            ids_logprobs, ids_rows, ids_counts = None, (), ()
 
         return SampleOutputs(
             token_ids=token_ids,
@@ -168,6 +187,10 @@ class ModelSamplingRunner:
             logprob_rows=gen_rows,
             prompt_logprobs=prompt_logprobs,
             prompt_logprob_slices=tuple(prompt_descriptors),
+            sampling_support=support,
+            token_ids_logprobs=ids_logprobs,
+            ids_logprob_rows=ids_rows,
+            ids_logprob_counts=ids_counts,
         )
 
     def close(self) -> None:
@@ -186,6 +209,8 @@ class ModelSamplingRunner:
         """
         raw: list[LogprobEntry] = []
         sampling: list[_SamplingReportRow] = []
+        ids: list[_IdsReportRow] = []
+        ids_raw_count = 0
         row = 0
         for scheduled in step.slices:
             if not scheduled.sample_last_query:
@@ -196,8 +221,16 @@ class ModelSamplingRunner:
                     raw.append(LogprobEntry(sampling_row=row, k=k))
                 else:
                     sampling.append(_SamplingReportRow(sampling_row=row, k=k))
+            ids_tokens = self._coordinator.token_ids_logprobs_for(scheduled.request_id)
+            if ids_tokens:
+                mode = self._coordinator.logprob_mode_for(scheduled.request_id)
+                ids.append(_IdsReportRow(sampling_row=row, tokens=ids_tokens, mode=mode))
+                if mode is LogprobMode.RAW:
+                    ids_raw_count += 1
             row += 1
-        return _GenerationReport(raw=tuple(raw), sampling=tuple(sampling))
+        return _GenerationReport(
+            raw=tuple(raw), sampling=tuple(sampling), ids=tuple(ids), ids_raw_count=ids_raw_count
+        )
 
     def _forward_rows(self, step):
         """Forward every slice that samples or scores; gather its needed rows.
@@ -272,10 +305,12 @@ class ModelSamplingRunner:
 
         SAMPLING-mode rows never enter the snapshot: their distribution is
         read from the post-mutation logits after the draw. Order: raw
-        generation rows first (their sampling-row indices), then prompt rows
+        generation rows first (their sampling-row indices), then raw-ids
+        rows (same snapshot, scored for specific tokens), then prompt rows
         in (slice, position) order — matching the compute helpers.
         """
         gen_rows = [entry.sampling_row for entry in report.raw]
+        gen_rows.extend(row.sampling_row for row in report.ids if row.mode is LogprobMode.RAW)
         prompt_rows: list[int] = []
         cursor = sampling_count
         for prompt_report in prompt_descriptors:
@@ -286,6 +321,72 @@ class ModelSamplingRunner:
             return None
         rows = torch.tensor([*gen_rows, *prompt_rows], dtype=torch.long, device=logits.device)
         return logits.index_select(0, rows).to(torch.float32)
+
+    def _ids_logprobs(
+        self,
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+        report: _GenerationReport,
+        snapshot,
+    ) -> tuple[TokenIdsLogprobTensors | None, tuple[int, ...], tuple[int, ...]]:
+        """Logprob cho token cụ thể theo mode của từng row.
+
+        RAW rows đọc snapshot (sau các raw top-k rows); SAMPLING rows đọc
+        post-mutation packed logits. Trả (payload, rows sorted, counts).
+        """
+        if not report.ids:
+            return None, (), ()
+        md = self._coordinator.md
+        parts: list[tuple[int, tuple[int, ...], TokenIdsLogprobTensors, int]] = []
+        raw_index = 0
+        for entry in report.ids:
+            if entry.mode is LogprobMode.RAW:
+                assert snapshot is not None
+                offset = len(report.raw) + raw_index
+                z = snapshot[offset]
+                tensors = compute_token_ids_raw_logprobs(
+                    z.unsqueeze(0),
+                    (entry.tokens,),
+                    token_ids[entry.sampling_row : entry.sampling_row + 1],
+                )
+                raw_index += 1
+            else:
+                processed = logits[entry.sampling_row : entry.sampling_row + 1]
+                tensors = compute_token_ids_sampling_logprobs(
+                    processed,
+                    (entry.tokens,),
+                    token_ids[entry.sampling_row : entry.sampling_row + 1],
+                    md.active("temperature").index_select(
+                        0, torch.tensor([entry.sampling_row], device=logits.device)
+                    ),
+                    md.active("top_k").index_select(
+                        0, torch.tensor([entry.sampling_row], device=logits.device)
+                    ),
+                    md.active("top_p").index_select(
+                        0, torch.tensor([entry.sampling_row], device=logits.device)
+                    ),
+                    md.active("min_p").index_select(
+                        0, torch.tensor([entry.sampling_row], device=logits.device)
+                    ),
+                )
+            parts.append((entry.sampling_row, entry.tokens, tensors, 0))
+
+        parts.sort(key=lambda part: part[0])
+        count = len(parts)
+        width = max(len(part[1]) for part in parts)
+        device = logits.device
+        merged = torch.full((count, width), float("-inf"), dtype=torch.float32, device=device)
+        merged_selected = torch.empty(count, dtype=torch.float32, device=device)
+        for index, (_row, tokens, tensors, _idx) in enumerate(parts):
+            length = len(tokens)
+            if length:
+                merged[index, :length] = tensors.logprobs[0, :length]
+            merged_selected[index] = tensors.token_logprob[0]
+        return (
+            TokenIdsLogprobTensors(logprobs=merged, token_logprob=merged_selected),
+            tuple(part[0] for part in parts),
+            tuple(len(part[1]) for part in parts),
+        )
 
     def _generation_logprobs(
         self,
