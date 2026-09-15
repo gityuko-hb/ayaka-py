@@ -354,11 +354,7 @@ def index_select_storage(torch: Any, source: Any, indices: Any) -> Any:
     """
     idx_tensor = _extract_index_tensor(indices)
     if is_fp8_storage_dtype(dtype_name(source.dtype)):
-        return (
-            source.view(torch.uint8)
-            .index_select(0, idx_tensor)
-            .view(source.dtype)
-        )
+        return source.view(torch.uint8).index_select(0, idx_tensor).view(source.dtype)
     return source.index_select(0, idx_tensor)
 
 

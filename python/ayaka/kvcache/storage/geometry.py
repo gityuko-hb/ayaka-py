@@ -168,9 +168,13 @@ class BaseKVStorageSpec(ABC):
             f"{self.bytes_per_token_per_layer} B/token/layer"
         )
 
-    def with_capacity_pages(self, capacity_pages: int) -> BaseKVStorageSpec: ...
+    @abstractmethod
+    def with_capacity_pages(self, capacity_pages: int) -> BaseKVStorageSpec:
+        """Return a copy of this spec with a different page capacity."""
 
-    def with_num_layers(self, num_layers: int) -> BaseKVStorageSpec: ...
+    @abstractmethod
+    def with_num_layers(self, num_layers: int) -> BaseKVStorageSpec:
+        """Return a copy of this spec with a different layer count."""
 
 
 def _check_positive_inits(**values: int) -> None:
@@ -293,6 +297,7 @@ class MHAStorageSpec(BaseKVStorageSpec):
             self.dtype,
             self.layout,
             self._quantization_policy.scheme,
+            self._quantization_policy.require_calibration,
         )
 
     def with_capacity_pages(self, capacity_pages: int) -> MHAStorageSpec:
@@ -377,6 +382,7 @@ class MLAStorageSpec(BaseKVStorageSpec):
             self.dtype,
             self.layout,
             self._quantization_policy.scheme,
+            self._quantization_policy.require_calibration,
         )
 
     def with_capacity_pages(self, capacity_pages: int) -> MLAStorageSpec:

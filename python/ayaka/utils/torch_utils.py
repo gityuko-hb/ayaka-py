@@ -252,7 +252,7 @@ def supports_fp8(index: int = 0) -> bool:
     Note the gap this predicate is really about: FP8 *storage* works anywhere
     the dtype exists, because it is bytes. What needs sm_89 is arithmetic. A KV
     cache in FP8 on an Ampere card is legal and slow, not illegal -- see
-    ``ayaka.cache.kv.storage.validation``.
+    ``ayaka.kvcache.storage.validation``.
     """
     return _at_least(SM_ADA, index)
 

@@ -12,12 +12,15 @@ from ayaka.utils.torch_utils import require_torch
 DEFAULT_SCORE_BUDGET_BYTES: Final[int] = 512 * 1024 * 1024
 _FP32_BYTES: Final[int] = 4
 
+
 def _validate(torch: Any, query: Any, key: Any, value: Any, query_positions: Any) -> Any:
     """Shared shape / device / range checks. Returns the positions tensor."""
     if any(not isinstance(tensor, torch.Tensor) for tensor in (query, key, value)):
         raise TypeError("query, key, and value must be tensors")
     if query.ndim != 3 or key.ndim != 3 or value.shape != key.shape:
         raise ValueError("attention tensors must use token-head-dim layout")
+    if key.shape[1] == 0:
+        raise ValueError("the retained attention cache must have at least one KV head")
     if query.shape[2] != key.shape[2] or query.shape[1] % key.shape[1]:
         raise ValueError("query and K/V head geometry is incompatible")
     if key.shape[0] == 0:
@@ -35,6 +38,7 @@ def _validate(torch: Any, query: Any, key: Any, value: Any, query_positions: Any
         raise ValueError("query_positions address outside the attention cache")
     return positions
 
+
 def _resolve_scale(query: Any, scale: float | None) -> float:
     """Resolve and validate the score scale.
 
@@ -48,6 +52,7 @@ def _resolve_scale(query: Any, scale: float | None) -> float:
     if not math.isfinite(scale):
         raise ValueError("scale must be finite")
     return float(scale)
+
 
 def _start_tensor(torch: Any, policy: RetentionPolicy, positions: Any, layer_id: int) -> Any:
     """Per-query window starts, vectorized when the policy is a suffix window.
@@ -64,6 +69,7 @@ def _start_tensor(torch: Any, policy: RetentionPolicy, positions: Any, layer_id:
         return (positions + 1 - int(span)).clamp_(min=0)
     starts = window_starts(policy, tuple(positions.tolist()), layer_id=layer_id)
     return torch.as_tensor(starts, dtype=torch.long, device=positions.device)
+
 
 def reference_retained_attention(
     query: Any,
@@ -112,7 +118,7 @@ def reference_retained_attention(
             f"({num_queries} queries x {num_heads} heads x {num_cached} cached tokens, fp32), "
             f"over the {score_budget_bytes / 2**20:.0f} MiB budget. "
             "Use reference_retained_attention_chunked() or raise score_budget_bytes."
-    )
+        )
 
     attention_scale = _resolve_scale(query, scale)
 
@@ -135,6 +141,7 @@ def reference_retained_attention(
     probabilities = torch.softmax(scores, dim=-1)
     output = torch.einsum("qhl,lhd->qhd", probabilities, expanded_value.float())
     return output.to(dtype=query.dtype)
+
 
 def reference_retained_attention_chunked(
     query: Any,

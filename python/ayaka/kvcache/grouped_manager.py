@@ -82,7 +82,7 @@ from ayaka.memory.views import (
 )
 from ayaka.prefix.identity import PrefixCacheContext
 from ayaka.prefix.interface import PrefixLookupResult
-from ayaka.utils.validation import require_int
+from ayaka.utils.validation import require_int, require_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,8 +230,14 @@ class KVCacheGroupManager:
 
     @property
     def prefix_capability(self) -> LayoutFeatureCapability:
-        """Layout-level prefix capability of the configured groups."""
-        return prefix_cache_capability(self.cache_groups)  # type: ignore
+        """Layout-level prefix capability of the configured groups.
+
+        This states only whether the *layout* could host a prefix cache. The
+        manager itself implements no prefix lookup, so callers gating a code
+        path should use :meth:`require_prefix_cache_supported`, which folds in
+        the manager-level limitation.
+        """
+        return prefix_cache_capability(self.cache_groups)
 
     def _prefix_reuse_capability(self) -> LayoutFeatureCapability:
         """Report prefix reuse as unimplemented even for compatible layouts.
@@ -301,10 +307,10 @@ class KVCacheGroupManager:
         """Allocate a fresh generation-safe grouped sequence identity.
 
         Raises:
+            ValueError: if ``request_id`` is not a non-empty string.
             SequenceCapacityError: if the arena is full.
         """
-        if not request_id:
-            raise ValueError("request_id must not be empty")
+        require_text(request_id, "request_id")
         with self._lock:
             if not self._free_sequence_indices:
                 raise SequenceCapacityError("sequence arena is full")
@@ -1196,12 +1202,16 @@ class KVCacheGroupManager:
             )
 
     def require_prefix_cache_supported(self) -> None:
-        """Raise when the configured groups cannot use A6 prefix sharing.
+        """Raise when this manager cannot serve A6 prefix sharing.
+
+        Checks the *manager-level* capability, so a layout that is structurally
+        compatible still fails closed here: the grouped manager implements no
+        prefix lookup, and a caller must not be told otherwise.
 
         Raises:
             LayoutFeatureCompatibilityError: when prefix reuse is unsupported.
         """
-        self.prefix_capability.require_supported()
+        self._prefix_reuse_capability().require_supported()
 
     def snapshot(self) -> GroupedMemorySnapshot:
         """Return per-group accounting plus cross-group totals."""
@@ -1471,7 +1481,7 @@ class KVCacheGroupManager:
                     sequence,
                     safe_epoch=max(
                         state.release_safe_epoch,
-                        failure_safe_epoch or self.current_epoch,
+                        self.current_epoch if failure_safe_epoch is None else failure_safe_epoch,
                     ),
                 )
 
@@ -1549,7 +1559,7 @@ class KVCacheGroupManager:
 
     def _get_sequence_state(self, handle: SequenceHandle) -> _SequenceState:
         """Resolve a sequence handle, rejecting stale generations."""
-        if handle.index >= len(self._sequence_states):
+        if not 0 <= handle.index < len(self._sequence_states):
             raise InvalidHandleError(f"sequence index {handle.index} is out of range")
         state = self._sequence_states[handle.index]
         if state is None or state.handle.generation != handle.generation:

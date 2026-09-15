@@ -40,10 +40,10 @@ class PagedKVStorage:
     """Preallocated page-major storage for an arbitrary set of planes.
 
     Not abstract -- it is fully usable -- but normally constructed through
-    :func:`~ayaka.cache.kv.storage.families.create_kv_storage` or one of the
-    family classes in :mod:`.families`, which add the named accessors and,
-    where the layout allows it, the
-    :class:`~ayaka.cache.kv.storage.ports.StackedKVLayout` capability.
+    :func:`~ayaka.kvcache.build.build_kv_storage` or one of the family classes
+    in :mod:`ayaka.kvcache.build`, which add the named accessors and, where the
+    layout allows it, the
+    :class:`~ayaka.kvcache.storage.ports.StackedKVLayout` capability.
     """
 
     def __init__(
@@ -263,7 +263,7 @@ class PagedKVStorage:
         Only drops references: the caching allocator reclaims the blocks, but
         nothing is returned to the driver (no ``empty_cache()``), and any view a
         caller still holds keeps the memory alive. After this, every method
-        raises :class:`~ayaka.cache.kv.storage.errors.StorageClosedError`
+        raises :class:`~ayaka.kvcache.storage.errors.StorageClosedError`
         rather than an ``IndexError`` from an emptied tuple.
         """
         self._allocations = ()
@@ -344,6 +344,7 @@ class PagedKVStorage:
 
     def scale(self, layer_index: int, plane: str | int) -> float:
         """Return the installed scale, or 1.0 for an unquantized store."""
+        self._check_open()
         self._check_layer(layer_index)
         if not self._quantization.is_quantized:
             return 1.0
@@ -398,9 +399,10 @@ class PagedKVStorage:
             layer_index: Target layer.
             slots: Unique slot addresses -- a Python sequence, a 1-D integer
                 tensor, or a prebuilt
-                :class:`~ayaka.cache.kv.storage._indexing.SlotIndex`. Pass a
+                :class:`~ayaka.kvcache.storage.index.SlotIndex`. Pass a
                 ``SlotIndex`` to validate once and reuse across every layer of
-                a step.
+                a step. The index must carry write proof (``unique=True``); an
+                index built with ``validate=False`` is gather-only.
             *values: One tensor per plane, shaped ``(num_tokens, *plane.tail)``.
 
         Raises:
@@ -560,9 +562,11 @@ class PagedKVStorage:
         ``num_layers`` times.
 
         ``validate=False`` issues no ``.item()`` but does not establish write
-        uniqueness. Such an index may be gathered, not passed to ``write``.
-        For graph writes use a host-validated prepared store such as the paged
-        decode adapter; do not fabricate a uniqueness flag for mutable indices.
+        uniqueness. Such an index may be gathered, never passed to
+        :meth:`write`, which requires write proof. There is deliberately no
+        graph-capturable write entry point here: writing mutable indices
+        without a host-side uniqueness check is a silent-overwrite bug, and a
+        caller that can prove uniqueness must do so before calling.
         """
         self._check_open()
         return slot_index(

@@ -12,6 +12,7 @@ class KVStorageCompatibilityError(StorageUnavailableError):
         detail = "; ".join(getattr(issue, "message", str(issue)) for issue in issues)
         super().__init__(f"KV storage is incompatible: {detail}")
 
+
 class StorageClosedError(RuntimeError):
     """A storage object was used after :meth:`close`.
 
@@ -19,6 +20,7 @@ class StorageClosedError(RuntimeError):
     ``IndexError`` from a line that mentions neither the close nor the caller's
     mistake, and reads exactly like an out-of-range layer index.
     """
+
 
 class KVQuantizationError(ValueError):
     """A quantized store was used without, or against, a valid scale.

@@ -52,6 +52,7 @@ def retained_page_range(
         (token_range.stop + page_size - 1) // page_size,
     )
 
+
 def maximum_retained_pages(
     policy: RetentionPolicy,
     *,
@@ -89,6 +90,7 @@ def maximum_retained_pages(
         page_size=page_size,
         max_scan_tokens=max_scan_tokens,
     )
+
 
 def window_starts(
     policy: RetentionPolicy,

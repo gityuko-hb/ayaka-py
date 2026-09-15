@@ -6,6 +6,23 @@ from ayaka.kvcache.retention.policy import HybridRetention, RetentionPolicy
 from ayaka.kvcache.storage.geometry import BaseKVStorageSpec
 
 
+def _group_compatibility_key(
+    storage_spec: BaseKVStorageSpec,
+    retention: RetentionPolicy,
+) -> tuple[object, ...]:
+    """Identity under which two layers can share one allocator.
+
+    Kept as the single definition used by both :class:`KVCacheGroup` and
+    :func:`build_kv_cache_groups`, so coalescing cannot drift from the
+    group's own reported identity.
+    """
+    return (
+        storage_spec.compatibility_key,
+        storage_spec.capacity_pages,
+        retention.compatibility_key,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class KVLayerConfig:
     """Storage and retention declaration for one model layer.
@@ -32,6 +49,7 @@ class KVLayerConfig:
             raise TypeError("retention must implement RetentionPolicy")
         if isinstance(self.retention, HybridRetention):
             raise ValueError("KVLayerConfig requires the resolved layer retention policy")
+
 
 @dataclass(frozen=True, slots=True)
 class KVCacheGroup:
@@ -77,11 +95,7 @@ class KVCacheGroup:
     @property
     def compatibility_key(self) -> tuple[object, ...]:
         """Identity used for coalescing: geometry + capacity + retention."""
-        return (
-            self.storage_spec.compatibility_key,
-            self.storage_spec.capacity_pages,
-            self.retention.compatibility_key,
-        )
+        return _group_compatibility_key(self.storage_spec, self.retention)
 
 
 def build_kv_cache_groups(
@@ -124,11 +138,7 @@ def build_kv_cache_groups(
     grouped: dict[tuple[object, ...], list[KVLayerConfig]] = {}
     group_order: list[tuple[object, ...]] = []
     for layer in ordered:
-        key = (
-            layer.storage_spec.compatibility_key,
-            layer.storage_spec.capacity_pages,
-            layer.retention.compatibility_key,
-        )
+        key = _group_compatibility_key(layer.storage_spec, layer.retention)
         if key not in grouped:
             grouped[key] = []
             group_order.append(key)

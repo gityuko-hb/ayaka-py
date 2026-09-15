@@ -18,6 +18,7 @@ class StackedKVLayout(Protocol):
         """
         ...
 
+
 @runtime_checkable
 class KVStorage(Protocol):
     """Physical tensor allocation associated with one storage specification.
@@ -26,6 +27,7 @@ class KVStorage(Protocol):
     scatter / gather primitives. They never allocate or free pages -- that is
     the allocator's job -- and never see request identity.
     """
+
     @property
     def spec(self) -> BaseKVStorageSpec:
         """Geometry this store was built from. Read-only."""

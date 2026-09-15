@@ -18,13 +18,18 @@ class _StorageDTypeInfo:
 #: Names deliberately match PyTorch attributes. ``max_finite`` lets quantization clamp
 #: values before casting; element size and floating-point classification come directly
 #: from :class:`DType` and are not repeated here.
+#:
+#: ``INT8`` is intentionally absent. Integer KV storage cannot carry a scale
+#: (``KVQuantization.validate_for_dtype`` refuses a scheme on any non-FP8
+#: dtype), so every write would cast real activations through a truncating
+#: ``.to(int8)`` with no diagnostic. Until a calibrated integer scheme exists,
+#: refusing the dtype is the fail-closed answer.
 _STORAGE_INFO: Final[dict[DType, _StorageDTypeInfo]] = {
     DType.FP32: _StorageDTypeInfo("float32", 3.4028234663852886e38),
     DType.FP16: _StorageDTypeInfo("float16", 65504.0),
     DType.BF16: _StorageDTypeInfo("bfloat16", 3.3895313892515355e38),
     DType.FP8_E4M3: _StorageDTypeInfo("float8_e4m3fn", 448.0),
     DType.FP8_E5M2: _StorageDTypeInfo("float8_e5m2", 57344.0),
-    DType.INT8: _StorageDTypeInfo("int8", 127.0),
 }
 
 #: Derived once so forward and reverse conversion cannot drift apart.
@@ -64,8 +69,9 @@ def to_storage_dtype(dtype: DType) -> str:
     """Translate a canonical enum into its KV storage name.
 
     Raises:
-        ValueError: If ``dtype`` has no KV storage representation. Sub-byte weight formats
-            are intentionally unsupported rather than silently promoted to int8.
+        ValueError: If ``dtype`` has no KV storage representation. Sub-byte weight
+            formats and integer formats are intentionally unsupported rather than
+            silently promoted or stored unscaled.
     """
     info = _STORAGE_INFO.get(dtype)
     if info is None:

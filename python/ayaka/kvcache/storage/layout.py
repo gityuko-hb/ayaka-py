@@ -18,6 +18,7 @@ from typing import Final
 #: Every independently allocated buffer starts on at least this boundary.
 DEFAULT_KV_ALIGNMENT_BYTES: Final[int] = 256
 
+
 class KVStorageKind(StrEnum):
     """Physical cache-content families.
 
@@ -37,7 +38,7 @@ class KVStorageKind(StrEnum):
     """Recurrent model state.
 
     Declared but **not constructible**: no spec class produces this kind and
-    :func:`~ayaka.cache.kv.storage.validation.validate_kv_storage_support`
+    :func:`~ayaka.kvcache.storage.validation.validate_kv_storage_support`
     rejects it with ``KIND_UNSUPPORTED``. It stays in the enum so that a model
     config naming a recurrent architecture is classified and *then* refused
     with a sentence, instead of falling through a ``match`` into whichever
@@ -48,6 +49,7 @@ class KVStorageKind(StrEnum):
     def is_implemented(self) -> bool:
         """Whether a storage implementation exists for this kind."""
         return self is not KVStorageKind.RECURRENT
+
 
 @dataclass(frozen=True, slots=True)
 class PlaneSpec:

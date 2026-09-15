@@ -34,7 +34,7 @@ class MHAStorage(_StackedKVMixin, PagedKVStorage):
     """Page-major K/V storage for MHA, MQA and GQA.
 
     Planes are ``("key", "value")`` and share one allocation per layer, so this
-    class satisfies :class:`~ayaka.cache.kv.storage.ports.StackedKVLayout`.
+    class satisfies :class:`~ayaka.kvcache.storage.ports.StackedKVLayout`.
     """
 
     def __init__(

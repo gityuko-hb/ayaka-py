@@ -10,12 +10,14 @@ from typing import ClassVar, Final
 #: rather than making bring-up quietly take seconds per layer.
 DEFAULT_MAX_SCAN_TOKENS: Final[int] = 65_536
 
+
 def _validate_layer_id(layer_id: int) -> None:
     """Reject a non-integer or negative layer id."""
     if not isinstance(layer_id, int) or isinstance(layer_id, bool):
         raise TypeError("layer_id must be an integer")
     if layer_id < 0:
         raise ValueError("layer_id must be non-negative")
+
 
 def _validate_sequence_length(sequence_length: int) -> None:
     """Reject a non-integer or negative sequence length."""
@@ -24,17 +26,20 @@ def _validate_sequence_length(sequence_length: int) -> None:
     if sequence_length < 0:
         raise ValueError("sequence_length must be non-negative")
 
+
 def _validate_page_size(page_size: int) -> None:
     if not isinstance(page_size, int) or isinstance(page_size, bool):
         raise TypeError("page_size must be an integer")
     if page_size <= 0:
         raise ValueError("page_size must be positive")
 
+
 def _pages_for(start: int, stop: int, page_size: int) -> int:
     """Pages an interval touches. A partially retained page stays readable."""
     if start >= stop:
         return 0
     return (stop + page_size - 1) // page_size - start // page_size
+
 
 class RetentionPolicy(ABC):
     """The half-open logical token interval a layer must keep readable."""
@@ -112,6 +117,7 @@ class RetentionPolicy(ABC):
                 return ceil
         return best
 
+
 @dataclass(frozen=True, slots=True)
 class FullRetention(RetentionPolicy):
     """Keep every committed token for full causal attention.
@@ -158,6 +164,7 @@ class FullRetention(RetentionPolicy):
     def compatibility_key(self) -> tuple[object, ...]:
         return (self.policy_id,)
 
+
 @dataclass(frozen=True, slots=True)
 class SlidingWindowRetention(RetentionPolicy):
     """Keep only the most recent ``window_size`` committed tokens.
@@ -171,6 +178,7 @@ class SlidingWindowRetention(RetentionPolicy):
     >>> SlidingWindowRetention(window_size=4).required_token_range(0, 2)
     range(0, 2)
     """
+
     policy_id: ClassVar[str] = "sliding_window"
 
     window_size: int
@@ -233,6 +241,7 @@ class SlidingWindowRetention(RetentionPolicy):
     @property
     def compatibility_key(self) -> tuple[object, ...]:
         return (self.policy_id, self.window_size)
+
 
 @dataclass(frozen=True, slots=True)
 class HybridRetention(RetentionPolicy):

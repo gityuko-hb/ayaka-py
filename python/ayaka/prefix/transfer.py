@@ -23,6 +23,15 @@ from ayaka.utils.validation import require_int
 _TRANSFER_IDS = count(1)
 
 
+class TransferCreditError(RuntimeError):
+    """Host transfer credits would be exceeded; no ticket was admitted.
+
+    Its own type rather than ``KVCapacityError``: credit exhaustion is a host
+    transfer-budget outcome, not a KV page-capacity outcome, and callers that
+    retry on one must not silently retry the other.
+    """
+
+
 class TransferCredits:
     """Shared byte semaphore; reservations last until whole-ticket retirement."""
 
@@ -40,7 +49,7 @@ class TransferCredits:
         if owner in self._claims:
             raise ValueError("transfer owner already reserved credits")
         if self.held + nbytes > self.limit:
-            raise KVCapacityError("transfer credits exhausted")
+            raise TransferCreditError("transfer credits exhausted")
         self._claims[owner] = nbytes
 
     def release(self, owner):

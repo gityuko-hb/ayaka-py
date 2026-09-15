@@ -17,10 +17,18 @@ from ayaka.kvcache.storage.layout import KVStorageKind
 
 
 class _ResolvedKVCacheGroup(Protocol):
-    """Structural subset needed to evaluate layout feature support."""
+    """Structural subset needed to evaluate layout feature support.
 
-    retention: RetentionPolicy
-    storage_spec: BaseKVStorageSpec
+    Declared as read-only properties so frozen dataclasses such as
+    :class:`~ayaka.kvcache.groups.KVCacheGroup` satisfy the protocol.
+    """
+
+    @property
+    def retention(self) -> RetentionPolicy: ...
+
+    @property
+    def storage_spec(self) -> BaseKVStorageSpec: ...
+
 
 class LayoutFeature(StrEnum):
     """Cross-layout features the A9 grouping may or may not support."""
@@ -44,6 +52,7 @@ class LayoutFeatureIssueCode(StrEnum):
     """Layout is compatible but no grouped manager implements the cache."""
     NO_VALIDATED_RECURRENT_BACKEND = "no_validated_recurrent_backend"
     """No recurrent model/backend contract exists for lifecycle validation."""
+
 
 @dataclass(frozen=True, slots=True)
 class LayoutFeatureIssue:

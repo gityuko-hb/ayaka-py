@@ -44,6 +44,7 @@ from .dtypes import is_fp8_storage_dtype, normalize_storage_dtype, storage_dtype
 SCALE_DTYPE: Final[str] = "float32"
 SCALE_DTYPE_BYTES: Final[int] = 4
 
+
 class QuantizationScheme(StrEnum):
     """Granularity at which a scale is applied."""
 
@@ -81,6 +82,7 @@ class QuantizationScheme(StrEnum):
         """
         return self is QuantizationScheme.PER_HEAD
 
+
 @dataclass(frozen=True, slots=True)
 class KVQuantization:
     """Quantization policy attached to a storage spec.
@@ -106,7 +108,8 @@ class KVQuantization:
     def __post_init__(self) -> None:
         if not isinstance(self.scheme, QuantizationScheme):
             raise TypeError(
-                f"scheme must be a QuantizationScheme, got {type(self.scheme).__name__}")
+                f"scheme must be a QuantizationScheme, got {type(self.scheme).__name__}"
+            )
         if self.scheme is QuantizationScheme.PER_HEAD:
             raise NotImplementedError(
                 "per-head KV scales are declared but not implemented: no Ayaka kernel "
@@ -119,7 +122,6 @@ class KVQuantization:
                 "a quantized scheme needs the storage dtype's max magnitude; "
                 "build it with KVQuantization.for_dtype()"
             )
-
 
     @classmethod
     def none(cls) -> KVQuantization:
