@@ -6,7 +6,7 @@ state, or upgrades a prefix hint into authoritative ownership.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,13 +51,14 @@ def _priority(entry: QueueEntry) -> int:
 
 
 def _arrival_ns(entry: QueueEntry) -> int:
-    return int(getattr(entry.lifecycle.request, "arrival_ns", entry.ready_ns))
+    arrival = getattr(entry.lifecycle.request, "arrival_ns", 0)
+    return int(arrival) if arrival else entry.ready_ns
 
 
 def _max_output_tokens(entry: QueueEntry) -> int:
     request = entry.lifecycle.request
     sampling = getattr(request, "sampling", None)
-    for obj in (sampling, request):
+    for obj in (sampling, getattr(request, "stop", None), request):
         if obj is None:
             continue
         for name in ("max_tokens", "max_output_tokens", "max_new_tokens"):
@@ -70,6 +71,26 @@ def _max_output_tokens(entry: QueueEntry) -> int:
 def _routing_key(entry: QueueEntry) -> str:
     value = getattr(entry.lifecycle.request, "routing_key", "")
     return "" if value is None else str(value)
+
+
+def _fcfs_key(entry: QueueEntry) -> tuple[int, int]:
+    return (_arrival_ns(entry), entry.ordinal)
+
+
+def _priority_key(entry: QueueEntry) -> tuple[int, int, int]:
+    return (-_priority(entry), _arrival_ns(entry), entry.ordinal)
+
+
+def _cache_affinity_key(entry: QueueEntry) -> tuple[int, int, int, int]:
+    return (-entry.cache_hint_tokens, -_priority(entry), _arrival_ns(entry), entry.ordinal)
+
+
+def _longest_output_key(entry: QueueEntry) -> tuple[int, int, int, int]:
+    return (-_max_output_tokens(entry), -_priority(entry), _arrival_ns(entry), entry.ordinal)
+
+
+def _routing_key_policy(entry: QueueEntry) -> tuple[str, int, int, int]:
+    return (_routing_key(entry), -_priority(entry), _arrival_ns(entry), entry.ordinal)
 
 
 def rank_waiting(
@@ -94,16 +115,17 @@ def rank_waiting(
     ranked = list(entries)
     name = _policy_name(scheduling_policy)
 
+    key: Callable[[QueueEntry], tuple[Any, ...]]
     if name == "fcfs":
-        key = lambda e: (_arrival_ns(e), e.ordinal)
+        key = _fcfs_key
     elif name == "priority":
-        key = lambda e: (-_priority(e), _arrival_ns(e), e.ordinal)
+        key = _priority_key
     elif name in {"lpm", "longest_prefix", "cache_affinity"}:
-        key = lambda e: (-e.cache_hint_tokens, -_priority(e), _arrival_ns(e), e.ordinal)
+        key = _cache_affinity_key
     elif name in {"lof", "longest_output"}:
-        key = lambda e: (-_max_output_tokens(e), _arrival_ns(e), e.ordinal)
+        key = _longest_output_key
     elif name == "routing_key":
-        key = lambda e: (_routing_key(e), _arrival_ns(e), e.ordinal)
+        key = _routing_key_policy
     else:
         raise ConfigError(
             "scheduler.scheduling_policy",
