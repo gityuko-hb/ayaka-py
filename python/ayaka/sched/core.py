@@ -12,6 +12,7 @@ import time
 from abc import abstractmethod
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ayaka.configs.base import ConfigError
@@ -20,7 +21,7 @@ from ayaka.executor.ticket import ExecutionTicket
 from ayaka.handles import SequenceHandle
 from ayaka.plan import SamplingPlan
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
-from ayaka.request.schema import Request
+from ayaka.request.schema import Request, RequestId
 from ayaka.sampling.logprobs import LogprobMode
 from ayaka.sched.base import BaseScheduler
 from ayaka.sched.interfaces import OverloadedError, SequenceAllocator, StepRuntime
@@ -107,7 +108,31 @@ class SchedulerCore(BaseScheduler):
     # ------------------------------------------------------------------
 
     def add_request(self, request: Request) -> RequestLifecycle:
-        """Validate, bind a sequence, and enqueue the request."""
+        """Validate, bind a sequence, and enqueue the request.
+
+        n > 1 mở rộng tại admission thành n request con độc lập
+        ``f"{id}#c{i}"`` — seed riêng, stream RNG riêng, lifecycle riêng
+        (nguyên tắc "expand at admission" thay vì fork động giữa chừng).
+        Prompt KV bị NHÂN BẢN cho mỗi child — chưa có prefix sharing (paged
+        runtime là backlog). Trả lifecycle của child đầu; caller thấy token
+        theo child id.
+        """
+        if request.sampling.n > 1:
+            first: RequestLifecycle | None = None
+            for index in range(request.sampling.n):
+                child_seed = (
+                    None if request.sampling.seed is None else request.sampling.seed + index
+                )
+                child = Request(
+                    RequestId(f"{request.request_id}#c{index}"),
+                    request.prompt_token_ids,
+                    sampling=replace(request.sampling, n=1, seed=child_seed),
+                    stop=request.stop,
+                )
+                lifecycle = self.add_request(child)
+                first = first or lifecycle
+            assert first is not None
+            return first
         self._plan.validate_request(request)
         self._validate_request_features(request)
         self._check_capacity()
@@ -142,12 +167,6 @@ class SchedulerCore(BaseScheduler):
 
     def _validate_request_features(self, request: Request) -> None:
         params = request.sampling
-        if params.n != 1:
-            raise ConfigError(
-                "request.sampling",
-                "UNSUPPORTED_SAMPLING",
-                "scheduler core supports n == 1 only; parallel sampling is not ported",
-            )
         if not params.is_greedy and self._sampling is None:
             raise ConfigError(
                 "request.sampling",
@@ -160,11 +179,15 @@ class SchedulerCore(BaseScheduler):
                 "UNSUPPORTED_PROMPT_LOGPROBS",
                 "prompt logprobs require a wired SamplingCoordinator",
             )
-        if params.logprob_mode is LogprobMode.SAMPLING and params.logprobs is None:
+        if (
+            params.logprob_mode is LogprobMode.SAMPLING
+            and params.logprobs is None
+            and params.token_ids_logprobs is None
+        ):
             raise ConfigError(
                 "request.sampling.logprob_mode",
                 "INVALID_LOGPROB_MODE",
-                "logprob_mode=sampling needs logprobs to be enabled",
+                "logprob_mode=sampling needs logprobs or token_ids_logprobs enabled",
             )
         if params.logprobs is not None and self._sampling is None:
             raise ConfigError(
