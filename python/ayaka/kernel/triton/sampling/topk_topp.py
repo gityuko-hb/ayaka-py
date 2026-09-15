@@ -15,20 +15,11 @@ import torch
 import triton
 import triton.language as tl
 
+from ayaka.kernel.triton.sampling.philox import philox_u01_f32
+
 # -----------------------------------------------------------------------------
 # RNG & Helper Utilities
 # -----------------------------------------------------------------------------
-
-
-@triton.jit
-def _splitmix64(seed, offset, idx):
-    """Deterministic uniform random float32 in [0.0, 1.0) using SplitMix64."""
-    z = seed + offset + idx.to(tl.uint64) * 0x9E3779B97F4A7C15
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    z = z ^ (z >> 31)
-    # Lấy 24-bit mantissa chuyển thành float trong khoảng [0.0, 1.0)
-    return ((z & 0x00FFFFFF).to(tl.float32)) / 16777216.0
 
 
 # -----------------------------------------------------------------------------
@@ -56,7 +47,7 @@ def _sampling_from_probs_kernel(
     # 1. Sinh số ngẫu nhiên đồng nhất u ~ U(0, 1)
     seed = tl.load(seed_ptr + row_idx).to(tl.uint64) if HAS_SEED_TENSOR else seed_val
     offset = tl.load(offset_ptr + row_idx).to(tl.uint64) if HAS_OFFSET_TENSOR else offset_val
-    u = _splitmix64(seed, offset, row_idx)
+    u = philox_u01_f32(seed, offset.to(tl.int64) * tl.num_programs(0) + row_idx)
 
     # 2. Pass 1: Tính tổng xác suất toàn hàng
     row_offset = row_idx * probs_stride_b
@@ -126,7 +117,7 @@ def _min_p_sampling_kernel(
     min_p = tl.load(min_p_ptr + row_idx).to(tl.float32) if HAS_MIN_P_TENSOR else min_p_val
     seed = tl.load(seed_ptr + row_idx).to(tl.uint64) if HAS_SEED_TENSOR else seed_val
     offset = tl.load(offset_ptr + row_idx).to(tl.uint64) if HAS_OFFSET_TENSOR else offset_val
-    u = _splitmix64(seed, offset, row_idx)
+    u = philox_u01_f32(seed, offset.to(tl.int64) * tl.num_programs(0) + row_idx)
 
     # Pass 1: Tìm xác suất lớn nhất (max_prob)
     max_prob = 0.0
@@ -205,7 +196,7 @@ def _top_p_sampling_kernel(
     top_p = tl.load(top_p_ptr + row_idx).to(tl.float32) if HAS_TOP_P_TENSOR else top_p_val
     seed = tl.load(seed_ptr + row_idx).to(tl.uint64) if HAS_SEED_TENSOR else seed_val
     offset = tl.load(offset_ptr + row_idx).to(tl.uint64) if HAS_OFFSET_TENSOR else offset_val
-    u = _splitmix64(seed, offset, row_idx)
+    u = philox_u01_f32(seed, offset.to(tl.int64) * tl.num_programs(0) + row_idx)
 
     # 1. Tìm ngưỡng qua 64 histogram bins trong dải log-scale / linear
     # Với sampling thông thường, bisection qua 16 bước tìm ngưỡng cutoff:

@@ -8,13 +8,14 @@ không phải chi tiết:
     sampling tiêu thụ số lượng biến thiên ⇒ không batch-invariant.
   * Generator không capture được vào CUDA graph.
 
-splitmix64(seed, offset) cho mỗi row một dòng số độc lập, thuần hàm, tái lập
-được, và (seed, offset) là tensor nên FlashInfer capture graph được — chính là
-lý do FlashInfer yêu cầu seed/offset dạng tensor thay vì int.
+Philox4x32-10 (ayaka.sampling.rng) cho mỗi (seed, offset) một dãy số độc lập,
+thuần hàm, tái lập được, và (seed, offset) là tensor nên FlashInfer capture
+graph được — chính là lý do FlashInfer yêu cầu seed/offset dạng tensor thay vì
+int.
 
-CẬP NHẬT: splitmix64 giờ import từ ayaka.sampling.rng (nguồn canonical, hợp nhất
-với bản Python-int trong columns.py) thay vì tự định nghĩa ở đây — hai bản
-từng trùng lặp, xem docstring ayaka/sampling/rng.py.
+CẬP NHẬT: tensor RNG là Philox4x32-10 từ ayaka.sampling.rng (nguồn canonical,
+twin Triton ở ayaka.kernel.triton.sampling.philox); SplitMix64 chỉ còn cho
+derive_seed ở tầng host.
 """
 
 from __future__ import annotations
@@ -160,7 +161,9 @@ def _reference_sample(
     return tok
 
 
-def softmax_stats(logits: torch.Tensor, temperature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def softmax_stats(
+    logits: torch.Tensor, temperature: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Wrapper chia temperature rồi tính stats — hợp đồng cũ cho reference path."""
     scaled = logits.to(torch.float32) / temperature.clamp_min(1e-6).unsqueeze(1)
     return softmax_stats_scaled(scaled)

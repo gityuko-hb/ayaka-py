@@ -22,32 +22,9 @@ import torch
 import triton
 import triton.language as tl
 
-from ayaka.sampling.rng import C1 as _C1
-from ayaka.sampling.rng import C2 as _C2
-from ayaka.sampling.rng import GOLDEN as _GOLDEN
+from ayaka.kernel.triton.sampling.philox import philox_u01
 
 HAS_TRITON_GUMBEL = True
-
-
-@triton.jit
-def _lsr64(x, k: tl.constexpr):
-    """Logical shift right cho int64 — giống hệt _lsr trong topk_topp.py,
-    cần vì Triton's `>>` cũng arithmetic cho signed như torch."""
-    return (x >> k) & ((tl.full((), 1, tl.int64) << (64 - k)) - 1)
-
-
-@triton.jit
-def _splitmix64_u01(seed, offset, GOLDEN: tl.constexpr, C1: tl.constexpr, C2: tl.constexpr):
-    """Y HỆT counter_uniform trong topk_topp.py, viết lại bằng Triton
-    primitives — PHẢI cho cùng kết quả bit-exact với bản torch (test bằng
-    cách so trực tiếp trên vài (seed,offset) cụ thể, không chỉ chi-square,
-    trước khi tin bản này)."""
-    z = seed + (offset + 1) * GOLDEN
-    z = (z ^ _lsr64(z, 30)) * C1
-    z = (z ^ _lsr64(z, 27)) * C2
-    z = z ^ _lsr64(z, 31)
-    u_bits = _lsr64(z, 11)
-    return u_bits.to(tl.float64) * (1.0 / (1 << 53))
 
 
 @triton.jit
@@ -58,9 +35,6 @@ def _gumbel_argmax_kernel(
     seed_ptr,
     offset_ptr,
     stride_row,
-    GOLDEN: tl.constexpr,
-    C1: tl.constexpr,
-    C2: tl.constexpr,
     TOPK_BOUND: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -85,7 +59,7 @@ def _gumbel_argmax_kernel(
     offset = offset_base * TOPK_BOUND + col  # dia chi hoa rieng cho gumbel,
     # giong het counter_uniform_cols ben gumbel.py (khong dung offset+col
     # truc tiep de tranh dam do voi cac loi goi counter_uniform 1-chieu khac)
-    u = _splitmix64_u01(seed, offset, GOLDEN, C1, C2)
+    u = philox_u01(seed, offset)
     u = tl.minimum(tl.maximum(u, 1e-12), 1.0 - 1e-7)
     gumbel = -tl.log(-tl.log(u))
 
@@ -125,9 +99,6 @@ def fused_gumbel_sample(
         seed,
         offset,
         sp.stride(0),
-        _GOLDEN,
-        _C1,
-        _C2,
         TOPK_BOUND=min(topk_bound, v),
         BLOCK=block,
     )

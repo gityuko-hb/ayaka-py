@@ -13,7 +13,7 @@ TẠI SAO đáng làm kernel riêng thay vì dùng FlashInfer's rejection sampli
 sẵn có:
   - Rejection sampling tiêu thụ số vòng biến thiên ⇒ khó CUDA-graph hơn.
     Gumbel-max chi phí CỐ ĐỊNH mỗi row (1 argmax trên tập đã biết kích thước).
-  - splitmix64 hiện có là hàm THUẦN của index ⇒ sinh noise độc lập theo
+  - Philox4x32-10 hiện có là hàm THUẦN của địa chỉ ⇒ sinh noise độc lập theo
     (row, candidate) không tốn state, song song hoàn hảo — hợp gumbel-max
     (cần NHIỀU số ngẫu nhiên/row) hơn hẳn so với chỉ 1 số/row của inverse-CDF.
   - Không phụ thuộc FlashInfer cho primitive sampling lõi (nhất quán với
