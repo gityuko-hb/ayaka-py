@@ -36,9 +36,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
-from ayaka.sampling.ops.sampling import filter_probs
 import torch
 
+from ayaka.sampling.ops.sampling import filter_probs
 from ayaka.utils.import_utils import CapabilityError
 from ayaka.utils.validation import require_int
 
@@ -93,12 +93,15 @@ class LogprobResult:
 
     token_logprob: float
     top_logprobs: tuple[TokenLogprob, ...]
+    token_ids_logprobs: tuple[TokenLogprob, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.token_logprob, bool) or not isinstance(self.token_logprob, float):
             raise TypeError("token_logprob must be a float")
         if type(self.top_logprobs) is not tuple:
             raise TypeError("top_logprobs must be a tuple")
+        if type(self.token_ids_logprobs) is not tuple:
+            raise TypeError("token_ids_logprobs must be a tuple")
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +283,172 @@ def compute_raw_logprobs(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class TokenIdsLogprobTensors:
+    """Device-resident log probabilities for explicit token ids (`token_ids_logprobs`).
+
+    Row `j` corresponds to `SampleOutputs.ids_logprob_rows[j]`.
+
+    Attributes:
+        logprobs: Tensor of shape `[batch_size, max_tokens]` in FP32 containing log
+            probabilities for each requested token id. Unused padded elements are `-inf`.
+        token_logprob: Tensor of shape `[batch_size]` in FP32 containing the log probability
+            of the sampled token evaluated under identical distribution semantics.
+    """
+
+    logprobs: torch.Tensor  # [R, K] FP32
+    token_logprob: torch.Tensor  # [R] FP32
+
+
+def _token_ids_tensor(token_lists: Sequence[Sequence[int]], device) -> torch.Tensor:
+    counts = [len(tokens) for tokens in token_lists]
+    width = max(counts) if counts else 0
+    if width == 0:
+        return torch.empty((len(token_lists), 0), dtype=torch.long, device=device)
+    ids = torch.full((len(token_lists), width), -1, dtype=torch.long, device=device)
+    for row, tokens in enumerate(token_lists):
+        if tokens:
+            ids[row, : len(tokens)] = torch.tensor(tokens, dtype=torch.long, device=device)
+    return ids
+
+
+def compute_token_ids_raw_logprobs(
+    raw_logits: torch.Tensor,
+    token_lists: Sequence[Sequence[int]],
+    selected_tokens: torch.Tensor,
+) -> TokenIdsLogprobTensors:
+    """Compute raw log probabilities for explicit token id lists.
+
+    Computes `z_t - logsumexp(z)` per row for each requested token id without
+    materializing a full `[batch_size, vocab_size]` log-softmax matrix.
+
+    Args:
+        raw_logits: Float32 tensor of pre-transform model logits of shape
+            `[batch_size, vocab_size]`.
+        token_lists: Sequence of target token id sequences to score per batch row.
+        selected_tokens: Tensor of shape `[batch_size]` containing sampled tokens.
+
+    Returns:
+        TokenIdsLogprobTensors holding explicit token logprobs and selected token logprobs.
+
+    Raises:
+        ValueError: If `raw_logits` is not 2-D or row counts mismatch `token_lists`.
+    """
+    if raw_logits.dim() != 2:
+        raise ValueError(f"raw_logits must be 2-D, got {tuple(raw_logits.shape)}")
+    if len(token_lists) != raw_logits.size(0):
+        raise ValueError(f"token_lists must have {raw_logits.size(0)} rows, got {len(token_lists)}")
+    z = raw_logits.to(torch.float32)
+    lse = torch.logsumexp(z, dim=-1)
+    ids = _token_ids_tensor(token_lists, z.device)
+    if ids.numel():
+        safe = ids.clamp_min(0)
+        logprobs = z.gather(1, safe) - lse.unsqueeze(1)
+        logprobs = torch.where(ids >= 0, logprobs, torch.full_like(logprobs, float("-inf")))
+    else:
+        logprobs = torch.empty_like(ids, dtype=torch.float32)
+    token_logprob = z.gather(1, selected_tokens.to(torch.long).unsqueeze(1)).squeeze(1) - lse
+    return TokenIdsLogprobTensors(logprobs=logprobs, token_logprob=token_logprob)
+
+
+def compute_token_ids_sampling_logprobs(
+    processed_logits: torch.Tensor,
+    token_lists: Sequence[Sequence[int]],
+    selected_tokens: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+) -> TokenIdsLogprobTensors:
+    """Compute sampling-distribution log probabilities for explicit token id lists.
+
+    Evaluates `log(p_renorm(t))` over the surviving positive support. Tokens outside
+    the filtered support evaluate to `-inf`. Follows the exact distribution semantics
+    of `compute_sampling_logprobs` without consuming RNG state.
+
+    Args:
+        processed_logits: Post-penalty, post-mask logits of shape `[batch_size, vocab_size]`.
+        token_lists: Sequence of target token id sequences to score per batch row.
+        selected_tokens: Tensor of shape `[batch_size]` containing sampled tokens.
+        temperature: Tensor of shape `[batch_size]` containing temperature scaling values.
+        top_k: Tensor of shape `[batch_size]` specifying top-k filtering thresholds.
+        top_p: Tensor of shape `[batch_size]` specifying top-p cumulative thresholds.
+        min_p: Tensor of shape `[batch_size]` specifying min-p probability cutoffs.
+
+    Returns:
+        TokenIdsLogprobTensors holding explicit token logprobs and selected token logprobs.
+
+    Raises:
+        ValueError: If `processed_logits` is not 2-D or row counts mismatch `token_lists`.
+    """
+    if processed_logits.dim() != 2:
+        raise ValueError(f"processed_logits must be 2-D, got {tuple(processed_logits.shape)}")
+    if len(token_lists) != processed_logits.size(0):
+        raise ValueError(
+            f"token_lists must have {processed_logits.size(0)} rows, got {len(token_lists)}"
+        )
+
+    selected = selected_tokens.to(torch.long)
+    scaled = processed_logits.to(torch.float32) / temperature.clamp_min(1e-6).unsqueeze(1)
+    sp, si = filter_probs(scaled, top_k, top_p, min_p)
+    total = sp.sum(dim=-1, keepdim=True)
+    by_id = torch.zeros_like(sp).scatter_(1, si, sp)
+    log_denom = torch.log(total.clamp_min(torch.finfo(sp.dtype).tiny)).squeeze(1)
+
+    ids = _token_ids_tensor(token_lists, scaled.device)
+    if ids.numel():
+        safe = ids.clamp_min(0)
+        weights = by_id.gather(1, safe)
+        logprobs = torch.log(weights) - log_denom.unsqueeze(1)
+        logprobs = torch.where(ids >= 0, logprobs, torch.full_like(logprobs, float("-inf")))
+    else:
+        logprobs = torch.empty_like(ids, dtype=torch.float32)
+
+    token_logprob = compute_token_ids_sampling_selected(
+        processed_logits, selected, temperature, top_k, top_p, min_p
+    )
+    return TokenIdsLogprobTensors(logprobs=logprobs, token_logprob=token_logprob)
+
+
+def compute_token_ids_sampling_selected(
+    processed_logits: torch.Tensor,
+    selected_tokens: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+) -> torch.Tensor:
+    """Compute sampling-distribution log probability for the selected tokens.
+
+    Isolates selected token logprob computation for token-id scoring rows, matching
+    the `token_logprob` semantics in `compute_sampling_logprobs`.
+
+    Args:
+        processed_logits: Post-penalty, post-mask logits of shape `[batch_size, vocab_size]`.
+        selected_tokens: Tensor of sampled token ids of shape `[batch_size]`.
+        temperature: Tensor of shape `[batch_size]` containing temperature scaling values.
+        top_k: Tensor of shape `[batch_size]` specifying top-k filtering thresholds.
+        top_p: Tensor of shape `[batch_size]` specifying top-p cumulative thresholds.
+        min_p: Tensor of shape `[batch_size]` specifying min-p probability cutoffs.
+
+    Returns:
+        Tensor of shape `[batch_size]` containing selected token log probabilities.
+    """
+    selected = selected_tokens.to(torch.long)
+    scaled = processed_logits.to(torch.float32) / temperature.clamp_min(1e-6).unsqueeze(1)
+    sp, si = filter_probs(scaled, top_k, top_p, min_p)
+    total = sp.sum(dim=-1, keepdim=True)
+    degenerate = (total <= 0).squeeze(1)
+    p_renorm = sp / total.clamp_min(torch.finfo(sp.dtype).tiny)
+    position = (si == selected.unsqueeze(1)).int().argmax(dim=-1)
+    token_logprob = torch.log(p_renorm.gather(1, position.unsqueeze(1)).squeeze(1))
+    if bool(degenerate.any()):
+        fallback_lse = torch.logsumexp(scaled, dim=-1)
+        fallback = scaled.gather(1, selected.unsqueeze(1)).squeeze(1) - fallback_lse
+        token_logprob = torch.where(degenerate, fallback, token_logprob)
+    return token_logprob
+
+
 def compute_prompt_logprobs(
     raw_logits: torch.Tensor,
     target_tokens: torch.Tensor,
@@ -320,26 +489,39 @@ def compute_sampling_logprobs(
     top_p: torch.Tensor,
     min_p: torch.Tensor,
 ) -> SampleLogprobTensors:
-    """Sampling-distribution logprobs: after penalty/mask/temperature/filter.
+    """Compute sampling-distribution log probabilities after penalties, masking, and filtering.
 
-    ``processed_logits`` rows are the post-penalty, post-mask logits of the
-    report rows (the sampler already applied penalties/mask in place);
-    temperature is applied here exactly as the sampler does
-    (``clamp_min(1e-6)``). ``filter_probs`` (top_k -> renorm -> top_p -> min_p)
-    builds the filtered distribution; the final renormalization over the
-    surviving support is the sampling distribution:
+    The `processed_logits` rows represent post-penalty, post-mask logits (the sampler
+    having already applied penalties and bitmasks in place). Temperature scaling is
+    applied here identically to the sampler (`clamp_min(1e-6)`). The filtered
+    distribution is constructed via `filter_probs` (top_k -> renorm -> top_p -> min_p),
+    and final renormalization over the surviving support yields the sampling distribution:
 
-        log P_sampling(t) = log(p_renorm(t)),  -inf khi t nằm ngoài support
+        log P_sampling(t) = log(p_renorm(t)),  -inf when t lies outside support
 
-    The selected token is always drawn from that support, so its logprob is
-    finite; top-k likewise lists only surviving tokens. A degenerate row
-    (surviving mass underflowed to zero — contract violation upstream, never
-    produced by a valid mask) falls back to the processed-distribution
-    logprob instead of reporting NaN garbage.
+    The selected token is drawn from this support, so its logprob is finite. Similarly,
+    top-k lists only surviving tokens. Degenerate rows (where surviving probability mass
+    underflows to zero due to numerical limits) fall back to the processed-distribution
+    logprob to avoid returning NaN values.
 
-    Note: the FlashInfer sampling fast path does not materialize probabilities;
-    this helper recomputes them for reporting rows only, after the draw. It
-    consumes no randomness, so enabling it cannot change sampled tokens.
+    Args:
+        processed_logits: Post-penalty, post-mask logits of shape `[batch_size, vocab_size]`.
+        selected_tokens: Tensor of sampled token ids of shape `[batch_size]`.
+        ks: Sequence specifying the number of top logprobs to return per row.
+        temperature: Tensor of shape `[batch_size]` containing temperature scaling values.
+        top_k: Tensor of shape `[batch_size]` specifying top-k filtering thresholds.
+        top_p: Tensor of shape `[batch_size]` specifying top-p cumulative thresholds.
+        min_p: Tensor of shape `[batch_size]` specifying min-p probability cutoffs.
+
+    Returns:
+        SampleLogprobTensors holding token logprobs, top token ids, and top logprobs.
+
+    Raises:
+        ValueError: If `processed_logits` or `selected_tokens` shapes mismatch `ks`.
+
+    Notes:
+        This helper recomputes probabilities post-hoc without consuming randomness,
+        guaranteeing that enabling logprob generation never alters sampled tokens.
     """
     if processed_logits.dim() != 2:
         raise ValueError(f"processed_logits must be 2-D, got {tuple(processed_logits.shape)}")
@@ -358,10 +540,10 @@ def compute_sampling_logprobs(
     degenerate = (total <= 0).squeeze(1)
     p_renorm = sp / total.clamp_min(torch.finfo(sp.dtype).tiny)
 
-    # Token đứng ở đâu trong thứ tự đã sort? Si là permutation nên đúng một match.
+    # Locate selected token in the sorted permutation order (unique match).
     position = (si == selected.unsqueeze(1)).int().argmax(dim=-1)
     token_logprob = torch.log(p_renorm.gather(1, position.unsqueeze(1)).squeeze(1))
-    # Fail-safe cho row degenerate: fallback logprob trên phân phối đã xử lý.
+    # Fallback to processed-distribution logprob if surviving support underflows to zero.
     if bool(degenerate.any()):
         fallback_lse = torch.logsumexp(scaled, dim=-1)
         fallback = scaled.gather(1, selected.unsqueeze(1)).squeeze(1) - fallback_lse
@@ -370,7 +552,7 @@ def compute_sampling_logprobs(
     k_max = max(ks) if ks else 0
     if k_max > 0:
         top_ids = si[:, :k_max].contiguous()
-        # Vượt qua support: p_renorm = 0 → log = -inf (ngoài support thật).
+        # Outside surviving positive support: p_renorm = 0 -> logprob = -inf.
         top_logprobs = torch.log(p_renorm[:, :k_max])
         ks_tensor = torch.tensor(list(ks), dtype=torch.long, device=scaled.device)
         padding = torch.arange(k_max, device=scaled.device).unsqueeze(0) >= ks_tensor.unsqueeze(1)

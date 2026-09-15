@@ -1,4 +1,4 @@
-"""Counter-based PRNG: Philox4x32-10 cho tensor sampling, SplitMix64 cho seed.
+"""Counter-based PRNG: Philox4x32-10 for tensor sampling and SplitMix64 for seed derivation.
 
 This module provides deterministic, counter-based PRNG primitives for sampling kernels
 and host-side seed derivation. The tensor primitives (`counter_uniform`,
