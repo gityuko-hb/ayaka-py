@@ -18,6 +18,7 @@ from ayaka.sched.outcome import FinishReason
 
 if TYPE_CHECKING:
     from ayaka.tokenizers.detokenizer import IncrementalDetokenizer
+    from ayaka.tokenizers.process_pool import ProcessDetokenizer, ProcessTokenizerPool
     from ayaka.tokenizers.service import TokenizerService
 
 __all__ = ["FinishDecision", "OutputProcessor"]
@@ -36,7 +37,7 @@ class FinishDecision:
 class _OutputState:
     policy: ResolvedStopPolicy
     prompt_tokens: int
-    decoder: IncrementalDetokenizer | None
+    decoder: IncrementalDetokenizer | ProcessDetokenizer | None
     text: str = ""
     events: list[OutputEvent] = field(default_factory=list)
 
@@ -50,7 +51,7 @@ class OutputProcessor:
 
     def __init__(
         self,
-        tokenizer: TokenizerService | None = None,
+        tokenizer: TokenizerService | ProcessTokenizerPool | None = None,
         *,
         eos_token_ids: tuple[int, ...] = (),
     ) -> None:
@@ -94,7 +95,11 @@ class OutputProcessor:
         )
 
     def forget(self, request_id: str) -> None:
-        self._states.pop(request_id, None)
+        state = self._states.pop(request_id, None)
+        if state is not None and state.decoder is not None:
+            close = getattr(state.decoder, "close", None)
+            if close is not None:
+                close()
 
     def masked_ids(self, request_id: str, *, generated_tokens: int) -> frozenset[int]:
         return self._state(request_id).policy.masked_token_ids(generated_tokens)
