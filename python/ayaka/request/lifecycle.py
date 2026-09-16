@@ -509,6 +509,12 @@ class LifecycleManager:
         if lc.is_terminal and self._active.get(lc.request_id) is lc:
             self._finished[lc.request_id] = self._active.pop(lc.request_id)
 
+    def forget(self, request_id: str) -> None:
+        """Forget one consumed terminal result; active lifetimes cannot be erased."""
+        if request_id in self._active:
+            raise ValueError("cannot forget an active request")
+        self._finished.pop(request_id, None)
+
     def reap(self, *, older_than_ns: int = 0) -> tuple[str, ...]:
         """Drop finished entries whose output has been consumed.
 

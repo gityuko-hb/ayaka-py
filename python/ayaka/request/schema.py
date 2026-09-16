@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import NewType
 
+from ayaka.request.input import ConstraintSpec, MultimodalEmbedding
 from ayaka.sampling.params import SamplingParams
 from ayaka.utils.validation import require_frozen, require_int, require_text
 
@@ -51,6 +52,12 @@ class Request:
     stop: StopCriteria = field(default_factory=StopCriteria)
     cache: CacheHints = field(default_factory=CacheHints)
 
+    tenant_id: str = ""
+    quota_bucket: str = ""
+    sla_class: str = "default"
+    constraint: ConstraintSpec | None = None
+    multimodal: tuple[MultimodalEmbedding, ...] = ()
+
     # Admission / scheduling inputs.  Higher priority is served first; the
     # scheduler breaks ties on arrival_ns so ordering is total and stable.
     priority: int = 0
@@ -66,6 +73,14 @@ class Request:
         require_text(self.request_id, "request_id")
         for token in self.prompt_token_ids:
             require_int(token, "prompt token id")
+        previous_end = 0
+        for embedding in self.multimodal:
+            if (
+                embedding.start < previous_end
+                or embedding.start + len(embedding.rows) > self.prompt_len
+            ):
+                raise ValueError("multimodal spans must be disjoint and inside the prompt")
+            previous_end = embedding.start + len(embedding.rows)
         if not self.prompt_token_ids:
             raise ValueError(f"{self.request_id}: empty prompt")
 
