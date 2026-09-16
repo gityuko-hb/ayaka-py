@@ -7,12 +7,14 @@ from typing import Any
 
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.request.lifecycle import LifecycleManager
+from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sched.continuous import ContinuousScheduler
 from ayaka.sched.eager import EagerScheduler
 from ayaka.sched.interfaces import (
     AdmissionAdvisor,
     PreemptionController,
     PrefixHintProvider,
+    RequestPreparer,
     SequenceAllocator,
     StepRuntime,
 )
@@ -28,6 +30,8 @@ def create_scheduler(
     allocator: SequenceAllocator,
     *,
     text_stops: bool = False,
+    sampling: SamplingCoordinator | None = None,
+    request_preparer: RequestPreparer | None = None,
     clock: Callable[[], int] | None = None,
     prefix_hints: PrefixHintProvider | None = None,
     admission: AdmissionAdvisor | None = None,
@@ -42,6 +46,8 @@ def create_scheduler(
     name = kind.strip().lower().replace("-", "_")
     common: dict[str, Any] = {
         "text_stops": text_stops,
+        "sampling": sampling,
+        "request_preparer": request_preparer,
         "clock": clock,
     }
     if name in {"eager", "reference", "debug"}:

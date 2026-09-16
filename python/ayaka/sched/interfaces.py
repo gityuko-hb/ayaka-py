@@ -24,6 +24,7 @@ __all__ = [
     "PreemptionCallback",
     "PreemptionController",
     "SequenceAllocator",
+    "RequestPreparer",
     "StepPrepareError",
     "StepRuntime",
 ]
@@ -76,6 +77,16 @@ class StepRuntime(Protocol):
     def adopt(self, prepared: PreparedStep) -> ExecutionTicket: ...
 
     def cancel(self, ticket: ExecutionTicket, reason: str) -> None: ...
+
+
+class RequestPreparer(Protocol):
+    """Acquire reusable state or rebind evicted state before taking a snapshot.
+
+    Return False while the request is not ready. Implementations must leave
+    lifecycle and physical state consistent even when the batch is not adopted.
+    """
+
+    def prepare_request(self, lifecycle: RequestLifecycle) -> bool: ...
 
 
 class PrefixHintProvider(Protocol):

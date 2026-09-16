@@ -17,7 +17,13 @@ from ayaka.executor.ticket import ExecutionTicket, TerminalStatus
 from ayaka.request.lifecycle import LifecycleManager
 from ayaka.request.states import RequestState
 from ayaka.sched.core import SchedulerCore
-from ayaka.sched.interfaces import OverloadedError, SequenceAllocator, StepPrepareError, StepRuntime
+from ayaka.sched.interfaces import (
+    OverloadedError,
+    RequestPreparer,
+    SequenceAllocator,
+    StepPrepareError,
+    StepRuntime,
+)
 from ayaka.sched.plan import BatchStepPlan, KVRequirement, Phase, PreparedStep, ScheduledSlice
 from ayaka.sched.policy import rank_waiting
 
@@ -70,6 +76,7 @@ class EagerScheduler(SchedulerCore):
         text_stops: bool = False,
         clock: Callable[[], int] | None = None,
         sampling: SamplingCoordinator | None = None,
+        request_preparer: RequestPreparer | None = None,
     ) -> None:
         super().__init__(
             plan,
@@ -79,6 +86,7 @@ class EagerScheduler(SchedulerCore):
             text_stops=text_stops,
             clock=clock,
             sampling=sampling,
+            request_preparer=request_preparer,
         )
         self._inflight_phases: dict[str, Phase] = {}
 
@@ -182,7 +190,13 @@ class EagerScheduler(SchedulerCore):
         eligible = [
             entry
             for entry in self._iter_waiting()
-            if entry.lifecycle.state in _SCHEDULABLE_STATES
+            if (
+                entry.lifecycle.state in _SCHEDULABLE_STATES
+                or (
+                    self._request_preparer is not None
+                    and entry.lifecycle.state is RequestState.PREEMPTED
+                )
+            )
             and not entry.lifecycle.token.is_cancelled
         ]
         ranked = rank_waiting(eligible, scheduling_policy=self._plan.scheduling_policy)
@@ -192,6 +206,10 @@ class EagerScheduler(SchedulerCore):
         for entry in ranked:
             if len(slices) >= self._seq_cap():
                 break
+            if self._request_preparer is not None and not self._request_preparer.prepare_request(
+                entry.lifecycle
+            ):
+                continue
             snapshot = entry.lifecycle.snapshot()
             count = snapshot.prompt_tokens - snapshot.computed_tokens
             if count <= 0:
@@ -207,7 +225,9 @@ class EagerScheduler(SchedulerCore):
                     snapshot.computed_tokens,
                     count,
                     Phase.PREFILL,
-                    sample_last_query=True,
+                    sample_last_query=(
+                        snapshot.computed_tokens + count == len(snapshot.known_tokens)
+                    ),
                 )
             )
             inputs.append(snapshot)
@@ -232,7 +252,7 @@ class EagerScheduler(SchedulerCore):
                     snapshot.computed_tokens,
                     1,
                     Phase.DECODE,
-                    sample_last_query=True,
+                    sample_last_query=(snapshot.computed_tokens + 1 == len(snapshot.known_tokens)),
                 )
             )
             inputs.append(snapshot)

@@ -22,6 +22,7 @@ from ayaka.sched.interfaces import (
     AdmissionAdvisor,
     PreemptionController,
     PrefixHintProvider,
+    RequestPreparer,
     SequenceAllocator,
     StepPrepareError,
     StepRuntime,
@@ -118,6 +119,7 @@ class ContinuousScheduler(SchedulerCore):
         prefill_chunk_size: int | None = None,
         max_bypass: int = 64,
         sampling: SamplingCoordinator | None = None,
+        request_preparer: RequestPreparer | None = None,
     ) -> None:
         super().__init__(
             plan,
@@ -127,6 +129,7 @@ class ContinuousScheduler(SchedulerCore):
             text_stops=text_stops,
             clock=clock,
             sampling=sampling,
+            request_preparer=request_preparer,
         )
         if prefill_chunk_size is not None and prefill_chunk_size <= 0:
             raise ValueError("prefill_chunk_size must be positive")
@@ -181,6 +184,8 @@ class ContinuousScheduler(SchedulerCore):
                         continue
                     if item.phase is Phase.PREFILL:
                         if item.query_end < item.prompt_tokens:
+                            # Partial prefill keeps its concurrency slot between chunks.
+                            self._prefilling[item.request_id] = lifecycle
                             self._requeue(lifecycle)
                         else:
                             self._running_add(item.request_id, lifecycle)
@@ -283,7 +288,7 @@ class ContinuousScheduler(SchedulerCore):
                     snapshot.computed_tokens,
                     1,
                     Phase.DECODE,
-                    sample_last_query=True,
+                    sample_last_query=(snapshot.computed_tokens + 1 == len(snapshot.known_tokens)),
                 )
             )
             inputs.append(snapshot)
@@ -305,7 +310,13 @@ class ContinuousScheduler(SchedulerCore):
         eligible = [
             entry
             for entry in self._hot
-            if entry.lifecycle.state in _SCHEDULABLE_STATES
+            if (
+                entry.lifecycle.state in _SCHEDULABLE_STATES
+                or (
+                    self._request_preparer is not None
+                    and entry.lifecycle.state is RequestState.PREEMPTED
+                )
+            )
             and not entry.lifecycle.token.is_cancelled
             and entry.ready_ns <= now
         ]
@@ -317,11 +328,18 @@ class ContinuousScheduler(SchedulerCore):
             scheduling_policy=self._plan.scheduling_policy,
         )
 
+        partial_ids = set(self._prefilling)
+        # Continue owned partial prompts before admitting another partial prompt.
+        ranked.sort(key=lambda entry: entry.lifecycle.request_id not in partial_ids)
         for entry in ranked:
-            if budget.remaining_sequences <= 0:
+            if budget.remaining_sequences <= 0 or budget.largest_fittable(1) == 0:
                 break
 
             lifecycle = entry.lifecycle
+            if self._request_preparer is not None and not self._request_preparer.prepare_request(
+                lifecycle
+            ):
+                continue
             snapshot = lifecycle.snapshot()
             remaining = snapshot.prompt_tokens - snapshot.computed_tokens
             if remaining <= 0:
@@ -346,9 +364,18 @@ class ContinuousScheduler(SchedulerCore):
 
             query_end = snapshot.computed_tokens + chunk
             last_prompt_chunk = query_end == snapshot.prompt_tokens
+            if (
+                not last_prompt_chunk
+                and lifecycle.request_id not in partial_ids
+                and len(partial_ids) >= self._plan.max_num_partial_prefills
+            ):
+                self._mark_bypass(entry)
+                continue
             if not budget.try_consume(chunk, phase=Phase.PREFILL):
                 self._mark_bypass(entry)
                 continue
+            if not last_prompt_chunk:
+                partial_ids.add(lifecycle.request_id)
             slices.append(
                 ScheduledSlice(
                     lifecycle.request_id,
@@ -357,7 +384,9 @@ class ContinuousScheduler(SchedulerCore):
                     snapshot.computed_tokens,
                     chunk,
                     Phase.PREFILL,
-                    sample_last_query=last_prompt_chunk,
+                    sample_last_query=(
+                        last_prompt_chunk and query_end == len(snapshot.known_tokens)
+                    ),
                 )
             )
             inputs.append(snapshot)
@@ -434,8 +463,15 @@ class ContinuousScheduler(SchedulerCore):
         inputs = plan.inputs
         largest = -1
         for index, scheduled in enumerate(slices):
-            if scheduled.phase is Phase.PREFILL and (
-                largest < 0 or scheduled.query_count > slices[largest].query_count
+            if scheduled.phase is not Phase.PREFILL:
+                continue
+            # At equal width, shrink later/new prompts first. Dropping the only
+            # continuation can strand its owned pages while a new request waits.
+            priority = (scheduled.query_count, inputs[index].computed_tokens == 0, index)
+            if largest < 0 or priority > (
+                slices[largest].query_count,
+                inputs[largest].computed_tokens == 0,
+                largest,
             ):
                 largest = index
 
@@ -464,6 +500,8 @@ class ContinuousScheduler(SchedulerCore):
                 )
 
             # 2. Remove a one-token prefill before sacrificing decode width.
+            if len(slices) == 1:
+                return None
             return self._make_plan(
                 slices[:largest] + slices[largest + 1 :],
                 inputs[:largest] + inputs[largest + 1 :],
@@ -476,11 +514,23 @@ class ContinuousScheduler(SchedulerCore):
         return None
 
     def _try_preempt_one(self, current_request_ids: set[str]) -> str | None:
-        if self._preemption is None or len(self._running) <= 1:
+        if self._preemption is None:
             return None
 
+        candidates = dict(self._running)
+        candidates.update(self._prefilling)
+        # A prefix can already be acquired for a waiting request that did not fit
+        # the previous batch. It owns real pages and must also be reclaimable.
+        for entry in self._hot:
+            lifecycle = entry.lifecycle
+            if (
+                lifecycle.computed_tokens > 0
+                and lifecycle.machine.can(RequestState.PREEMPTED)
+                and lifecycle.request_id not in self._pending
+            ):
+                candidates[lifecycle.request_id] = lifecycle
         victim = select_preemption_victim(
-            self._running.values(),
+            candidates.values(),
             excluded_request_ids=current_request_ids,
         )
         if victim is None:
@@ -495,6 +545,7 @@ class ContinuousScheduler(SchedulerCore):
             return None
 
         self._running_remove(victim.request_id)
+        self._prefilling.pop(victim.request_id, None)
         outcome = (
             RequestOutcome.PREEMPTED_SWAP if mode == "swap" else RequestOutcome.PREEMPTED_RECOMPUTE
         )

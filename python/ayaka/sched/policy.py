@@ -120,7 +120,7 @@ def rank_waiting(
         key = _fcfs_key
     elif name == "priority":
         key = _priority_key
-    elif name in {"lpm", "longest_prefix", "cache_affinity"}:
+    elif name in {"lpm", "longest_prefix", "longest_prefix_match", "cache_affinity"}:
         key = _cache_affinity_key
     elif name in {"lof", "longest_output"}:
         key = _longest_output_key

@@ -1,4 +1,4 @@
-"""Immutable scheduler contracts for the single-flight eager baseline.
+"""Immutable scheduler contracts for single-flight execution.
 
 Resolution checks declared execution/ledger capacities without allocating. It
 does not certify a runnable engine or replace transactional memory admission.
@@ -39,8 +39,8 @@ __all__ = [
 class SchedulingPolicy(enum.StrEnum):
     """Waiting order, independent of phase allocation and victim selection.
 
-    LPM/remaining-length names remain for migration diagnostics; the baseline
-    rejects them until their data and execution contracts are integrated.
+    LPM requires a prefix-capable runtime. Remaining-length scheduling remains
+    unsupported until output-length estimates have an execution contract.
     """
 
     FCFS = "fcfs"
@@ -50,7 +50,7 @@ class SchedulingPolicy(enum.StrEnum):
 
 
 class PreemptionMode(enum.StrEnum):
-    """Only NONE is integrated with the baseline scheduler contract."""
+    """RECOMPUTE requires a runtime that releases and rebinds KV; SWAP is unsupported."""
 
     NONE = "none"
     RECOMPUTE = "recompute"
@@ -70,12 +70,17 @@ class SchedulerCapabilities(ConfigMixin):
     token_padding_multiple: int = 1
     chunked_prefill: bool = False
     graph_mode: GraphMode = GraphMode.EAGER
+    recompute_preemption: bool = False
+    prefix_cache: bool = False
 
     def __post_init__(self) -> None:
         require_int(self.max_num_seqs, "capabilities.max_num_seqs", minimum=1)
         require_int(self.token_padding_multiple, "capabilities.token_padding_multiple", minimum=1)
         if type(self.chunked_prefill) is not bool:
             raise TypeError("capabilities.chunked_prefill must be bool")
+        for name in ("recompute_preemption", "prefix_cache"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"capabilities.{name} must be bool")
         if not isinstance(self.graph_mode, GraphMode):
             raise TypeError("capabilities.graph_mode must be GraphMode")
 
@@ -194,18 +199,25 @@ class SchedulerConfig(ConfigMixin):
             ("max_inflight", 1),
             ("max_num_partial_prefills", 1),
             ("long_prefill_token_threshold", 0),
-            ("preemption_mode", PreemptionMode.NONE),
             ("priority_preemption", False),
         ):
             if getattr(self, name) != supported:
                 raise ConfigError(
                     f"scheduler.{name}", "UNSUPPORTED_FEATURE", f"baseline requires {supported!r}"
                 )
-        if self.scheduling_policy not in (SchedulingPolicy.FCFS, SchedulingPolicy.PRIORITY):
+        if self.preemption_mode is PreemptionMode.SWAP:
+            raise ConfigError(
+                "scheduler.preemption_mode", "UNSUPPORTED_FEATURE", "SWAP is not integrated"
+            )
+        if self.scheduling_policy not in (
+            SchedulingPolicy.FCFS,
+            SchedulingPolicy.PRIORITY,
+            SchedulingPolicy.LONGEST_PREFIX_MATCH,
+        ):
             raise ConfigError(
                 "scheduler.scheduling_policy",
                 "UNSUPPORTED_POLICY",
-                "baseline supports FCFS/PRIORITY",
+                "supported policies are FCFS, PRIORITY, and capability-gated LPM",
             )
         if type(self.tier_limits) is not tuple:
             raise TypeError("scheduler.tier_limits must be a tuple of tuple pairs")
@@ -306,8 +318,8 @@ class ResolvedSchedulerPlan(SchedulerConfig):
     this max_inflight explicitly to the executor; runtime wiring belongs to S1.
     """
 
-    max_num_scheduled_tokens: int = field()
-    max_prefill_chunk_tokens: int | None = field()
+    max_num_scheduled_tokens: int = field()  # type: ignore
+    max_prefill_chunk_tokens: int | None = field()  # type: ignore
     max_model_len: int
     execution: ExecutionPlan
     capabilities: SchedulerCapabilities
@@ -401,6 +413,24 @@ class ResolvedSchedulerPlan(SchedulerConfig):
                 "scheduler.max_num_scheduled_tokens",
                 "PADDED_CAPACITY_EXCEEDED",
                 "padded issue budget exceeds execution capacity",
+            )
+        if (
+            self.preemption_mode is PreemptionMode.RECOMPUTE
+            and not self.capabilities.recompute_preemption
+        ):
+            raise ConfigError(
+                "scheduler.preemption_mode",
+                "PREEMPTION_UNSUPPORTED",
+                "runtime must support recompute and resume",
+            )
+        if (
+            self.scheduling_policy is SchedulingPolicy.LONGEST_PREFIX_MATCH
+            and not self.capabilities.prefix_cache
+        ):
+            raise ConfigError(
+                "scheduler.scheduling_policy",
+                "PREFIX_CACHE_UNSUPPORTED",
+                "runtime must supply prefix ownership and ranking",
             )
         if self.enable_chunked_prefill and not (
             compute.enable_chunked_prefill and self.capabilities.chunked_prefill

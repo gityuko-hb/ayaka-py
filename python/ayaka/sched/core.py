@@ -24,7 +24,7 @@ from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.schema import Request, RequestId
 from ayaka.sampling.logprobs import LogprobMode
 from ayaka.sched.base import BaseScheduler
-from ayaka.sched.interfaces import OverloadedError, SequenceAllocator, StepRuntime
+from ayaka.sched.interfaces import OverloadedError, RequestPreparer, SequenceAllocator, StepRuntime
 from ayaka.sched.outcome import FinishReason, RequestOutcome, RequestReport, SchedulerReport
 from ayaka.sched.plan import PromptLogprobSlicePlan, RequestStepInput
 from ayaka.sched.policy import QueueEntry
@@ -55,6 +55,7 @@ class SchedulerCore(BaseScheduler):
         text_stops: bool = False,
         clock: Callable[[], int] | None = None,
         sampling: SamplingCoordinator | None = None,
+        request_preparer: RequestPreparer | None = None,
     ) -> None:
         if not isinstance(plan, ResolvedSchedulerPlan):
             raise TypeError("plan must be ResolvedSchedulerPlan")
@@ -68,6 +69,7 @@ class SchedulerCore(BaseScheduler):
                     "lifetime, not just the running set"
                 )
 
+        self._request_preparer = request_preparer
         self._plan = plan
         self._requests = requests
         self._runtime = runtime
@@ -150,9 +152,20 @@ class SchedulerCore(BaseScheduler):
                 request_index=self._next_ordinal,
             )
 
-        lifecycle = self._requests.create(request)
-        self._requests.advance_to_queue(lifecycle.request_id)
-        sequence = self._allocator.create(lifecycle.request_id)
+        try:
+            sequence = self._allocator.create(str(request.request_id))
+        except BaseException:
+            if self._sampling is not None:
+                self._sampling.release(str(request.request_id))
+            raise
+        try:
+            lifecycle = self._requests.create(request)
+            self._requests.advance_to_queue(lifecycle.request_id)
+        except BaseException:
+            self._allocator.release(sequence)
+            if self._sampling is not None:
+                self._sampling.release(str(request.request_id))
+            raise
         lifecycle.bind_sequence(sequence, state_version=0, computed_tokens=0)
         self._sequences[lifecycle.request_id] = sequence
         self._waiting_add(self._new_queue_entry(lifecycle, sequence))

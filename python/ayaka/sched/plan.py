@@ -77,8 +77,11 @@ class PromptLogprobSlicePlan:
     positions: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if not _VALIDATE:
-            return
+        if _VALIDATE:
+            self.validate()
+
+    def validate(self) -> None:
+        """Validate explicitly, including under optimized Python."""
         require_int(self.slice_index, "prompt logprob slice_index", minimum=0)
         require_int(self.k, "prompt logprob k", minimum=0)
         if type(self.positions) is not tuple:
@@ -112,8 +115,11 @@ class ScheduledSlice:
     sample_last_query: bool = False
 
     def __post_init__(self) -> None:
-        if not _VALIDATE:
-            return
+        if _VALIDATE:
+            self.validate()
+
+    def validate(self) -> None:
+        """Validate explicitly, including under optimized Python."""
         require_text(self.request_id, "request_id")
         require_int(self.sequence_epoch, "sequence_epoch", minimum=1)
         require_int(self.expected_state_version, "expected_state_version")
@@ -151,8 +157,11 @@ class RequestStepInput:
     max_output_tokens: int
 
     def __post_init__(self) -> None:
-        if not _VALIDATE:
-            return
+        if _VALIDATE:
+            self.validate()
+
+    def validate(self) -> None:
+        """Validate explicitly, including under optimized Python."""
         require_text(self.request_id, "request_id")
         if not isinstance(self.sequence, SequenceHandle):
             raise TypeError("sequence must be SequenceHandle")
@@ -213,8 +222,11 @@ class KVRequirement:
     request_tokens: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
-        if not _VALIDATE:
-            return
+        if _VALIDATE:
+            self.validate()
+
+    def validate(self) -> None:
+        """Validate explicitly, including under optimized Python."""
         for name in ("group_id", "append_tokens", "cow_pages", "restore_bytes", "growth_bytes"):
             require_int(getattr(self, name), name)
         request_ids: list[str] = []
@@ -238,8 +250,11 @@ class StepDependency:
     kind: str
 
     def __post_init__(self) -> None:
-        if not _VALIDATE:
-            return
+        if _VALIDATE:
+            self.validate()
+
+    def validate(self) -> None:
+        """Validate explicitly, including under optimized Python."""
         require_text(self.producer_id, "producer_id")
         require_text(self.kind, "dependency kind")
 
@@ -253,8 +268,11 @@ class DistributedStepIdentity:
     worker_generation: int
 
     def __post_init__(self) -> None:
-        if not _VALIDATE:
-            return
+        if _VALIDATE:
+            self.validate()
+
+    def validate(self) -> None:
+        """Validate explicitly, including under optimized Python."""
         require_frozen(self, "distributed identity")
         require_int(self.collective_sequence, "collective_sequence")
         require_int(self.worker_generation, "worker_generation")
@@ -295,8 +313,11 @@ class BatchStepPlan:
     created_ns: int = 0
 
     def __post_init__(self) -> None:
-        if not _VALIDATE:
-            return
+        if _VALIDATE:
+            self.validate()
+
+    def validate(self) -> None:
+        """Validate explicitly, including under optimized Python."""
         require_int(self.step_id, "step_id")
         require_text(self.execution_plan_id, "execution_plan_id")
         require_int(self.padded_num_tokens, "padded_num_tokens")
@@ -339,6 +360,8 @@ class BatchStepPlan:
                 raise ValueError("a request may have only one slice per step")
             request_ids.add(scheduled.request_id)
             sequences.add(value.sequence)
+            scheduled.validate()
+            value.validate()
             value.validate_slice(scheduled)
             offset += scheduled.query_count
             if scheduled.sample_last_query:
@@ -357,6 +380,7 @@ class BatchStepPlan:
         for entry in self.prompt_logprobs:
             if not isinstance(entry, PromptLogprobSlicePlan):
                 raise TypeError("prompt_logprobs must contain PromptLogprobSlicePlan")
+            entry.validate()
             if entry.slice_index >= len(self.slices):
                 raise IndexError("prompt logprob slice_index outside the step's slices")
             if entry.slice_index <= previous_slice:
@@ -372,6 +396,16 @@ class BatchStepPlan:
                         f"prompt logprob position {position} outside slice {entry.slice_index} "
                         f"prompt range [{lo}, {hi})"
                     )
+        for requirement in self.kv_requirements:
+            if not isinstance(requirement, KVRequirement):
+                raise TypeError("kv_requirements must contain KVRequirement")
+            requirement.validate()
+        for dependency in self.dependencies:
+            if not isinstance(dependency, StepDependency):
+                raise TypeError("dependencies must contain StepDependency")
+            dependency.validate()
+        if self.distributed is not None:
+            self.distributed.validate()
         groups = [requirement.group_id for requirement in self.kv_requirements]
         if len(set(groups)) != len(groups):
             raise ValueError("KV requirements must be unique by group")
@@ -439,14 +473,18 @@ class PreparedStep:
     memory_view: ExecutionMemoryView | GroupedExecutionMemoryView
 
     def __post_init__(self) -> None:
-        if not _VALIDATE:
-            return
+        if _VALIDATE:
+            self.validate()
+
+    def validate(self) -> None:
+        """Validate explicitly, including under optimized Python."""
         if not isinstance(self.execution, ExecutionPlan):
             raise TypeError("execution must be ExecutionPlan")
         if not isinstance(self.step, BatchStepPlan):
             raise TypeError("step must be BatchStepPlan")
         if not isinstance(self.memory_view, (ExecutionMemoryView, GroupedExecutionMemoryView)):
             raise TypeError("memory_view must be an execution memory snapshot")
+        self.step.validate()
         if self.execution.plan_id != self.step.execution_plan_id:
             raise ValueError("resolved execution identity disagrees with step")
         if not self.step.slices:
