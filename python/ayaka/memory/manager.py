@@ -1,8 +1,20 @@
-"""Scheduler-independent paged runtime-memory manager
+"""Scheduler-independent paged KV manager for the homogeneous path.
 
-Implements the full reservation/execution/reclamation lifecycle for the
-homogeneous MHA/GQA path: sequences, page allocation, prefix reuse, deferred
-free, and leak accounting, all behind opaque handles and immutable results.
+Owns sequence state, page allocation, prefix reuse, deferred free, tiering and
+leak accounting behind opaque handles and immutable views.  The step lifecycle
+is::
+
+    begin_transaction -> try_reserve -> prepare_step -> mark_step_in_flight
+        -> complete_step | abort_prepared_step | fail_in_flight_step
+        -> retire_step
+
+Nothing here decides priority, queue order or batch shape: the scheduler plans,
+this manager makes the plan legal and reversible, and the executor reports
+completion back through ``advance_epoch``.
+
+The cache-group path has a parallel implementation in
+:mod:`ayaka.kvcache.grouped_manager`.  The two share the records and state
+machine in :mod:`ayaka.memory.transaction` but not the manager itself.
 """
 
 from __future__ import annotations

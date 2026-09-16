@@ -1,3 +1,13 @@
+"""Structured outcomes for the memory-pressure paths.
+
+The manager never returns bare counters from reclaim, eviction or preemption.
+It returns one of these immutable results so a caller can distinguish "nothing
+was reclaimable" from "the action gained capacity" without inspecting
+internals, and so monitoring gets exact cumulative totals alongside the
+attempt/progress pairs.  Each result validates its own consistency: a
+``PROGRESSED`` status with zero reclaimed pages is rejected at construction.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

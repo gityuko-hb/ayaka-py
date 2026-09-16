@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import os
-import re
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any
 
 from ayaka.utils.import_utils import CapabilityError
 from ayaka.utils.torch_utils import (
@@ -47,6 +45,7 @@ class DeviceMemory:
             f"(+{self.allocator_overhead / mib:.0f} MiB overhead)"
         )
 
+
 def device_memory(device: Any = None) -> DeviceMemory:
     """Sample a device's memory at both levels.
 
@@ -72,6 +71,7 @@ def device_memory(device: Any = None) -> DeviceMemory:
         reserved=int(module.cuda.memory_reserved(resolved.index)),
     )
 
+
 def empty_cache() -> None:
     """Return the caching allocator's free segments to the driver.
 
@@ -82,6 +82,7 @@ def empty_cache() -> None:
     """
     if cuda_available():
         require_torch().cuda.empty_cache()
+
 
 @contextmanager
 def peak_memory_bytes(device: Any = None) -> Generator[list[int]]:
@@ -112,97 +113,66 @@ def peak_memory_bytes(device: Any = None) -> Generator[list[int]]:
         module.cuda.synchronize(index)
         result[0] = int(module.cuda.max_memory_allocated(index))
 
-_MEMINFO: Final[str] = "/proc/meminfo"
-_CGROUP_V2_MAX: Final[str] = "/sys/fs/cgroup/memory.max"
-_CGROUP_V1_MAX: Final[str] = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 
-def _host_total_ram_bytes() -> int | None:
-    """Total host RAM, honouring a cgroup limit when one applies.
-
-    A container's ``MemTotal`` is the *host's*, not the container's, so a
-    pinned-memory ceiling computed from ``/proc/meminfo`` alone will happily
-    exceed the cgroup limit and get the process OOM-killed by the kernel rather
-    than refused by an allocator.
-    """
-    limits: list[int] = []
-    try:
-        with open(_MEMINFO, encoding="ascii") as handle:
-            for line in handle:
-                if line.startswith("MemTotal:"):
-                    limits.append(int(line.split()[1]) * 1024)
-                    break
-    except OSError:
-        pass
-    for path in (_CGROUP_V2_MAX, _CGROUP_V1_MAX):
-        try:
-            with open(path, encoding="ascii") as handle:
-                raw = handle.read().strip()
-        except OSError:
-            continue
-        if raw == "max":
-            continue
-        value = int(raw)
-        # cgroup v1 writes a sentinel near 2**63 to mean "unlimited".
-        if 0 < value < 2**62:
-            limits.append(value)
-    return min(limits) if limits else None
-
-def host_pinned_ceiling_bytes(
+def empty_host_tensor(
+    shape: tuple[int, ...] | int,
+    dtype: Any,
     *,
-    requested_bytes: int | None = None,
-    fraction: float = 0.25,
-    reserve_bytes: int = 2 * 2**30,
-) -> int:
-    """Safe upper bound on page-locked host memory.
+    pinned: bool,
+    allow_pageable: bool = False,
+) -> tuple[Any, bool]:
+    """Allocate a host tensor, page-locked when ``pinned`` asks for it.
 
-    Pinned memory is not swappable: over-pinning does not degrade, it takes the
-    kernel's reclaimable pool away and ends in an OOM kill that no Python
-    handler sees. So the ceiling is the minimum of what the operator asked for
-    and what the system can survive.
+    Returns ``(tensor, actually_pinned)``.  The flag is the *actual* tier, not
+    the request: a caller that charges a memory ledger must charge what it got,
+    and a predicted tier is not a materialized one.
 
     Args:
-        requested_bytes: What the operator configured, if anything.
-        fraction: Share of total host memory that may be pinned.
-        reserve_bytes: Absolute floor left to the rest of the system.
+        shape: Tensor shape.
+        dtype: Dtype or dtype name.
+        pinned: Whether page-locked memory is required.
+        allow_pageable: Fall back to ordinary host memory when pinning is
+            impossible. Off by default, because the caller that charged a
+            ledger for pinned bytes must not silently receive pageable memory —
+            the two differ in whether DMA from the buffer is possible at all.
 
-    Returns:
-        The byte ceiling, never negative.
-
-    >>> host_pinned_ceiling_bytes(requested_bytes=0)
-    0
+    Raises:
+        CapabilityError: ``pinned`` was requested, the result would not be
+            page-locked, and ``allow_pageable`` is False.
     """
-    total = _host_total_ram_bytes()
-    if total is None:
-        # Unknown host size: trust only what was explicitly asked for.
-        return max(requested_bytes or 0, 0)
-    system_ceiling = max(int(total * fraction), 0)
-    system_ceiling = min(system_ceiling, max(total - reserve_bytes, 0))
-    if requested_bytes is None:
-        return system_ceiling
-    return max(min(requested_bytes, system_ceiling), 0)
-
-def _numa_nodes() -> int:
+    module = require_torch(capability="pinned_host_memory")
+    resolved = torch_dtype(dtype)
+    if not pinned:
+        return module.empty(shape, dtype=resolved, device="cpu"), False
+    if not cuda_available():
+        if not allow_pageable:
+            raise CapabilityError(
+                "pinned_host_memory",
+                detail="page-locked host memory requires CUDA",
+                remedy="run on a CUDA host, or allow pageable fallback",
+            )
+        return module.empty(shape, dtype=resolved, device="cpu"), False
     try:
-        entries = os.listdir("/sys/devices/system/node")
-    except OSError:
-        return 1
-    nodes = sum(1 for e in entries if re.fullmatch(r"node\d+", e))
-    return max(1, nodes)
+        tensor = module.empty(shape, dtype=resolved, device="cpu", pin_memory=True)
+    except RuntimeError as exc:
+        if not allow_pageable:
+            raise CapabilityError(
+                "pinned_host_memory",
+                detail=f"cannot page-lock {shape} of {dtype_name(resolved)}: {exc}",
+                remedy="lower the host tier size, or raise the RLIMIT_MEMLOCK ceiling",
+            ) from exc
+        return module.empty(shape, dtype=resolved, device="cpu"), False
+    # ``pin_memory=True`` is a request, not a guarantee; report what exists.
+    if bool(tensor.is_pinned()):
+        return tensor, True
+    if not allow_pageable:
+        raise CapabilityError(
+            "pinned_host_memory",
+            detail="torch returned pageable memory for a pinned request",
+            remedy="lower the host tier size, or raise the RLIMIT_MEMLOCK ceiling",
+        )
+    return tensor, False
 
-def _pci_numa_node(bus_id: str) -> int:
-    """Inspect PCI sysfs to find the NUMA affinity of the device."""
-    if not bus_id:
-        return -1
-    clean_bus = bus_id.lower().strip()
-    if not clean_bus.startswith("0000:"):
-        clean_bus = f"0000:{clean_bus}"
-    path = f"/sys/bus/pci/devices/{clean_bus}/numa_node"
-    try:
-        with open(path, encoding="ascii") as fh:
-            val = int(fh.read().strip())
-            return val if val >= 0 else -1
-    except (OSError, ValueError):
-        return -1
 
 def pinned_empty(
     shape: tuple[int, ...],
@@ -210,37 +180,5 @@ def pinned_empty(
     *,
     allow_pageable: bool = True,
 ) -> tuple[Any, bool]:
-    """Allocate a host buffer, page-locked when possible.
-
-    Returns ``(tensor, pinned)``. The flag is the *actual* tier, not the
-    request: a caller that charges a memory ledger must charge what it got, and
-    a predicted tier is not a materialized one.
-
-    Args:
-        shape: Tensor shape.
-        dtype: Dtype or dtype name.
-        allow_pageable: Fall back to ordinary host memory when pinning fails.
-            Set False when only DMA-capable memory is acceptable.
-
-    Raises:
-        CapabilityError: when pinning fails and ``allow_pageable`` is False.
-    """
-    module = require_torch(capability="pinned_host_memory")
-    resolved = torch_dtype(dtype)
-    if cuda_available():
-        try:
-            return module.empty(shape, dtype=resolved, device="cpu", pin_memory=True), True
-        except RuntimeError as exc:
-            if not allow_pageable:
-                raise CapabilityError(
-                    "pinned_host_memory",
-                    detail=f"cannot page-lock {shape} of {dtype_name(resolved)}: {exc}",
-                    remedy="lower the host tier size, or raise the RLIMIT_MEMLOCK ceiling",
-                ) from exc
-    elif not allow_pageable:
-        raise CapabilityError(
-            "pinned_host_memory",
-            detail="page-locked host memory requires CUDA",
-            remedy="run on a CUDA host, or allow pageable fallback",
-        )
-    return module.empty(shape, dtype=resolved, device="cpu"), False
+    """Host buffer, page-locked when possible; see :func:`empty_host_tensor`."""
+    return empty_host_tensor(shape, dtype, pinned=True, allow_pageable=allow_pageable)

@@ -1,3 +1,22 @@
+"""Opt-in host KV tier: mirrored storage, transfer engines, placement policy.
+
+Three layers, in dependency order:
+
+``HostKVStorage``
+    A host mirror of the device KV planes, one slot per page, plus the block
+    copies between tiers.
+``TransferEngine``
+    Async device<->host copies.  ``SynchronousTransferEngine`` serves tests and
+    CPU; ``CudaTransferEngine`` uses real streams and events.
+``TierManager``
+    Placement policy over the :class:`~ayaka.memory.allocator.PageAllocator`:
+    which evicted pages move to the host, which host blocks are promoted back,
+    and which device pages are safe to release once a copy lands.
+
+Tiering is strictly opt-in: with no :class:`TieringConfig` the manager keeps the
+GPU-only path and nothing in this module runs.
+"""
+
 from __future__ import annotations
 
 from collections import deque
@@ -39,6 +58,7 @@ class TierState(Enum):
     PROMOTING = auto()
     """A host-to-device copy is in flight into a RESERVED GPU page."""
 
+
 class TransferDirection(Enum):
     """Direction of one page-sized tier transfer."""
 
@@ -72,6 +92,7 @@ class TransferTicket:
     host_slot: int
     issue_epoch: int
 
+
 @dataclass(frozen=True, slots=True)
 class TransferOutcome:
     """Result of one resolved transfer."""
@@ -86,6 +107,7 @@ class TransferOutcome:
             raise ValueError("a transfer outcome cannot still be pending")
         if (self.error is None) == (self.state is TransferState.FAILED):
             raise ValueError("a failed outcome must carry an error and a success must not")
+
 
 @dataclass(frozen=True, slots=True)
 class TransferMetrics:
@@ -132,6 +154,7 @@ class TransferEngine(Protocol):
 
     @property
     def metrics(self) -> TransferMetrics: ...
+
 
 class HostKVStorage:
     """Page-for-page host mirror of a device KV storage (A11-01).

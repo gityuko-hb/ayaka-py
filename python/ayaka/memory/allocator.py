@@ -1,8 +1,19 @@
-"""Fixed-size page allocator with generation checks, pin locks, and deferred reclamation.
+"""Fixed-size KV page identities: generation checks, refcounts, deferred reclaim.
 
-Allocates generation-safe metadata identities into preallocated KV storage.
-Deferred free defers recycling until a safe completion epoch, so a page can
-never be handed out while a launched GPU step may still write to it.
+The allocator owns *metadata and page identities*, never bytes: the K/V buffers
+are preallocated by the storage layer and addressed by
+:class:`~ayaka.handles.PhysicalPageId`.  A page's generation changes whenever its
+slot is reused, so a handle from an older lifetime is rejected instead of
+silently aliasing another sequence's KV.
+
+Reclamation is epoch-gated.  ``free`` is not "return the page", it is "drop one
+owner and record how early the page could be safe"; a page whose last reference
+disappears waits in ``RECLAIM_PENDING`` until the execution layer advances its
+completion epoch.  That is what makes it impossible for a launched GPU step to
+write into a recycled slot.
+
+Byte pooling for scratch — workspaces, activations, staging — is a different
+problem with a different answer; see :mod:`ayaka.memory.caching`.
 """
 
 from __future__ import annotations
@@ -732,13 +743,11 @@ class PageAllocator:
                 for epoch, index, generation in self._reclaim_heap
                 if 0 <= index < self._total_pages
                 and self._pages[index].generation == generation
-                and self._pages[index].allocation_state
-                is PageAllocationState.RECLAIM_PENDING
+                and self._pages[index].allocation_state is PageAllocationState.RECLAIM_PENDING
                 and self._pages[index].pending_free_epoch == epoch
             ]
             pending_count = sum(
-                meta.allocation_state is PageAllocationState.RECLAIM_PENDING
-                for meta in self._pages
+                meta.allocation_state is PageAllocationState.RECLAIM_PENDING for meta in self._pages
             )
             if (
                 len(valid_reclaim_entries) != pending_count

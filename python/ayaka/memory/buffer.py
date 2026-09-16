@@ -1,4 +1,11 @@
-"""Physical step buffers with one ledger charge per allocation.
+"""Typed, one-shot step buffers with one ledger claim per allocation.
+
+A :class:`BufferLease` is a typed tensor view — the transfer path reshapes it to
+the KV plane geometry — plus its own ledger reservation, released when the owner
+closes it.  That is deliberately *not* :class:`~ayaka.memory.caching.CachingAllocator`:
+a pooled region has no dtype, cannot be reshaped for a copy, and its ledger
+entry is restated as a pool rather than claimed and released per use.  Staging
+buffers are one-shot by construction, so the claim is the honest accounting.
 
 Views are borrowed: consumers must finish before the owner closes the buffer.
 Allocation performs no tensor initialization or transfer and enqueues no work.
@@ -9,10 +16,13 @@ from __future__ import annotations
 from itertools import count
 from typing import Any
 
+from ayaka.exceptions import RuntimeMemoryError
 from ayaka.memory.ledger import MemoryLedger, Reservation
-from ayaka.memory.region import MemoryRegion
+from ayaka.memory.region import MemoryRegion, first_aligned_offset
 from ayaka.plan import WorkspaceRequest
 from ayaka.types import MemoryTier
+from ayaka.utils.import_utils import CapabilityError
+from ayaka.utils.torch_memory import empty_host_tensor
 from ayaka.utils.torch_utils import require_torch
 
 _BUFFER_IDS = count()
@@ -83,18 +93,26 @@ class BufferAllocator:
         )
         tensor = view = None
         try:
-            torch = require_torch(capability="runtime buffers")
-            tensor = torch.empty(
-                size,
-                dtype=torch.uint8,
-                device=(
-                    f"cuda:{self.ledger.device_index}"
-                    if request.tier is MemoryTier.DEVICE
-                    else "cpu"
-                ),
-                pin_memory=request.tier is MemoryTier.HOST_PINNED,
-            )
-            offset = (-tensor.data_ptr()) % request.alignment
+            if request.tier is MemoryTier.DEVICE:
+                torch = require_torch(capability="runtime buffers")
+                tensor = torch.empty(
+                    size,
+                    dtype=torch.uint8,
+                    device=f"cuda:{self.ledger.device_index}",
+                )
+            else:
+                try:
+                    tensor, _ = empty_host_tensor(
+                        (size,),
+                        "uint8",
+                        pinned=request.tier is MemoryTier.HOST_PINNED,
+                        allow_pageable=request.tier is not MemoryTier.HOST_PINNED,
+                    )
+                except CapabilityError as exc:
+                    raise RuntimeMemoryError(
+                        f"step buffer {label!r} could not be allocated: {exc}"
+                    ) from exc
+            offset = first_aligned_offset(tensor.data_ptr(), request.alignment)
             view = tensor[offset : offset + request.nbytes]
             region = MemoryRegion(
                 region_id=next(_BUFFER_IDS),
@@ -106,6 +124,7 @@ class BufferAllocator:
                     self.ledger.device_index if request.tier is MemoryTier.DEVICE else -1
                 ),
                 alignment=request.alignment,
+                class_bytes=size,
             )
             self.ledger.materialize(ticket, actual_bytes=size)
             self.ledger.commit(ticket)

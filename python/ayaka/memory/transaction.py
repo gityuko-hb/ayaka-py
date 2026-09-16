@@ -1,3 +1,12 @@
+"""Transactional records for tentative KV plans.
+
+A scheduler step opens a transaction, reserves pages tentatively, freezes the
+plan into an execution lease, then commits or rolls it back.  The records and
+the small state machine (:class:`LifecycleTransitions`) are shared by the
+homogeneous and grouped managers; the managers own the behaviour, these records
+own the truth.  Nothing in this module touches the allocator or the ledger.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable, MutableMapping

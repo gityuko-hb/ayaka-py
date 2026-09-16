@@ -41,6 +41,11 @@ start. Alignment can already make charge differ from tensor payload; they
 diverge further when KV moves to ``cuMemAddressReserve`` (A6 elastic KV): a huge
 VA range is reserved once and physical pages are mapped and unmapped underneath
 it. Adding all three columns now is free; retrofitting them later is not.
+
+The pieces: :class:`TierAccount` is one tier's capacity, :class:`Reservation` is
+one claim, :class:`Ticket` is an open transaction, and :class:`MemoryLedger`
+owns the five verbs plus :meth:`~MemoryLedger.reconcile`, the invariant that
+keeps the whole structure honest.
 """
 
 from __future__ import annotations

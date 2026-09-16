@@ -1,3 +1,13 @@
+"""Sequence page tables and the per-sequence KV state machine.
+
+A sequence's KV is a list of :class:`PageTableEntry` values — a page plus its
+valid token count — optionally split per cache group on the grouped path.  The
+page table is pure data validated against the committed token count; the entries
+name pages, the allocator owns them, and nothing here touches bytes.  The
+:class:`SequenceArena` hands out generation-safe sequence identities, and the
+homogeneous/grouped split mirrors the two manager implementations.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -28,6 +38,7 @@ class PageTableEntry:
         if self.valid_tokens <= 0:
             raise ValueError("a committed page-table entry must contain tokens")
 
+
 @dataclass(frozen=True, slots=True)
 class GroupPageTableEntry:
     """One committed logical block inside one cache group's page table.
@@ -45,6 +56,7 @@ class GroupPageTableEntry:
             raise ValueError("logical_block must be non-negative")
         if self.valid_tokens <= 0:
             raise ValueError("a group page-table entry must contain valid tokens")
+
 
 @dataclass(slots=True)
 class SequencePageTable:
@@ -93,6 +105,7 @@ class SequencePageTable:
                 f"page table represents {total} tokens, expected {committed_tokens}"
             )
 
+
 @dataclass(slots=True)
 class SequenceMemoryState:
     """Mutable per-sequence state owned by the arena.
@@ -122,6 +135,7 @@ class SequenceMemoryState:
     blocked_until_epoch: int = 0
     """Sequence is blocked from new work until this epoch (failed steps)."""
 
+
 @dataclass(frozen=True, slots=True)
 class SequenceMemorySnapshot:
     """Immutable scheduler-facing view of one sequence's KV state."""
@@ -135,6 +149,7 @@ class SequenceMemorySnapshot:
     """True while the sequence participates in a transaction or lease."""
     release_requested: bool
     blocked_until_epoch: int
+
 
 @dataclass(slots=True)
 class GroupedSequenceMemoryState:
@@ -156,6 +171,7 @@ class GroupedSequenceMemoryState:
     release_requested: bool = False
     release_safe_epoch: int = 0
     blocked_until_epoch: int = 0
+
 
 @dataclass(frozen=True, slots=True)
 class GroupedSequenceSnapshot:
@@ -180,6 +196,7 @@ class GroupedSequenceSnapshot:
             if name == group_name:
                 return entries
         raise KeyError(group_name)
+
 
 class SequenceArena:
     """Fixed-capacity arena that rejects stale sequence handles.

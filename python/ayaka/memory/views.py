@@ -1,3 +1,12 @@
+"""Frozen views handed to the scheduler, executor and diagnostics.
+
+The manager never exposes allocator internals.  It builds these immutable
+views — page tables, write slots, copy plans, capacity snapshots, leak reports —
+and revalidates them at launch.  The grouped variants carry per-group rows where
+the homogeneous ones carry a single page table; cache views and snapshot
+extras are homogeneous-path only.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

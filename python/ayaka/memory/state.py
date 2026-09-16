@@ -1,3 +1,12 @@
+"""Lifecycle vocabulary shared by the memory manager and its callers.
+
+Page lifecycle, residency, transaction and lease states, structured reservation
+failures, and release outcomes.  These enums are deliberately behaviour-free so
+the scheduler can react to a memory outcome without importing allocator
+internals; the transition rules that guard them live in
+:mod:`ayaka.memory.allocator` and :mod:`ayaka.memory.transaction`.
+"""
+
 from __future__ import annotations
 
 from enum import Enum, auto

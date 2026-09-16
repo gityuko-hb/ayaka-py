@@ -1,9 +1,19 @@
+"""Bump and slab carving inside one already-allocated region.
+
+An :class:`Arena` hands out aligned slices of a single region and frees them all
+at once with ``reset``; a :class:`SlabAllocator` hands out fixed-size strided
+objects and frees them individually.  Neither class allocates or moves bytes:
+the region came from a byte allocator, and exhaustion raises
+:class:`ArenaExhausted` rather than growing, because an arena is sized once for
+a worst-case step.
+"""
+
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
 
-from ayaka.memory.region import MemoryRegion
+from ayaka.memory.region import MemoryRegion, first_aligned_offset
 from ayaka.types import MemoryOwner
 
 __all__ = ["Arena", "ArenaExhausted", "ArenaStats", "SlabAllocator", "SlabStats"]
@@ -90,7 +100,7 @@ class Arena:
             raise ValueError(f"alignment {alignment} is not a power of two")
         with self._lock:
             base = self._region.base_ptr + self._offset
-            padding = (-base) % alignment
+            padding = first_aligned_offset(base, alignment)
             start = self._offset + padding
             if start + nbytes > self._region.nbytes:
                 raise ArenaExhausted(

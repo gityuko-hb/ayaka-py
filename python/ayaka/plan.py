@@ -122,6 +122,18 @@ class ComputePlan:
 
 
 #! MemoryPlan
+MAX_ALIGNMENT = 64 << 10
+"""Upper bound on :attr:`WorkspaceRequest.alignment`.
+
+A byte allocator cannot hand out a pointer aligned to ``A`` from an arbitrary
+block without holding ``A - base_alignment`` extra bytes, so an unbounded
+alignment turns one oversized request into an arbitrarily oversized class.
+64 KiB is far above anything a kernel needs (256 is the tensor-core floor, 128
+the vectorized-load floor) and small enough that the over-allocation stays
+bounded.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class WorkspaceRequest:
     """A scratch reservation for one step.
@@ -143,6 +155,12 @@ class WorkspaceRequest:
         require_int(self.alignment, "workspace alignment", minimum=1)
         if self.alignment & (self.alignment - 1):
             raise ValueError(f"{self.name}: alignment {self.alignment} is not a power of two")
+        if self.alignment > MAX_ALIGNMENT:
+            raise ValueError(
+                f"{self.name}: alignment {self.alignment} exceeds the {MAX_ALIGNMENT}-byte "
+                "cap; over-allocating for a larger boundary would hold more slack than "
+                "the request itself"
+            )
 
 
 @dataclass(frozen=True, slots=True)

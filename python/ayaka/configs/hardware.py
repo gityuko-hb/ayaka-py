@@ -8,13 +8,13 @@ from dataclasses import dataclass, field, replace
 from ayaka.configs.base import ConfigMixin
 from ayaka.distributed.device import DeviceCapability, DeviceRef, LinkKind
 from ayaka.types import DeviceKind
+from ayaka.utils.host_info import host_total_ram_bytes, numa_node_count, pci_numa_node
 from ayaka.utils.nvml_utils import (
     get_driver_version,
     nvml_session,
     probe_device,
     probe_nvlink_matrix,
 )
-from ayaka.utils.torch_memory import _host_total_ram_bytes, _numa_nodes, _pci_numa_node
 
 CC_LIMITS: dict[tuple[int, int], dict[str, int]] = {
     # Pascal
@@ -186,6 +186,7 @@ def _fill_cc_limits(cap: DeviceCapability) -> DeviceCapability:
         l2_bytes=cap.l2_bytes or _l2_for(cap.name),
     )
 
+
 @dataclass(frozen=True, slots=True)
 class HardwareConfig(ConfigMixin):
     """Immutable hardware topology, device capabilities, and interconnect matrix.
@@ -262,8 +263,8 @@ class HardwareConfig(ConfigMixin):
     def cpu_only(cls, *, note: str = "") -> HardwareConfig:
         """Construct a fallback CPU-only hardware configuration without CUDA devices."""
         return cls(
-            host_ram_bytes=_host_total_ram_bytes() or 0,
-            numa_nodes=_numa_nodes(),
+            host_ram_bytes=host_total_ram_bytes() or 0,
+            numa_nodes=numa_node_count(),
             cpu_count=os.cpu_count() or 1,
             detected=False,
             notes=(note,) if note else (),
@@ -281,13 +282,14 @@ class HardwareConfig(ConfigMixin):
         return cls(
             devices=devices,
             capabilities=tuple(cap for _ in range(count)),
-            host_ram_bytes=_host_total_ram_bytes() or 0,
-            numa_nodes=_numa_nodes(),
+            host_ram_bytes=host_total_ram_bytes() or 0,
+            numa_nodes=numa_node_count(),
             cpu_count=os.cpu_count() or 1,
             links=links,
             detected=False,
             notes=("synthetic",),
         )
+
 
 def _detect_via_pynvml() -> HardwareConfig | None:
     with nvml_session() as pynvml:
@@ -314,7 +316,7 @@ def _detect_via_pynvml() -> HardwareConfig | None:
                             num_sms=raw.num_sms,
                             hbm_bytes=raw.hbm_bytes,
                             pci_bus_id=raw.pci_bus_id,
-                            numa_node=_pci_numa_node(raw.pci_bus_id),
+                            numa_node=pci_numa_node(raw.pci_bus_id),
                         )
                     )
                 )
@@ -335,8 +337,8 @@ def _detect_via_pynvml() -> HardwareConfig | None:
             return HardwareConfig(
                 devices=tuple(devices),
                 capabilities=tuple(caps),
-                host_ram_bytes=_host_total_ram_bytes() or 0,
-                numa_nodes=_numa_nodes(),
+                host_ram_bytes=host_total_ram_bytes() or 0,
+                numa_nodes=numa_node_count(),
                 cpu_count=os.cpu_count() or 1,
                 links=tuple(matrix),
                 driver_version=get_driver_version(pynvml),
@@ -388,7 +390,7 @@ def _detect_via_smi() -> HardwareConfig | None:
                     sm_minor=cc_pair[1],
                     hbm_bytes=hbm,
                     pci_bus_id=bus,
-                    numa_node=_pci_numa_node(bus),
+                    numa_node=pci_numa_node(bus),
                 )
             )
         )
@@ -403,8 +405,8 @@ def _detect_via_smi() -> HardwareConfig | None:
     return HardwareConfig(
         devices=tuple(devices),
         capabilities=tuple(caps),
-        host_ram_bytes=_host_total_ram_bytes() or 0,
-        numa_nodes=_numa_nodes(),
+        host_ram_bytes=host_total_ram_bytes() or 0,
+        numa_nodes=numa_node_count(),
         cpu_count=os.cpu_count() or 1,
         links=links,
         detected=True,
