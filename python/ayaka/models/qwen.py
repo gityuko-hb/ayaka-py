@@ -390,7 +390,10 @@ class _QwenAttention(nn.Module):
         value = value.view(tokens, self.num_heads, self.head_dim)
         self.rotary(positions, query, key)
         output = attention(layer_index, query, key, value)
-        return output.reshape(tokens, self.num_heads * self.head_dim)
+        reshaped = output.reshape(tokens, self.num_heads * self.head_dim)
+        projected = self.c_proj(reshaped)
+        assert isinstance(projected, torch.Tensor)
+        return projected
 
 
 class _QwenMLP(nn.Module):
@@ -477,8 +480,10 @@ class _QwenModel(nn.Module):
         token_ids: torch.Tensor,
         positions: torch.Tensor,
         attention: AttentionCallback,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden = self.wte(token_ids)
+        hidden = self.wte(token_ids) if inputs_embeds is None else inputs_embeds
         residual: torch.Tensor | None = None
         for layer_index, layer in enumerate(self.h):
             hidden, residual = layer(hidden, positions, attention, layer_index, residual)
@@ -518,8 +523,17 @@ class QwenForCausalLM(nn.Module):
         token_ids: torch.Tensor,
         positions: torch.Tensor,
         attention: AttentionCallback,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.transformer.forward_hidden(token_ids, positions, attention)
+        if inputs_embeds is not None:
+            if inputs_embeds.shape != (token_ids.numel(), self.config.hidden_size):
+                raise ValueError("inputs_embeds must match token count and hidden size")
+            if inputs_embeds.device != token_ids.device:
+                raise ValueError("inputs_embeds and tokens must share a device")
+        return self.transformer.forward_hidden(
+            token_ids, positions, attention, inputs_embeds=inputs_embeds
+        )
 
     def logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(hidden)
