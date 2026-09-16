@@ -61,6 +61,20 @@ class Executor(abc.ABC):
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def pending_completion(self) -> bool:
+        """Whether completion polling can still advance an unsettled ticket.
+
+        SUBMITTED and DRAINING tickets have fences that may turn quiescent on a
+        later poll, so an engine loop must keep iterating while one exists.
+        QUARANTINED is excluded on purpose: host-failure recovery is external
+        and a quarantined ticket must not count as progress.
+        """
+        return any(
+            ticket.state in (TicketState.SUBMITTED, TicketState.DRAINING)
+            for ticket in self._tickets.values()
+        )
+
     def get_ticket(self, ticket_id: TicketId) -> ExecutionTicket | None:
         return self._tickets.get(ticket_id)
 

@@ -12,8 +12,10 @@ from types import MappingProxyType
 from ayaka.exceptions import InvalidHandleError, InvalidStateTransitionError
 from ayaka.kvcache.grouped_manager import KVCacheGroupManager
 from ayaka.kvcache.materialize import KVStorageLease, KVStoragePin
+from ayaka.kvcache.retention.range import retained_page_range
 from ayaka.memory.ledger import MemoryLedger
 from ayaka.memory.manager import RuntimeMemoryManager
+from ayaka.memory.state import ReservationFailure
 from ayaka.memory.views import ExecutionMemoryView, GroupedExecutionMemoryView
 from ayaka.sched.plan import BatchStepPlan
 
@@ -21,7 +23,18 @@ MemoryView = ExecutionMemoryView | GroupedExecutionMemoryView
 
 
 class KVCapacityError(RuntimeError):
-    """A sequence or group could not satisfy an atomic append reservation."""
+    """A structured reservation failure, preserved across boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str | None = None,
+        reason: ReservationFailure | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.reason = reason
 
 
 class LogicalKVManager:
@@ -91,6 +104,22 @@ class LogicalKVManager:
                 or state.busy
             ):
                 raise InvalidStateTransitionError("request snapshot disagrees with logical KV")
+        if isinstance(self.backend, KVCacheGroupManager):
+            for scheduled in step.slices:
+                for group in self.backend.cache_groups:
+                    retained = retained_page_range(
+                        group.retention,
+                        layer_id=group.layer_ids[0],
+                        sequence_length=scheduled.query_end,
+                        page_size=group.storage_spec.page_size,
+                    )
+                    if len(retained) > group.storage_spec.capacity_pages - 1:
+                        raise KVCapacityError(
+                            f"{scheduled.request_id}: retained KV exceeds "
+                            f"group {group.name} capacity",
+                            request_id=scheduled.request_id,
+                            reason=ReservationFailure.REQUEST_TOO_LARGE,
+                        )
         if step.kv_requirements:
             if {r.group_id for r in step.kv_requirements} != set(range(len(self.group_names))):
                 raise ValueError("KV requirements must cover every group by stable ordinal")
@@ -111,7 +140,11 @@ class LogicalKVManager:
                     transaction, value.sequence, scheduled.query_count
                 )
                 if not result.ok:
-                    raise KVCapacityError(f"{value.request_id}: {result.reason}")
+                    raise KVCapacityError(
+                        f"{value.request_id}: {result.reason}",
+                        request_id=value.request_id,
+                        reason=result.reason,
+                    )
             lease = self.backend.prepare_step(transaction)
             return self.backend.build_execution_view(lease)
         except BaseException:

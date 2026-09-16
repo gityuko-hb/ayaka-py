@@ -2,12 +2,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from ayaka.types import AttentionType, KVCacheDtype, KVLayoutKind, MaskKind
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass(frozen=True)

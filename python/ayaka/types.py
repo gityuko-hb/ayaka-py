@@ -361,7 +361,7 @@ class AttentionType(StrEnum):
 
     A group declares one; a backend declares the set it serves
     (``BackendInfo.supported_types``). Pool layout follows the type, so this is also what
-    ``KVCacheGeometry`` keys on -- one taxonomy, not two.
+    ``CacheGroupGeometry`` keys on -- one taxonomy, not two.
     """
 
     FULL = "full"  # uniform causal MHA/GQA over a paged K/V pool
@@ -447,6 +447,24 @@ class KVCacheDtype(StrEnum):
     def is_quantized(self) -> bool:
         return self is not KVCacheDtype.AUTO
 
+    @classmethod
+    def from_dtype(cls, dtype: DType) -> KVCacheDtype:
+        """Map a storage :class:`DType` onto the KV-cache storage dtype.
+
+        FP8 storage requires a calibrated scale, so it maps to the explicit FP8
+        members; fp16/bf16 keep ``AUTO`` (same as the model dtype, no scale).
+
+        Raises:
+            ValueError: when the dtype has no KV-cache representation.
+        """
+        if dtype in (DType.FP16, DType.BF16):
+            return cls.AUTO
+        if dtype is DType.FP8_E4M3:
+            return cls.FP8_E4M3
+        if dtype is DType.FP8_E5M2:
+            return cls.FP8_E5M2
+        raise ValueError(f"{dtype.label} has no KV cache dtype")
+
     @property
     def torch_dtype_name(self) -> str | None:
         """Canonical name for ``torch_utils.torch_dtype``; None for AUTO."""
@@ -458,7 +476,7 @@ class KVCacheDtype(StrEnum):
     def element_bytes(self) -> int | None:
         """Bytes per element, or None for AUTO (the model dtype decides).
 
-        This is the number ``KVBudgetSpec.bytes_per_token_per_rank`` multiplies, which is
+        This is the number ``CacheGroupGeometry.token_bytes`` multiplies, which is
         why the quantization choice must reach capacity planning and not just the kernel.
         """
         return 1 if self.is_quantized else None

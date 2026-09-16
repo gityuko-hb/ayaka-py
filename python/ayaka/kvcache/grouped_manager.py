@@ -326,6 +326,14 @@ class KVCacheGroupManager:
             )
             return handle
 
+    def physical_page(self, group_name: str, page: KVPageHandle) -> int:
+        """Resolve a generation-checked page inside its group namespace.
+
+        The caller must hold a prepared or in-flight lease while using the result.
+        """
+        with self._lock:
+            return self._runtime_by_name[group_name].allocator.physical_id(page).value
+
     def get_sequence(self, sequence: SequenceHandle) -> GroupedSequenceSnapshot:
         """Return an immutable snapshot of a grouped sequence."""
         with self._lock:

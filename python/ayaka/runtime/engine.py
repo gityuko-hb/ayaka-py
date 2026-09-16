@@ -114,7 +114,9 @@ class Engine:
                 did = True
 
         self._allocator.advance_epoch(self._settled)
-        return did
+        # A pending completion fence is progress-capable work: the loop must
+        # stay alive until the executor settles or quarantines it.
+        return did or self._coordinator.executor.pending_completion
 
     def run_until_idle(self, *, max_steps: int = 1024) -> int:
         """Run until no active request remains or a step makes no progress."""

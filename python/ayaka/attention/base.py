@@ -79,12 +79,12 @@ class BaseAttentionBackend(ABC):
     def kv_bytes_per_token(self, model_dtype: Any) -> int:
         """Bytes of KV pool one token of this group consumes on THIS rank.
 
-        The number ``KVBudgetSpec.bytes_per_token_per_rank`` is built from, and the reason
-        backend selection has to run BEFORE capacity planning: the physical shape is a
-        backend property (does it store K and V separately, or one latent row?), and the
-        element size is a quantization property. A planner that guesses either sizes the
-        pool wrong, and sizing a KV pool wrong is not a rounding error -- it is either an
-        OOM at the first long request or permanently stranded HBM.
+        The physical figure the cache planner's payload bytes must agree with, and the
+        reason backend selection has to run BEFORE capacity planning: the physical shape
+        is a backend property (does it store K and V separately, or one latent row?), and
+        the element size is a quantization property. A planner that guesses either sizes
+        the pool wrong, and sizing a KV pool wrong is not a rounding error -- it is either
+        an OOM at the first long request or permanently stranded HBM.
         """
         from ayaka.utils.torch_utils import dtype_bytes
 
