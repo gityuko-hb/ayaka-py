@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.completion import CompletionResult
-from ayaka.executor.ticket import ExecutionTicket, TerminalStatus
+from ayaka.executor.ticket import ExecutionTicket, TerminalStatus, TicketId
 from ayaka.request.lifecycle import LifecycleManager
 from ayaka.request.states import RequestState
 from ayaka.sched.budget import BatchBudget
@@ -96,10 +96,10 @@ class ContinuousScheduler(SchedulerCore):
     - delegated recompute/swap preemption;
     - rollback-safe queue mutation only after prepare/adopt succeeds.
 
-    One execution ticket is intentionally kept in flight at a time. CPU/GPU
-    overlap, PP microbatch pipelines, and speculative multi-step execution are
-    execution-pipeline features and should be added after this synchronous core
-    is correct under physical paged KV.
+    Up to ``plan.max_inflight`` execution tickets may be adopted at once
+    (pipeline microbatches / overlap). A request owns at most one unsettled
+    slice: candidates exclude every request with a slice still in flight, and
+    preemption victims are only selected outside that set.
     """
 
     def __init__(
@@ -144,7 +144,7 @@ class ContinuousScheduler(SchedulerCore):
         self._prefill_chunk_size = prefill_chunk_size
         self._max_bypass = max_bypass
 
-        self._inflight_slices: tuple[_InflightSlice, ...] = ()
+        self._inflight_slices: dict[TicketId, tuple[_InflightSlice, ...]] = {}
         self._last_step: BatchStepPlan | None = None
         self._decode_cursor = 0
 
@@ -158,7 +158,7 @@ class ContinuousScheduler(SchedulerCore):
     # ------------------------------------------------------------------
 
     def schedule(self) -> ExecutionTicket | None:
-        if self._inflight is not None:
+        if len(self._inflight) >= self._plan.max_inflight:
             return None
         self._round += 1
         self._drain_window()
@@ -173,8 +173,7 @@ class ContinuousScheduler(SchedulerCore):
             self._sampling.record_published(output.published)
         settled_ids = self._clear_inflight(output.ticket_id)
         if settled_ids is not None:
-            inflight = self._inflight_slices
-            self._inflight_slices = ()
+            inflight = self._inflight_slices.pop(output.ticket_id, ())
 
             if output.status is TerminalStatus.SUCCEEDED:
                 for item in inflight:
@@ -277,6 +276,10 @@ class ContinuousScheduler(SchedulerCore):
             lifecycle = running[ring[(start + offset) % count]]
             if lifecycle.is_terminal or lifecycle.token.is_cancelled:
                 continue
+            if lifecycle.request_id in self._inflight_ids_all:
+                # One unsettled slice per request: the adopted ticket keeps
+                # its ownership until update_from_output settles it.
+                continue
             if not budget.try_consume(1, phase=Phase.DECODE):
                 break
             snapshot = lifecycle.snapshot()
@@ -318,6 +321,7 @@ class ContinuousScheduler(SchedulerCore):
                 )
             )
             and not entry.lifecycle.token.is_cancelled
+            and entry.lifecycle.request_id not in self._inflight_ids_all
             and entry.ready_ns <= now
         ]
         ranked = order(
@@ -422,7 +426,7 @@ class ContinuousScheduler(SchedulerCore):
                     continue
 
                 victim_id = self._try_preempt_one(
-                    {scheduled.request_id for scheduled in current.slices}
+                    {scheduled.request_id for scheduled in current.slices} | self._inflight_ids_all
                 )
                 if victim_id is not None:
                     current = self._without_request(current, victim_id) or current
@@ -438,7 +442,7 @@ class ContinuousScheduler(SchedulerCore):
         ticket = self._runtime.adopt(prepared)
         self._set_inflight(ticket, (scheduled.request_id for scheduled in current.slices))
         self._last_step = current
-        self._inflight_slices = tuple(
+        self._inflight_slices[ticket.id] = tuple(
             _InflightSlice(
                 scheduled.request_id,
                 scheduled.phase,
@@ -643,7 +647,7 @@ class ContinuousScheduler(SchedulerCore):
             waiting=self.num_waiting,
             prefilling=len(self._prefilling),
             running=len(self._running),
-            inflight=int(self._inflight is not None),
+            inflight=len(self._inflight),
             last_prefill_tokens=0 if last is None else last.num_prefill_tokens,
             last_decode_tokens=0 if last is None else last.num_decode_tokens,
             last_mixed=False if last is None else last.is_mixed,

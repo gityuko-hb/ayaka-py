@@ -279,8 +279,6 @@ class KVStepRuntime:
             if step.graph == EMPTY_GRAPH_PLAN:
                 step = replace(step, graph=self.graph_planner.plan(step))
             self.graph_planner.validate(step)
-        if self._pending:
-            raise ValueError("adopt or discard the previous prepared step first")
         if (
             self.coordinator.executor.closed
             or not self.coordinator.executor.has_submission_capacity()

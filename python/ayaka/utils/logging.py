@@ -3,19 +3,53 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
-from typing import Any
+from functools import partial
+from typing import Any, cast
 
 from ayaka.distributed.env import describe, is_distributed, is_master, rank
 
 __all__ = [
+    "AyakaLogger",
+    "ColorFormatter",
     "JSONFormatter",
     "TextFormatter",
+    "init_logger",
     "log_master",
     "log_once",
     "quiet_http_loggers",
     "reset_once_state",
+    "should_use_color",
 ]
+
+# ANSI color escape sequences
+_COLORS = {
+    "DEBUG": "\033[36m",  # Cyan
+    "INFO": "\033[32m",  # Green
+    "WARNING": "\033[33m",  # Yellow
+    "WARN": "\033[33m",  # Yellow
+    "ERROR": "\033[31m",  # Red
+    "CRITICAL": "\033[35m",  # Magenta
+}
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+
+
+def should_use_color(stream: Any = None) -> bool:
+    """Determine whether color output should be enabled.
+
+    Honors NO_COLOR, FORCE_COLOR, TERM=dumb, and stream TTY status.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR") not in (None, "", "0"):
+        return True
+    if os.environ.get("TERM") == "dumb":
+        return False
+    target_stream = stream if stream is not None else sys.stdout
+    return bool(getattr(target_stream, "isatty", lambda: False)())
+
 
 # HTTP client loggers emit one INFO line per request — a hub download is
 # dozens of them, interleaved with progress bars and ayaka's own log lines.
@@ -161,3 +195,176 @@ class TextFormatter(logging.Formatter):
             fmt=f"%(asctime)s {prefix}%(levelname)-7s %(name)s | %(message)s",
             datefmt="%H:%M:%S",
         )
+
+
+class ColorFormatter(logging.Formatter):
+    """Console formatter with ANSI colors, timestamps, and rank info."""
+
+    COLORS = _COLORS
+    RESET = _RESET
+    BOLD = _BOLD
+
+    def __init__(
+        self,
+        suffix: str = "",
+        *,
+        strip_file: bool = True,
+        use_pid: bool | None = None,
+        use_tp_rank: bool | None = None,
+        use_color: bool | None = None,
+    ) -> None:
+        super().__init__()
+        if strip_file and suffix:
+            suffix = os.path.basename(suffix)
+        self.suffix = f"|{suffix}" if suffix else ""
+
+        if use_pid is None:
+            use_pid = os.getenv("LOG_PID", "0").lower() in ("1", "true", "yes")
+        if use_pid:
+            self.suffix = f"|pid={os.getpid()}{self.suffix}"
+
+        self.use_tp_rank = use_tp_rank
+        self.use_color = should_use_color() if use_color is None else use_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        # SGLang timestamp format: [YYYY-MM-DD|HH:MM:SS]
+        timestamp = self.formatTime(record, "%Y-%m-%d|%H:%M:%S")
+
+        rank_str = ""
+        if self.use_tp_rank is not False and is_distributed():
+            rank_str = f"|core|{describe()}"
+        elif self.use_tp_rank is True:
+            rank_str = f"|core|rank={rank()}"
+
+        full_tag = f"[{timestamp}{self.suffix}{rank_str}]"
+        levelname = record.levelname
+        level_padded = f"{levelname:<8}"
+        message = record.getMessage()
+
+        if self.use_color:
+            level_color = self.COLORS.get(levelname, "")
+            colored_level = f"{level_color}{level_padded}{self.RESET}"
+            header = f"{self.BOLD}{full_tag}{self.RESET} {colored_level}"
+        else:
+            header = f"{full_tag} {level_padded}"
+
+        formatted = f"{header} {message}"
+
+        if record.exc_info:
+            if not record.exc_text:
+                record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            if not formatted.endswith("\n"):
+                formatted += "\n"
+            formatted += record.exc_text
+        if record.stack_info:
+            if not formatted.endswith("\n"):
+                formatted += "\n"
+            formatted += self.formatStack(record.stack_info)
+
+        return formatted
+
+
+class AyakaLogger(logging.Logger):
+    """Custom logger type providing convenience helpers for distributed rank 0 logging."""
+
+    def info_rank0(self, msg: object, *args: object, **kwargs: Any) -> None:
+        """Log at INFO level only on rank 0."""
+        ...
+
+    def warning_rank0(self, msg: object, *args: object, **kwargs: Any) -> None:
+        """Log at WARNING level only on rank 0."""
+        ...
+
+    def debug_rank0(self, msg: object, *args: object, **kwargs: Any) -> None:
+        """Log at DEBUG level only on rank 0."""
+        ...
+
+    def error_rank0(self, msg: object, *args: object, **kwargs: Any) -> None:
+        """Log at ERROR level only on rank 0."""
+        ...
+
+    def critical_rank0(self, msg: object, *args: object, **kwargs: Any) -> None:
+        """Log at CRITICAL level only on rank 0."""
+        ...
+
+
+_LEVEL_MAP: dict[str, int] = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def _resolve_log_level(level: int | str | None) -> int:
+    if isinstance(level, int):
+        return level
+    if isinstance(level, str):
+        level_upper = level.strip().upper()
+        if level_upper in _LEVEL_MAP:
+            return _LEVEL_MAP[level_upper]
+    env_level = os.getenv("LOG_LEVEL", "").strip().upper()
+    return _LEVEL_MAP.get(env_level, logging.INFO)
+
+
+def init_logger(
+    name: str = "ayaka",
+    suffix: str = "",
+    *,
+    strip_file: bool = True,
+    level: int | str | None = None,
+    use_pid: bool | None = None,
+    use_tp_rank: bool | None = None,
+    use_color: bool | None = None,
+    stream: Any = None,
+) -> AyakaLogger:
+    """Initialize a logger with SGLang-style colors and pretty formatting.
+
+    Args:
+        name: Logger name (e.g. ``"ayaka"`` or ``__name__``).
+        suffix: Optional suffix to append to the log prefix (e.g. filename).
+        strip_file: If True and suffix is a file path, strip down to basename.
+        level: Explicit log level (int or string). Defaults to ``$LOG_LEVEL`` or INFO.
+        use_pid: Whether to include process ID in prefix. Defaults to ``$LOG_PID``.
+        use_tp_rank: Whether to include distributed rank in prefix.
+        use_color: Explicit boolean to force enable/disable ANSI colors.
+        stream: Target stream for logging. Defaults to ``sys.stdout``.
+
+    Returns:
+        An :class:`AyakaLogger` instance configured with SGLang formatting and rank-0 helpers.
+    """
+    resolved_level = _resolve_log_level(level)
+    target_stream = stream if stream is not None else sys.stdout
+
+    logger = logging.getLogger(name)
+    logger.setLevel(resolved_level)
+    logger.handlers.clear()
+
+    formatter = ColorFormatter(
+        suffix=suffix,
+        strip_file=strip_file,
+        use_pid=use_pid,
+        use_tp_rank=use_tp_rank,
+        use_color=use_color if use_color is not None else should_use_color(target_stream),
+    )
+
+    handler = logging.StreamHandler(target_stream)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    def _call_rank0(level_name: str, msg: object, *args: object, **kwargs: Any) -> None:
+        if is_master():
+            getattr(logger, level_name)(msg, *args, **kwargs)
+
+    wrapper = cast(Any, logger)
+    wrapper.info_rank0 = partial(_call_rank0, "info")
+    wrapper.warning_rank0 = partial(_call_rank0, "warning")
+    wrapper.debug_rank0 = partial(_call_rank0, "debug")
+    wrapper.error_rank0 = partial(_call_rank0, "error")
+    wrapper.critical_rank0 = partial(_call_rank0, "critical")
+
+    return cast(AyakaLogger, logger)

@@ -708,6 +708,18 @@ def build_execution_plan(
         resolved_parallel = ParallelPlan(
             tp_size=plan.parallel.tp_size if plan.parallel is not None else 1
         )
+    # A pipeline stage owns exactly its declared layer span; single-rank plans
+    # and full-span stages keep the full model range. The config-level
+    # ResolvedParallelPlan owns the ranges; the runtime plan carries the rank.
+    layer_range = (0, architecture.num_layers)
+    if resolved_parallel.pp_size > 1:
+        if plan.parallel is None:
+            raise ConfigError(
+                "parallel",
+                "PARALLEL_PLAN_REQUIRED",
+                "pipeline stages require a resolved parallel plan with layer ranges",
+            )
+        layer_range = plan.parallel.layer_range(resolved_parallel.pp_rank)
     return ExecutionPlan(
         plan_id=plan_id,
         model_id=model_id,
@@ -716,7 +728,7 @@ def build_execution_plan(
         compute=ComputePlan(
             dtype=compute_dtype,
             kv_dtype=cache_config.kv_dtype,
-            layer_range=(0, architecture.num_layers),
+            layer_range=layer_range,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=enable_chunked_prefill,
         ),

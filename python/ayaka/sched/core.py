@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from ayaka.configs.base import ConfigError
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
-from ayaka.executor.ticket import ExecutionTicket
+from ayaka.executor.ticket import ExecutionTicket, TicketId
 from ayaka.handles import SequenceHandle
 from ayaka.plan import SamplingPlan
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
@@ -94,8 +94,12 @@ class SchedulerCore(BaseScheduler):
         # One observation per request, keyed for O(1) dedup on report.
         self._pending: dict[str, RequestReport] = {}
 
-        self._inflight: ExecutionTicket | None = None
-        self._inflight_request_ids: frozenset[str] = frozenset()
+        # Multiple adopted-but-unsettled tickets may exist at once (pipeline
+        # microbatches / overlap). Entries are keyed by ticket id; the union
+        # of their request ids is the scheduling exclusion oracle.
+        self._inflight: dict[TicketId, ExecutionTicket] = {}
+        self._inflight_request_ids: dict[TicketId, frozenset[str]] = {}
+        self._inflight_ids_all: set[str] = set()
         self._abort_pending: set[str] = set()
         self._resource_blocked = False
 
@@ -252,12 +256,13 @@ class SchedulerCore(BaseScheduler):
         self._abort_pending.add(request_id)
 
         if self._owns_inflight(request_id):
-            if (
-                self._inflight is not None
-                and self._inflight_request_ids
-                and self._inflight_request_ids.issubset(self._abort_pending)
-            ):
-                self._runtime.cancel(self._inflight, "all requests in ticket aborted")
+            # Cancel every inflight ticket whose request set is fully aborted;
+            # mixed tickets keep running for their still-live requests.
+            for ticket_id, ids in list(self._inflight_request_ids.items()):
+                if ids and ids.issubset(self._abort_pending):
+                    self._runtime.cancel(
+                        self._inflight[ticket_id], "all requests in ticket aborted"
+                    )
             return True
 
         self._finalize_abort(request_id)
@@ -353,19 +358,26 @@ class SchedulerCore(BaseScheduler):
         ids = frozenset(request_ids)
         if not ids:
             raise ValueError("an adopted ticket must own at least one request")
-        self._inflight = ticket
-        self._inflight_request_ids = ids
+        if ticket.id in self._inflight:
+            raise ValueError("ticket is already registered as inflight")
+        self._inflight[ticket.id] = ticket
+        self._inflight_request_ids[ticket.id] = ids
+        self._inflight_ids_all.update(ids)
 
-    def _clear_inflight(self, ticket_id: object) -> frozenset[str] | None:
-        if self._inflight is None or self._inflight.id != ticket_id:
+    def _clear_inflight(self, ticket_id: TicketId) -> frozenset[str] | None:
+        ids = self._inflight_request_ids.pop(ticket_id, None)
+        if ids is None:
             return None
-        ids = self._inflight_request_ids
-        self._inflight = None
-        self._inflight_request_ids = frozenset()
+        del self._inflight[ticket_id]
+        self._inflight_ids_all.difference_update(ids)
         return ids
 
     def _owns_inflight(self, request_id: str) -> bool:
-        return request_id in self._inflight_request_ids
+        return request_id in self._inflight_ids_all
+
+    @property
+    def inflight_count(self) -> int:
+        return len(self._inflight)
 
     def _finalize_settled_aborts(self, request_ids: Iterable[str]) -> None:
         for request_id in tuple(request_ids):
@@ -575,7 +587,14 @@ class SchedulerCore(BaseScheduler):
 
     @property
     def inflight_ticket(self) -> ExecutionTicket | None:
-        return self._inflight
+        """Single-flight compat view: the sole inflight ticket, or None."""
+        if len(self._inflight) == 1:
+            return next(iter(self._inflight.values()))
+        return None
+
+    @property
+    def inflight_tickets(self) -> tuple[ExecutionTicket, ...]:
+        return tuple(self._inflight.values())
 
     @property
     def resource_blocked(self) -> bool:

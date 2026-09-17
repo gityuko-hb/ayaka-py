@@ -482,14 +482,51 @@ class _QwenModel(nn.Module):
         attention: AttentionCallback,
         *,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        hidden = self.wte(token_ids) if inputs_embeds is None else inputs_embeds
-        residual: torch.Tensor | None = None
-        for layer_index, layer in enumerate(self.h):
-            hidden, residual = layer(hidden, positions, attention, layer_index, residual)
-        assert residual is not None
-        hidden, _ = self.ln_f(hidden, residual)
-        return hidden
+        layer_start: int = 0,
+        layer_end: int | None = None,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run a half-open layer range of the decoder.
+
+        ``layer_start``/``layer_end`` slice the transformer for one PP stage:
+        a non-zero ``layer_start`` requires ``state`` (the previous stage's
+        ``(hidden, residual)`` boundary) instead of token ids, and a
+        ``layer_end`` below the layer count returns the boundary tensors so
+        the next stage can resume without re-normalizing. Layer indices stay
+        GLOBAL so attention callbacks index KV slots exactly as a full
+        forward does; the final ``ln_f`` only runs on the last stage.
+        """
+        num_layers = len(self.h)
+        end = num_layers if layer_end is None else layer_end
+        if not 0 <= layer_start < num_layers:
+            raise ValueError(f"layer_start {layer_start} outside [0, {num_layers})")
+        if layer_end is not None:
+            if not layer_start < layer_end <= num_layers:
+                raise ValueError(
+                    f"layer_end {layer_end} must satisfy {layer_start} < layer_end <= {num_layers}"
+                )
+        residual_sum: torch.Tensor | None
+        if layer_start == 0:
+            if state is not None:
+                raise ValueError("layer_start 0 must not carry a boundary state")
+            hidden = self.wte(token_ids) if inputs_embeds is None else inputs_embeds
+            residual_sum = None
+        else:
+            if state is None:
+                raise ValueError("a non-first stage requires the previous stage's state")
+            if inputs_embeds is not None:
+                raise ValueError("inputs_embeds and a boundary state are mutually exclusive")
+            hidden, residual_sum = state
+        for layer_index in range(layer_start, end):
+            hidden, residual_sum = self.h[layer_index](
+                hidden, positions, attention, layer_index, residual_sum
+            )
+        if end < num_layers:
+            assert residual_sum is not None
+            return hidden, residual_sum
+        assert residual_sum is not None
+        normalized, _ = self.ln_f(hidden, residual_sum)
+        return normalized
 
 
 class QwenForCausalLM(nn.Module):
@@ -525,14 +562,23 @@ class QwenForCausalLM(nn.Module):
         attention: AttentionCallback,
         *,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        layer_start: int = 0,
+        layer_end: int | None = None,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if inputs_embeds is not None:
             if inputs_embeds.shape != (token_ids.numel(), self.config.hidden_size):
                 raise ValueError("inputs_embeds must match token count and hidden size")
             if inputs_embeds.device != token_ids.device:
                 raise ValueError("inputs_embeds and tokens must share a device")
         return self.transformer.forward_hidden(
-            token_ids, positions, attention, inputs_embeds=inputs_embeds
+            token_ids,
+            positions,
+            attention,
+            inputs_embeds=inputs_embeds,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            state=state,
         )
 
     def logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -562,4 +608,5 @@ class QwenForCausalLM(nn.Module):
             return out.squeeze(0).transpose(0, 1)
 
         hidden = self.forward_hidden(token_ids, positions, attention)
+        assert isinstance(hidden, torch.Tensor)
         return self.logits_from_hidden(hidden)

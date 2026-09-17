@@ -107,11 +107,12 @@ class Engine:
         if self._finish_exhausted():
             did = True
 
-        if self._coordinator.executor.has_submission_capacity():
+        while self._coordinator.executor.has_submission_capacity():
             ticket = self._scheduler.schedule()
-            if ticket is not None:
-                self._coordinator.launch(ticket)
-                did = True
+            if ticket is None:
+                break
+            self._coordinator.launch(ticket)
+            did = True
 
         self._allocator.advance_epoch(self._settled)
         # A pending completion fence is progress-capable work: the loop must

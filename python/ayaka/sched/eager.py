@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.completion import CompletionResult
-from ayaka.executor.ticket import ExecutionTicket, TerminalStatus
+from ayaka.executor.ticket import ExecutionTicket, TerminalStatus, TicketId
 from ayaka.request.lifecycle import LifecycleManager
 from ayaka.request.states import RequestState
 from ayaka.sched.core import SchedulerCore
@@ -88,10 +88,10 @@ class EagerScheduler(SchedulerCore):
             sampling=sampling,
             request_preparer=request_preparer,
         )
-        self._inflight_phases: dict[str, Phase] = {}
+        self._inflight_phases: dict[TicketId, dict[str, Phase]] = {}
 
     def schedule(self) -> ExecutionTicket | None:
-        if self._inflight is not None:
+        if len(self._inflight) >= self._plan.max_inflight:
             return None
         for plan in self._candidate_plans():
             ticket = self._prepare_and_adopt(plan)
@@ -137,7 +137,7 @@ class EagerScheduler(SchedulerCore):
 
         ticket = self._runtime.adopt(prepared)
         self._set_inflight(ticket, (s.request_id for s in current.slices))
-        self._inflight_phases = {s.request_id: s.phase for s in current.slices}
+        self._inflight_phases[ticket.id] = {s.request_id: s.phase for s in current.slices}
         self._resource_blocked = False
 
         for scheduled in current.slices:
@@ -151,8 +151,7 @@ class EagerScheduler(SchedulerCore):
             self._sampling.record_published(output.published)
         settled_ids = self._clear_inflight(output.ticket_id)
         if settled_ids is not None:
-            phases = self._inflight_phases
-            self._inflight_phases = {}
+            phases = self._inflight_phases.pop(output.ticket_id, {})
             if output.status is TerminalStatus.SUCCEEDED:
                 for request_id in settled_ids:
                     lifecycle = self._requests.find(request_id)
@@ -198,6 +197,7 @@ class EagerScheduler(SchedulerCore):
                 )
             )
             and not entry.lifecycle.token.is_cancelled
+            and entry.lifecycle.request_id not in self._inflight_ids_all
         ]
         ranked = rank_waiting(eligible, scheduling_policy=self._plan.scheduling_policy)
         slices: list[ScheduledSlice] = []
@@ -240,6 +240,8 @@ class EagerScheduler(SchedulerCore):
         total = 0
         for lifecycle in tuple(self._running.values()):
             if lifecycle.is_terminal or lifecycle.token.is_cancelled:
+                continue
+            if lifecycle.request_id in self._inflight_ids_all:
                 continue
             if len(slices) >= self._seq_cap() or not self._fits(total, 1):
                 break

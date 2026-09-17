@@ -277,6 +277,7 @@ class ModelSamplingRunner:
             attention = self._dense_attention()
             with torch.no_grad():
                 hidden = self._model.forward_hidden(tokens, positions, attention)
+            assert isinstance(hidden, torch.Tensor)
             if scheduled.sample_last_query:
                 sampling_rows.append(hidden[-1])
             if entry is not None:

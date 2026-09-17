@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any
+from typing import Any, Protocol
 
 from ayaka.distributed.completion import CompletionFence
 from ayaka.distributed.metadata import DistributedKVMetadata
@@ -96,9 +96,7 @@ class DistributedKVCoordinator:
                 raise InvariantViolationError("replacement process group changed local rank")
             if not 0 <= self.source_rank < replacement.world_size:
                 self.worker.fail("replacement process group changed world geometry")
-                raise InvariantViolationError(
-                    "replacement process group changed world geometry"
-                )
+                raise InvariantViolationError("replacement process group changed world geometry")
             self.process_group = replacement
 
 
@@ -182,10 +180,31 @@ class DataParallelReplica:
     manager: RuntimeMemoryManager
 
 
-class DataParallelRouter:
-    """Routes requests to replica-local memory managers (#28.2, #61.2)."""
+class PrefixScore(Protocol):
+    """Host-side prefix-affinity estimate for one request on one replica.
 
-    def __init__(self, replicas: Sequence[DataParallelReplica]) -> None:
+    Higher is better. The router only ranks; scores never claim ownership or
+    reserve pages. A failed callback is a bug in the provider, not a reason
+    to fall back silently.
+    """
+
+    def __call__(self, replica: DataParallelReplica, request_id: str) -> int: ...
+
+
+class DataParallelRouter:
+    """Routes requests to replica-local memory managers (#28.2, #61.2).
+
+    Routing weighs replica load first (free pages, descending); the optional
+    :class:`PrefixScore` hook breaks load ties — the seam the KV-aware router
+    (global prefix index) plugs into without changing callers.
+    """
+
+    def __init__(
+        self,
+        replicas: Sequence[DataParallelReplica],
+        *,
+        prefix_score: PrefixScore | None = None,
+    ) -> None:
         if not replicas:
             raise ValueError("a data-parallel router needs at least one replica")
         ranks = [replica.rank for replica in replicas]
@@ -193,6 +212,7 @@ class DataParallelRouter:
             raise ValueError("replica ranks must be unique")
         self._replicas = tuple(replicas)
         self._by_rank = {replica.rank: replica for replica in self._replicas}
+        self._prefix_score = prefix_score
         self._assignments: dict[str, int] = {}
         self._lock = RLock()
 
@@ -217,12 +237,19 @@ class DataParallelRouter:
             existing = self._assignments.get(request_id)
             if existing is not None:
                 return self._by_rank[existing]
-            chosen = max(
-                self._replicas,
-                key=lambda replica: (replica.manager.snapshot().free_pages, -replica.rank),
-            )
+            chosen = self._route(request_id)
             self._assignments[request_id] = chosen.rank
             return chosen
+
+    def _route(self, request_id: str) -> DataParallelReplica:
+        # Load first: a prefix hit on a full replica must not evict anyone.
+        # The prefix score only breaks load ties; rank keeps it deterministic.
+        def order(replica: DataParallelReplica) -> tuple[int, int, int]:
+            free = -replica.manager.snapshot().free_pages
+            score = 0 if self._prefix_score is None else -self._prefix_score(replica, request_id)
+            return (free, score, replica.rank)
+
+        return min(self._replicas, key=order)
 
     def release(self, request_id: str) -> None:
         with self._lock:

@@ -63,7 +63,9 @@ class SchedulerCapabilities(ConfigMixin):
 
     max_num_seqs is metadata capacity. token_padding_multiple describes packed
     batch padding, not per-sequence padding. Chunking needs an explicit runner
-    declaration. This descriptor cannot enable multi-step, speculative or SWAP.
+    declaration. pipeline_stages declares a runner that executes declared
+    layer-range stages and their boundary hand-offs (in-process PP only).
+    This descriptor cannot enable multi-step, speculative or SWAP.
     """
 
     max_num_seqs: int
@@ -72,13 +74,14 @@ class SchedulerCapabilities(ConfigMixin):
     graph_mode: GraphMode = GraphMode.EAGER
     recompute_preemption: bool = False
     prefix_cache: bool = False
+    pipeline_stages: bool = False
 
     def __post_init__(self) -> None:
         require_int(self.max_num_seqs, "capabilities.max_num_seqs", minimum=1)
         require_int(self.token_padding_multiple, "capabilities.token_padding_multiple", minimum=1)
         if type(self.chunked_prefill) is not bool:
             raise TypeError("capabilities.chunked_prefill must be bool")
-        for name in ("recompute_preemption", "prefix_cache"):
+        for name in ("recompute_preemption", "prefix_cache", "pipeline_stages"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"capabilities.{name} must be bool")
         if not isinstance(self.graph_mode, GraphMode):
@@ -196,7 +199,6 @@ class SchedulerConfig(ConfigMixin):
             )
         for name, supported in (
             ("max_decode_steps_per_schedule", 1),
-            ("max_inflight", 1),
             ("max_num_partial_prefills", 1),
             ("long_prefill_token_threshold", 0),
             ("priority_preemption", False),
@@ -446,16 +448,37 @@ class ResolvedSchedulerPlan(SchedulerConfig):
                 "UNCHUNKED_MODEL_TOO_LARGE",
                 "unchunked baseline requires model context to fit the issue budget",
             )
-        if (
-            not self.execution.parallel.is_single_process
-            or self.execution.parallel.sp_enabled
-            or compute.num_micro_batches != 1
-            or self.capabilities.graph_mode is not GraphMode.EAGER
-        ):
+        if self.execution.parallel.sp_enabled:
             raise ConfigError(
-                "execution",
-                "UNSUPPORTED_EXECUTION_MODE",
-                "baseline requires one rank, one micro-batch and eager execution",
+                "execution.parallel.sp_enabled",
+                "SP_UNSUPPORTED",
+                "sequence parallelism is not integrated",
+            )
+        staged = (
+            parallel.tp_size == 1
+            and parallel.dp_size == 1
+            and parallel.cp_size == 1
+            and parallel.ep_size == 1
+            and parallel.pp_size > 1
+            and self.capabilities.pipeline_stages
+        )
+        if not parallel.is_single_process and not staged:
+            raise ConfigError(
+                "execution.parallel",
+                "MULTI_RANK_UNAVAILABLE",
+                "only a single-rank plan or a declared in-process pipeline is wired",
+            )
+        if self.capabilities.graph_mode is not GraphMode.EAGER:
+            raise ConfigError(
+                "capabilities.graph_mode",
+                "GRAPH_MODE_EAGER_ONLY",
+                "eager execution is the only wired graph mode",
+            )
+        if compute.num_micro_batches > self.max_inflight:
+            raise ConfigError(
+                "scheduler.max_inflight",
+                "INFLIGHT_BELOW_MICROBATCHES",
+                "max_inflight must cover every concurrently submitted micro-batch",
             )
 
         if not capacities:
