@@ -14,8 +14,8 @@ requires-python = ">=3.13, <3.14"
 license = { file = "./LICENSE" }
 dependencies = [
     "aiohttp>=3.14.1",
-    "anthropic>=0.117.0",
-    "cachetools>=7.1.4",
+    "anthropic>=1.6.0",
+    "cachetools>=7.2.0",
     "cmake>=4.4.0",
     "datasets>=5.0.0",
     "fastapi[standard]>=0.139.2",
@@ -24,11 +24,11 @@ dependencies = [
     "msgspec>=0.21.1",
     "ninja>=1.13.0",
     "numpy>=2.5.1",
-    "openai>=2.46.0",
+    "openai>=3.15.0",
     "openai-harmony>=0.0.8",
     "packaging>=26.2",
     "pillow>=12.3.0",
-    "protobuf>=7.35.1",
+    "protobuf>=7.36.2",
     "psutil>=7.2.2",
     "pyzmq>=26.1",
     "pybase64>=1.4.3",
@@ -48,23 +48,20 @@ dependencies = [
     "tqdm>=4.69.0",
     "transformers>=5.14.1",
     "accelerate>=1.14.0",
-    "huggingface-hub>=1.28.0",
+    "huggingface-hub>=1.32.0",
     "grpcio>=1.70",
     "xgrammar>=0.2.6",
+    "prometheus-client>=0.21",
 ]
 
 [project.optional-dependencies]
 cuda = [
     "torch>=2.12",
-    "triton>=3.7,<3.8; sys_platform == 'linux'",
-    "triton-windows>=3.7,<3.8; sys_platform == 'win32'",
+    "triton>=3.8,<3.9; sys_platform == 'linux'",
+    "triton-windows>=3.8,<3.9; sys_platform == 'win32'",
+    "cuda-python>=13",
 ]
 cpu = ["torch>=2.12"]
-# Paged-attention backends. Kept out of `cuda` on purpose: flash-attn is an sdist and a
-# multi-hour source build, so opting into "the CUDA extra" must not silently demand it.
-#   flashinfer: a pure-Python wheel (`py3-none-any`), but its kernels JIT-compile at first use.
-#   flash-attn: FA2 (sm80-sm89) from this sdist; FA3 (sm90) ships in the repo's hopper/ dir
-#               and is not on PyPI. No binary wheels exist, including on Windows.
 flashinfer = ["flashinfer-python>=0.6,<0.7"]
 flash-attn = ["flash-attn>=2.7,<3"]
 
@@ -82,13 +79,13 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu126", extra = "cuda" },
+    { index = "pytorch-cu130", extra = "cuda" },
     { index = "pytorch-cpu", extra = "cpu" },
 ]
 
@@ -132,7 +129,7 @@ dev = [
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "pytest-timeout>=2.4.0",
-    "ruff>=0.16.1",
+    "ruff>=0.16.8",
     "xgrammar>=0.1.19",
 ]
 test = ["psutil>=7.2.2"]
