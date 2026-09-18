@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Literal
 
@@ -68,7 +69,30 @@ class TokenIdsInput:
             require_int(token, "token id")
 
 
-type EncodeInput = TextInput | ChatInput | TokenIdsInput
+@dataclass(frozen=True, slots=True)
+class TemplateInput:
+    """Owned JSON chat input for tool history and model-specific templates.
+
+    Serving validates roles/content before construction. The tokenizer worker
+    renders it under the same adapter lock and input budget as ordinary chat.
+    """
+
+    messages_json: str
+    tools_json: str = "[]"
+
+    def __post_init__(self) -> None:
+        if type(self.messages_json) is not str or type(self.tools_json) is not str:
+            raise TypeError("template inputs must be JSON strings")
+        messages, tools = json.loads(self.messages_json), json.loads(self.tools_json)
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a nonempty JSON array")
+        if any(not isinstance(m, dict) for m in messages):
+            raise ValueError("messages must contain objects")
+        if not isinstance(tools, list) or any(not isinstance(t, dict) for t in tools):
+            raise ValueError("tools must contain objects")
+
+
+type EncodeInput = TextInput | ChatInput | TemplateInput | TokenIdsInput
 
 
 @dataclass(frozen=True, slots=True)

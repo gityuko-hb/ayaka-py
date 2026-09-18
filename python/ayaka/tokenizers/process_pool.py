@@ -9,7 +9,13 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from uuid import uuid4
 
 from ayaka.configs.tokenizer import DetokUpdate, TokenizerConfig
-from ayaka.tokenizers.contracts import ChatInput, EncodeOptions, TextInput, TokenIdsInput
+from ayaka.tokenizers.contracts import (
+    ChatInput,
+    EncodeOptions,
+    TemplateInput,
+    TextInput,
+    TokenIdsInput,
+)
 from ayaka.tokenizers.service import TokenizerOverloaded, TokenizerService
 from ayaka.utils.validation import require_int
 
@@ -39,6 +45,7 @@ def _encode_media(value, options, markers, placeholder):
     if _service is None:
         raise RuntimeError("tokenizer worker is not initialized")
     from ayaka.tokenizers.multimodal import encode_media_chat
+
     return encode_media_chat(_service, value, options, markers, placeholder)
 
 
@@ -172,6 +179,10 @@ class ProcessTokenizerPool:
         elif isinstance(value, ChatInput):
             weight = sum(len(m.content.encode("utf-8")) + len(m.role) for m in value.messages)
             weight += len((value.chat_template or "").encode("utf-8"))
+        elif isinstance(value, TemplateInput):
+            weight = len(value.messages_json.encode("utf-8")) + len(
+                value.tools_json.encode("utf-8")
+            )
         else:
             raise TypeError("unsupported encode input")
         weight += len(options.cache_namespace.encode("utf-8"))
@@ -188,7 +199,12 @@ class ProcessTokenizerPool:
         weight += len((value.chat_template or "").encode("utf-8"))
         weight += len(options.cache_namespace.encode("utf-8")) + sum(8 * n for _, n in markers)
         return self._submit(
-            self._worker(), _encode_media, value, options, markers, placeholder,
+            self._worker(),
+            _encode_media,
+            value,
+            options,
+            markers,
+            placeholder,
             payload_bytes=weight,
         ).result()
 

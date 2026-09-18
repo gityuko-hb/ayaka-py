@@ -9,6 +9,7 @@ is discarded and its charge stays held until native work finishes.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -22,6 +23,7 @@ from ayaka.tokenizers.contracts import (
     ChatInput,
     EncodeInput,
     EncodeOptions,
+    TemplateInput,
     TextInput,
     TokenIdsInput,
 )
@@ -136,6 +138,8 @@ class TokenizerService:
             return sum(len(m.content.encode("utf-8")) + len(m.role) for m in value.messages) + len(
                 (value.chat_template or "").encode("utf-8")
             )
+        if isinstance(value, TemplateInput):
+            return len(value.messages_json.encode("utf-8")) + len(value.tools_json.encode("utf-8"))
         if isinstance(value, TokenIdsInput):
             return 8 * len(value.token_ids)
         raise TypeError("expected TextInput, ChatInput or TokenIdsInput")
@@ -157,9 +161,12 @@ class TokenizerService:
         weight = self._weight(value) + len(options.cache_namespace.encode("utf-8"))
         if self.tokenizer is None and not isinstance(value, TokenIdsInput):
             raise ValueError("tokenizer disabled: only token-ID input is available")
-        if isinstance(value, (TextInput, ChatInput)) and not self.loaded.capabilities.text_encode:
+        if (
+            isinstance(value, (TextInput, ChatInput, TemplateInput))
+            and not self.loaded.capabilities.text_encode
+        ):
             raise ValueError("loaded tokenizer does not support text encoding")
-        if isinstance(value, ChatInput) and not self.loaded.capabilities.chat:
+        if isinstance(value, (ChatInput, TemplateInput)) and not self.loaded.capabilities.chat:
             raise ValueError("loaded tokenizer does not support chat templates")
         if options.max_output_tokens >= self.max_model_len:
             raise ValueError("output reservation leaves no room for a prompt")
@@ -279,10 +286,14 @@ class TokenizerService:
         finally:
             self._local.in_worker = previous
 
-    def _render(self, value: TextInput | ChatInput) -> tuple[str, bool]:
+    def _render(self, value: TextInput | ChatInput | TemplateInput) -> tuple[str, bool]:
         if isinstance(value, TextInput):
             return value.text, value.add_special_tokens
         assert self.tokenizer is not None
+        if isinstance(value, TemplateInput):
+            return self.tokenizer.apply_chat_template(
+                json.loads(value.messages_json), tools=json.loads(value.tools_json)
+            ), False
         return self.tokenizer.apply_chat_template(
             [{"role": m.role, "content": m.content} for m in value.messages],
             add_generation_prompt=value.add_generation_prompt,
