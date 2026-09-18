@@ -53,3 +53,14 @@ class ParserError(ServingError):
 
 class UnknownParserError(ParserError):
     code = "unknown_parser"
+
+
+class OverloadedError(ServingError):
+    code = "rate_limit_exceeded"
+    status_code = 429
+    retryable = True
+
+
+class AuthenticationError(ServingError):
+    code = "authentication_error"
+    status_code = 401
