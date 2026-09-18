@@ -65,7 +65,7 @@ from ayaka.sampling.logprobs import (
 )
 from ayaka.sched.plan import PreparedStep
 
-__all__ = ["ModelSamplingRunner"]
+__all__ = ["ModelRunner"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +97,7 @@ class _GenerationReport:
     ids_raw_count: int = 0
 
 
-class ModelSamplingRunner:
+class ModelRunner:
     """Run one real model forward + LogitsProcessor + Sampler per prepared step."""
 
     __slots__ = ("_ban_applier", "_bans", "_coordinator", "_force_reference", "_logits", "_model")
@@ -146,7 +146,7 @@ class ModelSamplingRunner:
             prompt_descriptors,
             prompt_targets,
             prompt_ks,
-        ) = self._forward_rows(step)
+        ) = self._forward_prepared(prepared)
 
         if sampling_count != plan.num_rows:
             raise RuntimeError(
@@ -250,6 +250,10 @@ class ModelSamplingRunner:
         return _GenerationReport(
             raw=tuple(raw), sampling=tuple(sampling), ids=tuple(ids), ids_raw_count=ids_raw_count
         )
+
+    def _forward_prepared(self, prepared: PreparedStep):
+        """Forward hook for runners consuming execution-lease KV addresses."""
+        return self._forward_rows(prepared.step)
 
     def _forward_rows(self, step):
         """Forward every slice that samples or scores; gather its needed rows.
