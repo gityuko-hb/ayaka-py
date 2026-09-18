@@ -129,14 +129,6 @@ class Platform:
         return self.name == "cuda"
 
     @property
-    def is_rocm(self) -> bool:
-        return self.name == "rocm"
-
-    @property
-    def is_gpu(self) -> bool:
-        return self.name in ("cuda", "rocm")
-
-    @property
     def is_cpu(self) -> bool:
         return self.name == "cpu"
 
@@ -152,14 +144,14 @@ class Platform:
         self._synchronize()
 
     def device_count(self) -> int:
-        return device_count_stateless() if self.is_gpu else 0
+        return device_count_stateless() if self.is_cuda else 0
 
     # -- capability queries --------------------------------------------
 
     def compute_capability(self, device: int = 0) -> tuple[int, int]:
         """``(major, minor)`` compute capability for `device`."""
         capability_check(
-            self.is_gpu,
+            self.is_cuda,
             "gpu",
             detail=f"platform is {self.name}",
         )
@@ -178,11 +170,11 @@ class Platform:
         return _total_memory(device)
 
     def supports_bf16(self, device: int = 0) -> bool:
-        return self.is_gpu and self.sm_version(device) >= 80
+        return self.is_cuda and self.sm_version(device) >= 80
 
     def supports_fp8(self, device: int = 0) -> bool:
         """Native fp8 tensor-core support: Ada (89) and Hopper (90) onward."""
-        return self.is_gpu and self.sm_version(device) >= 89
+        return self.is_cuda and self.sm_version(device) >= 89
 
     def is_pin_memory_available(self) -> bool:
         """Whether pinned host allocations are usable.
@@ -190,7 +182,7 @@ class Platform:
         WSL reports pinned memory as available but performs catastrophically
         over PCIe virtualization, so it is treated as disabled under WSL.
         """
-        if not self.is_gpu:
+        if not self.is_cuda:
             return False
         if _in_wsl():
             logger.warning(
@@ -206,7 +198,7 @@ class Platform:
         Computed against total memory to preserve fixed headroom for NCCL,
         cuBLAS workspace, and memory fragmentation.
         """
-        if not self.is_gpu:
+        if not self.is_cuda:
             try:
                 import psutil
 
@@ -250,25 +242,12 @@ def _noop(*args: Any, **kwargs: Any) -> None:
 
 @lru_cache(maxsize=1)
 def current_platform() -> Platform:
-    """Detect platform backend lazily on first call."""
+    """Detect platform backend lazily on first call: CUDA, else CPU fallback."""
     try:
         import torch
 
-        if getattr(torch.version, "hip", None) is not None:
-            platform = Platform(
-                "rocm", "cuda", torch.cuda.empty_cache, torch.cuda.synchronize
-            )
-        elif (
-            getattr(torch.version, "cuda", None) is not None
-            and torch.cuda.is_available()
-        ):
-            platform = Platform(
-                "cuda", "cuda", torch.cuda.empty_cache, torch.cuda.synchronize
-            )
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            platform = Platform(
-                "xpu", "xpu", torch.xpu.empty_cache, torch.xpu.synchronize
-            )
+        if getattr(torch.version, "cuda", None) is not None and torch.cuda.is_available():
+            platform = Platform("cuda", "cuda", torch.cuda.empty_cache, torch.cuda.synchronize)
         else:
             platform = Platform("cpu", "cpu", _noop, _noop)
     except Exception:
@@ -297,7 +276,7 @@ def require_capability(
     """Raise CapabilityError unless device meets minimum_sm and is built."""
     platform = current_platform()
     capability_check(
-        platform.is_gpu,
+        platform.is_cuda,
         feature,
         detail=f"requires a GPU, platform is {platform.name}",
         remedy=remedy,
@@ -315,10 +294,7 @@ def require_capability(
     if archs and not any(actual >= arch for arch in archs):
         raise CapabilityError(
             feature,
-            detail=(
-                f"device sm_{actual} is below every architecture this build "
-                f"targets ({archs})"
-            ),
+            detail=(f"device sm_{actual} is below every architecture this build targets ({archs})"),
             remedy=f"add {actual} to {_ARCH_FILE.name} and rebuild",
         )
 
@@ -329,7 +305,7 @@ def platform_report() -> dict[str, Any]:
     report: dict[str, Any] = {
         "platform": platform.name,
         "device_count": platform.device_count(),
-        "cuda_initialized": cuda_is_initialized() if platform.is_gpu else False,
+        "cuda_initialized": cuda_is_initialized() if platform.is_cuda else False,
         "build_architectures": supported_archs(),
         "devices": [],
     }
