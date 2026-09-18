@@ -11,7 +11,6 @@ from ayaka.attention.errors import (
     BackendCapabilityError,
     GraphStateError,
 )
-from ayaka.attention.graph import GraphBuffers
 from ayaka.attention.metadata import (
     BaseAttentionMetadata,
     BaseAttentionMetadataBuilder,
@@ -19,6 +18,7 @@ from ayaka.attention.metadata import (
 )
 from ayaka.attention.ports import PagedKVCache
 from ayaka.attention.spec import AttentionGroupSpec
+from ayaka.runner.graph.buffer import GraphBuffer
 from ayaka.types import AttentionCudaGraphSupport, AttentionType, KVLayoutKind, MaskKind
 from ayaka.utils.import_utils import CapabilityError, require_module
 
@@ -149,7 +149,7 @@ class FlashAttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self, group: AttentionGroupSpec, kv_cache: PagedKVCache, device: torch.device
     ) -> None:
         super().__init__(group, kv_cache, device)
-        self._buffers: GraphBuffers | None = None
+        self._buffers: GraphBuffer | None = None
         self._graph_output: torch.Tensor | None = None
 
     def build(self, common: CommonAttentionMetadata) -> FlashAttentionMetadata:
@@ -170,7 +170,7 @@ class FlashAttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             max_query_len=max_query_len,
         )
         page = self.group.page_size
-        self._buffers = GraphBuffers.create(
+        self._buffers = GraphBuffer.create(
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             max_columns=(max_seq_len + page - 1) // page,

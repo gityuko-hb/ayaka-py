@@ -7,13 +7,13 @@ import torch
 from ayaka.attention.metadata import CommonAttentionMetadata
 from ayaka.types import AttentionCudaGraphSupport, ForwardMode
 
-from .errors import AttentionErrorCode, GraphStateError
+from ...attention.errors import AttentionErrorCode, GraphStateError
 
-__all__ = ["GraphBuffers"]
+__all__ = ["GraphBuffer"]
 
 
 @dataclass
-class GraphBuffers:
+class GraphBuffer:
     """Address-stable device buffers for one attention group's captured decode path.
 
     Sizing rules, and why each one is what it is:
@@ -62,7 +62,7 @@ class GraphBuffers:
         max_columns: int,
         device: torch.device,
         max_query_len: int = 1,
-    ) -> GraphBuffers:
+    ) -> GraphBuffer:
         max_tokens = max_batch_size * max_query_len
         return cls(
             seq_lens=torch.zeros(max_batch_size, dtype=torch.int32, device=device),
