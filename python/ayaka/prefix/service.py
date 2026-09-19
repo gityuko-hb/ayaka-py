@@ -1,0 +1,168 @@
+"""Resident prefix policy over the manager's single canonical ownership store."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+from ayaka.exceptions import (
+    InvalidHandleError,
+    PrefixCapabilityStaleError,
+)
+from ayaka.handles import SequenceHandle
+from ayaka.memory.manager import RuntimeMemoryManager
+from ayaka.memory.sequence import PageTableEntry
+from ayaka.prefix.identity import PrefixCacheContext
+from ayaka.prefix.interface import ValidResume
+from ayaka.utils.validation import require_int
+
+if TYPE_CHECKING:
+    from ayaka.kvcache.manager import LogicalKVManager
+    from ayaka.prefix.transfer import PrefixTransfer
+
+
+def common_resume_boundary(group_boundaries: tuple[tuple[int, ...], ...], limit: int) -> int:
+    """Find an actual common checkpoint, never the minimum of longest matches.
+
+    Each group lists positions it can independently restore, including its
+    retention/checkpoint restrictions. Absence of a common positive boundary
+    means recompute from zero. This helper does not certify recurrent support.
+    """
+    require_int(limit, "limit")
+    if not group_boundaries:
+        return 0
+    common = set(group_boundaries[0])
+    for values in group_boundaries:
+        for value in values:
+            require_int(value, "resume position")
+        common.intersection_update(values)
+    return max((x for x in common if x <= limit), default=0)
+
+
+class PrefixService:
+    """Policy and transfer lifecycle; durable page ownership stays in radix/ownership.
+
+    One service belongs to one LogicalKVManager. Partial-tail reuse is supported
+    only for resident homogeneous KV. A lookup is borrowed and may become stale;
+    acquisition revalidates it and returns zero on eviction. Callers supply the
+    complete execution identity and keep the final prompt query for logits.
+    """
+
+    def __init__(self, kv: LogicalKVManager) -> None:
+        if not isinstance(kv.backend, RuntimeMemoryManager) or kv.backend.tiering_enabled:
+            raise ValueError("canonical prefix resume requires homogeneous resident KV")
+        self.kv = kv
+        self.backend = kv.backend
+        self.store = self.backend.prefix_cache
+        self.cache_id = self.store.cache_id
+        self._max_entries: int | None = None
+        self._transfers: set[PrefixTransfer] = set()
+        self.closed = False
+
+    @property
+    def max_entries(self) -> int | None:
+        """Optional shared canonical-terminal ceiling; physical capacity is always bounded."""
+        return self._max_entries
+
+    @max_entries.setter
+    def max_entries(self, value: int | None) -> None:
+        """Fix the optional terminal ceiling; set-once for the shared service.
+
+        The first owner to set a ceiling wins. A later owner must agree or the
+        assignment fails: silently changing eviction policy would break the
+        first consumer's capacity accounting.
+        """
+        if value is not None:
+            require_int(value, "max_entries", minimum=1)
+        if self._max_entries is not None and value != self._max_entries:
+            raise ValueError(
+                f"prefix service max_entries is fixed at {self._max_entries}; "
+                "a second owner must not silently change eviction policy"
+            )
+        self._max_entries = value
+
+    def require_open(self) -> None:
+        if self.closed or self.kv.closed:
+            raise ValueError("prefix service is closed")
+        self.kv._validate_storage_bindings()
+
+    def lookup(
+        self, token_ids: Sequence[int], *, context: PrefixCacheContext
+    ) -> ValidResume | None:
+        self.require_open()
+        return self.store.match_resume(token_ids, context=context)
+
+    def ready(self, match: ValidResume) -> bool:
+        """Avoid attaching another partial-tail consumer with no COW headroom.
+
+        This is an engine-thread admission hint, not a reservation. A sole
+        consumer can privatize cache ownership under pressure; additional
+        consumers wait until a page or the source owner becomes available.
+        Stale hints proceed to acquire's generation-safe miss handling.
+        """
+        self.require_open()
+        if not match.pages or match.pages[-1].valid_tokens == self.backend.page_size:
+            return True
+        try:
+            meta = self.backend.allocator.get_meta(match.pages[-1].page)
+        except InvalidHandleError:
+            return True
+        capacity = self.backend.allocator.snapshot()
+        return bool(
+            capacity.free_pages
+            or capacity.evictable_pages
+            or not (meta.request_refs or meta.pin_refs or meta.inflight_refs)
+        )
+
+    def acquire(
+        self,
+        sequence: SequenceHandle,
+        match: ValidResume,
+        *,
+        token_ids: Sequence[int],
+        context: PrefixCacheContext,
+    ) -> int:
+        """Revalidate and attach a borrowed capability, or return zero on a miss.
+
+        Capability revalidation failures (cache incarnation, entry identity,
+        context, token identity, chain geometry) are clean misses. Sequence
+        state errors from the backend — a busy sequence, a stale handle, an
+        invariant violation — propagate so they are never masked as misses.
+        """
+        self.require_open()
+        n = match.logical_position
+        if n <= 0 or match.context != context or match.token_ids != tuple(token_ids[:n]):
+            return 0
+        try:
+            return self.backend.attach_resume(sequence, match)
+        except (InvalidHandleError, PrefixCapabilityStaleError):
+            return 0
+
+    def publish(
+        self, sequence: SequenceHandle, token_ids: Sequence[int], *, context: PrefixCacheContext
+    ) -> ValidResume | None:
+        self.require_open()
+        result = self.backend.cache_resume(sequence, token_ids, context=context)
+        if self.max_entries is not None:
+            while self.store.snapshot().terminal_entries > self.max_entries:
+                self.evict()
+        return result
+
+    def pin(self, match: ValidResume) -> tuple[PageTableEntry, ...]:
+        self.require_open()
+        return self.store.pin_resume(match)
+
+    def evict(self, entry_id: int | None = None) -> bool:
+        self.require_open()
+        return self.store.evict_entry(entry_id, safe_epoch=self.backend.current_epoch)
+
+    def close(self) -> bool:
+        """Drop cache ownership only after all transfers have retired."""
+        if self.closed:
+            return True
+        if any(not transfer.retired for transfer in self._transfers):
+            return False
+        self.backend.clear_prefix_cache()
+        self.backend.reclaim_deferred()
+        self.closed = True
+        return True

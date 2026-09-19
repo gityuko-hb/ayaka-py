@@ -31,6 +31,7 @@ class _RadixSpanNode:
         if not self.digests and self.parent is not None:
             raise ValueError("only a radix root may have an empty span")
 
+
 @dataclass(frozen=True, slots=True)
 class RadixPath:
     """One retained ownership chain used to rebuild the logical index."""

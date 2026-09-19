@@ -1,4 +1,4 @@
-"""Compatibility identity for complete-page prefix reuse.
+"""Compatibility identity for full-page and partial-tail prefix reuse.
 
 This module is deliberately allocator-free.  It turns token pages plus the
 execution context into chained SHA-256 identities; it does not decide where
@@ -8,11 +8,18 @@ pages live or who owns them.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ayaka.kvcache.storage.geometry import BaseKVStorageSpec
 
 _MAX_TOKEN_ID = (1 << 63) - 1
 _HASH_DOMAIN = b"ayaka-prefix-block-v1"
+_LAYOUT_TAG = "kv-layout:"
+
 
 @dataclass(frozen=True, slots=True)
 class PrefixCacheContext:
@@ -47,6 +54,7 @@ class PrefixCacheContext:
         for name, value in optional.items():
             if value == "":
                 raise ValueError(f"{name} must be None or a non-empty string")
+
     def components(self) -> tuple[str | None, ...]:
         """Ordered fields fed into the context seed."""
 
@@ -61,9 +69,10 @@ class PrefixCacheContext:
             self.cache_layout_version,
         )
 
+
 @dataclass(frozen=True, slots=True)
 class PrefixBlockIdentity:
-    """Collision-resistant identity for one complete prefix block."""
+    """Collision-resistant identity for one prefix block and its valid boundary."""
 
     context: PrefixCacheContext
     digest: bytes
@@ -84,6 +93,7 @@ class PrefixBlockIdentity:
 
         return self.digest.hex()
 
+
 def build_prefix_block_identities(
     token_ids: Sequence[int],
     *,
@@ -94,6 +104,7 @@ def build_prefix_block_identities(
 
     blocks = full_token_blocks(token_ids, page_size=page_size)
     return build_identities(blocks, page_size=page_size, context=context)
+
 
 def full_token_blocks(
     token_ids: Sequence[int],
@@ -126,11 +137,13 @@ def build_identities(
     page_size: int,
     context: PrefixCacheContext,
 ) -> tuple[PrefixBlockIdentity, ...]:
-    """Build chained identities for already-normalized complete blocks."""
+    """Build chained identities; only the final normalized block may be partial."""
 
     parent_digest = context_seed(context, page_size=page_size)
     identities: list[PrefixBlockIdentity] = []
     for block_index, block in enumerate(blocks):
+        if block_index < len(blocks) - 1 and len(block) != page_size:
+            raise ValueError("only a terminal prefix block may be partial")
         identity = identity_for_block(
             context=context,
             parent_digest=parent_digest,
@@ -153,6 +166,8 @@ def identity_for_block(
 ) -> PrefixBlockIdentity:
     """Hash domain + parent digest + position + one token page."""
 
+    if not 0 < len(block_token_ids) <= page_size:
+        raise ValueError("prefix block must contain between one and page_size tokens")
     digest = hashlib.sha256()
     digest.update(_HASH_DOMAIN)
     digest.update(parent_digest)
@@ -163,7 +178,7 @@ def identity_for_block(
         context=context,
         digest=digest.digest(),
         block_index=block_index,
-        token_count=(block_index + 1) * page_size,
+        token_count=block_index * page_size + len(block_token_ids),
     )
 
 
@@ -182,3 +197,64 @@ def context_seed(context: PrefixCacheContext, *, page_size: int) -> bytes:
         digest.update(len(encoded).to_bytes(8, "big", signed=False))
         digest.update(encoded)
     return digest.digest()
+
+
+def rope_config_identity(config: object) -> str | None:
+    """Hash the RoPE-relevant subset of a checkpoint config.
+
+    Covers theta, the scaling policy and head dimension via one canonical JSON
+    payload. A config without ``rope_theta`` (non-RoPE models such as GPT-2)
+    yields ``None``, which is itself part of the identity: it never collides
+    with a hashed value.
+    """
+
+    theta = getattr(config, "rope_theta", None)
+    if theta is None:
+        return None
+    payload = {
+        "head_dim": getattr(config, "head_dim", None),
+        "rope_scaling": repr(getattr(config, "rope_scaling", None)),
+        "rope_theta": repr(theta),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def storage_layout_identity(spec: BaseKVStorageSpec) -> str:
+    """Stable layout/geometry tag derived from the storage compatibility key.
+
+    The compatibility key already covers storage family, local KV heads,
+    head geometry, page size, dtype, element layout and quantization scheme,
+    so a geometry change invalidates cached chains without a manual bump.
+    """
+
+    digest = hashlib.sha256(repr(spec.compatibility_key).encode("utf-8")).hexdigest()
+    return _LAYOUT_TAG + digest[:24]
+
+
+def build_prefix_context(
+    *,
+    model_id: str,
+    model_revision: str | None = None,
+    config: object | None = None,
+    storage_spec: BaseKVStorageSpec,
+    adapter_id: str | None = None,
+    cache_salt: str | None = None,
+    multimodal_hash: str | None = None,
+) -> PrefixCacheContext:
+    """Build the canonical execution identity for prefix reuse.
+
+    The KV storage spec is mandatory: cache dtype and layout identity derive
+    from the real geometry, never from a caller-provided convenience string.
+    ``config`` contributes the RoPE identity when the model uses RoPE.
+    """
+
+    return PrefixCacheContext(
+        model_id=model_id,
+        model_revision=model_revision,
+        adapter_id=adapter_id,
+        cache_salt=cache_salt,
+        multimodal_hash=multimodal_hash,
+        rope_config_hash=rope_config_identity(config) if config is not None else None,
+        cache_dtype=storage_spec.dtype,
+        cache_layout_version=storage_layout_identity(storage_spec),
+    )

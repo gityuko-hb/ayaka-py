@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from itertools import count
 from threading import RLock
 
-from ayaka.exceptions import InvariantViolationError
+from ayaka.exceptions import (
+    InvalidHandleError,
+    InvariantViolationError,
+    PrefixCapabilityStaleError,
+)
 from ayaka.handles import KVPageHandle, PrefixHandle
 from ayaka.memory.allocator import PageAllocator
+from ayaka.memory.sequence import PageTableEntry
 from ayaka.prefix.identity import PrefixCacheContext, build_identities, full_token_blocks
-from ayaka.prefix.interface import CachedBlockInfo, PrefixCacheSnapshot, PrefixMatch
+from ayaka.prefix.interface import CachedBlockInfo, PrefixCacheSnapshot, PrefixMatch, ValidResume
 from ayaka.prefix.ownership import PrefixOwnershipNode, PrefixOwnershipTable
 from ayaka.prefix.radix import PageRadixIndex, RadixPath
+
+_CACHE_IDS = count(1)
 
 
 class RadixPagePrefixCache:
@@ -27,6 +35,7 @@ class RadixPagePrefixCache:
             raise ValueError("page_size must be positive")
         if allocator.page_size != page_size:
             raise ValueError("prefix cache and allocator page sizes must match")
+        self.cache_id = next(_CACHE_IDS)
         self._page_size = page_size
         self._ownership = PrefixOwnershipTable(
             allocator=allocator,
@@ -93,19 +102,47 @@ class RadixPagePrefixCache:
         """Publish complete pages under one canonical compatible identity."""
 
         blocks = full_token_blocks(token_ids, page_size=self._page_size)
-        identities = build_identities(
-            blocks,
-            page_size=self._page_size,
-            context=context,
+        return self._insert_blocks(blocks, tuple(pages), context=context, retain=True)
+
+    def insert_resume(
+        self,
+        token_ids: Sequence[int],
+        pages: Sequence[KVPageHandle],
+        *,
+        context: PrefixCacheContext,
+    ) -> ValidResume | None:
+        """Publish committed full pages and a partial tail under canonical ownership.
+
+        Repeated publication is idempotent. Partial blocks are terminal leaves;
+        complete-page callers continue to see only complete-page matches.
+        """
+        tokens = tuple(token_ids)
+        full_token_blocks(tokens, page_size=self._page_size)  # Validate every token.
+        blocks = tuple(
+            tokens[i : i + self._page_size] for i in range(0, len(tokens), self._page_size)
         )
-        source_pages = tuple(pages)
+        with self._lock:
+            handle = self._insert_blocks(blocks, tuple(pages), context=context, retain=False)
+            if handle is None:
+                return None
+            return self._resume(self._ownership.chain(handle), len(tokens))
+
+    def _insert_blocks(
+        self,
+        blocks: tuple[tuple[int, ...], ...],
+        source_pages: tuple[KVPageHandle, ...],
+        *,
+        context: PrefixCacheContext,
+        retain: bool,
+    ) -> PrefixHandle | None:
+        identities = build_identities(blocks, page_size=self._page_size, context=context)
         if len(source_pages) != len(blocks):
-            raise ValueError("insert requires exactly one page per complete token block")
+            raise ValueError("insert requires exactly one page per token block")
         if not blocks:
             return None
 
         with self._lock:
-            self._ownership.validate_source_pages(source_pages)
+            self._ownership.validate_source_pages(source_pages, tuple(map(len, blocks)))
             parent: PrefixHandle | None = None
             resolved: list[PrefixOwnershipNode] = []
             planned: list[PrefixOwnershipNode] = []
@@ -153,41 +190,137 @@ class RadixPagePrefixCache:
                 raise
 
             terminal = resolved[-1]
-            terminal.retain_terminal()
+            if retain or not terminal.terminal:
+                terminal.retain_terminal()
             self._ownership.touch(resolved)
             return terminal.handle
 
-    def acquire_match(self, match: PrefixMatch) -> tuple[KVPageHandle, ...]:
-        """Revalidate a match, then transactionally acquire request refs."""
+    def _resume(self, nodes: Sequence[PrefixOwnershipNode], n: int) -> ValidResume:
+        return ValidResume(
+            self.cache_id,
+            nodes[-1].handle.index,
+            nodes[-1].identity.context,
+            tuple(token for node in nodes for token in node.block_token_ids)[:n],
+            tuple(
+                PageTableEntry(node.page, min(self._page_size, n - i * self._page_size))
+                for i, node in enumerate(nodes)
+            ),
+        )
 
+    def match_resume(
+        self, token_ids: Sequence[int], *, context: PrefixCacheContext
+    ) -> ValidResume | None:
+        """Match full radix blocks, then the longest valid portion of the next block."""
+        tokens = tuple(token_ids)
         with self._lock:
-            nodes = self._ownership.resolve_match(match)
-            if not nodes:
-                return ()
-            pages = self._ownership.acquire_request_refs(nodes)
-            self._ownership.touch(nodes)
-            return pages
-
-    def truncate_match(self, match: PrefixMatch, matched_tokens: int) -> PrefixMatch:
-        """Return a shorter page-aligned capability after group intersection."""
-
-        if matched_tokens < 0 or matched_tokens % self._page_size:
-            raise ValueError("matched_tokens must be a non-negative page multiple")
-        if matched_tokens > match.matched_tokens:
-            raise ValueError("cannot extend a prefix match while truncating it")
-        with self._lock:
-            nodes = self._ownership.resolve_match(match)
-            count = matched_tokens // self._page_size
-            if count == 0:
-                return PrefixMatch.empty(context=match.context, page_size=self._page_size)
-            selected = nodes[:count]
-            return PrefixMatch(
-                context=match.context,
-                page_size=self._page_size,
-                matched_tokens=matched_tokens,
-                pages=tuple(node.page for node in selected),
-                terminal_handle=selected[-1].handle,
+            full = self.match(tokens, context=context)
+            nodes = (
+                () if full.terminal_handle is None else self._ownership.chain(full.terminal_handle)
             )
+            n = full.matched_tokens
+            best = None
+            common = 0
+            for candidate in self._ownership.children(full.terminal_handle, context):
+                matched = 0
+                for a, b in zip(candidate.block_token_ids, tokens[n:], strict=False):
+                    if a != b:
+                        break
+                    matched += 1
+                if matched > common:
+                    common, best = matched, candidate
+            if best is not None:
+                self._ownership.validate_node(
+                    best, expected_parent=full.terminal_handle, expected_tokens=best.block_token_ids
+                )
+                nodes += (best,)
+                n += common
+            if not nodes:
+                return None
+            self._ownership.touch(nodes)
+            return self._resume(nodes, n)
+
+    def _resolve_resume(self, match: ValidResume) -> tuple[PrefixOwnershipNode, ...]:
+        """Revalidate a borrowed capability or raise ``PrefixCapabilityStaleError``.
+
+        Cache incarnation, entry identity, context, token identity, chain
+        geometry and page generations must all agree with the store's current
+        state. Structural corruption found along the chain still raises
+        ``InvariantViolationError`` so it is never reported as a miss.
+        """
+        if match.cache_id != self.cache_id:
+            raise PrefixCapabilityStaleError("resume belongs to another cache incarnation")
+        nodes = self._ownership.chain(PrefixHandle(match.entry_id, 1))
+        n = match.logical_position
+        if (
+            not (len(nodes) - 1) * self._page_size
+            < n
+            <= sum(len(node.block_token_ids) for node in nodes)
+        ):
+            raise PrefixCapabilityStaleError("resume length does not match its terminal block")
+        if match != self._resume(nodes, n):
+            raise PrefixCapabilityStaleError("resume identity or page generations changed")
+        parent = None
+        for node in nodes:
+            self._ownership.validate_node(
+                node, expected_parent=parent, expected_tokens=node.block_token_ids
+            )
+            parent = node.handle
+        return nodes
+
+    def acquire_resume(self, match: ValidResume) -> tuple[PageTableEntry, ...]:
+        """Revalidate and acquire request refs under the same eviction lock.
+
+        Stale capabilities raise ``PrefixCapabilityStaleError`` (a clean miss
+        for ``acquire``); allocator failures during ref acquisition propagate
+        as backend faults.
+        """
+        with self._lock:
+            nodes = self._resolve_resume(match)
+            self._ownership.acquire_request_refs(nodes)
+            self._ownership.touch(nodes)
+            return match.pages
+
+    def pin_resume(self, match: ValidResume) -> tuple[PageTableEntry, ...]:
+        """Keep spill sources alive independently of cache eviction."""
+        with self._lock:
+            nodes = self._resolve_resume(match)
+            self._ownership.pin(nodes)
+            return match.pages
+
+    def evict_entry(self, entry_id: int | None = None, *, safe_epoch: int) -> bool:
+        """Evict one canonical terminal, leaving consumer refs and pins intact."""
+        with self._lock:
+            self._ownership.validate_safe_epoch(safe_epoch)
+            if entry_id is None:
+                candidates = self._ownership.evictable_nodes()
+                if not candidates:
+                    return False
+                node = candidates[0]
+            else:
+                try:
+                    node = self._ownership.get(PrefixHandle(entry_id, 1))
+                except InvalidHandleError:
+                    return False
+                if not node.terminal:
+                    return False
+            node.evict_terminal()
+            self._ownership.prune_unretained(node, safe_epoch=safe_epoch)
+            self._rebuild_radix()
+            return True
+
+    def evict_page(self, page: KVPageHandle, *, safe_epoch: int) -> int:
+        """Drop every cached path depending on a page; consumer refs stay untouched."""
+        with self._lock:
+            self._ownership.validate_safe_epoch(safe_epoch)
+            terminals = tuple(
+                chain[-1].handle
+                for chain in self._ownership.terminal_chains()
+                if any(node.page == page for node in chain)
+            )
+            before = len(self._ownership)
+            for handle in terminals:
+                self.evict_entry(handle.index, safe_epoch=safe_epoch)
+            return before - len(self._ownership)
 
     def release(self, prefix: PrefixHandle, *, safe_epoch: int) -> int:
         """Drop one terminal retainer and prune newly unshared ownership."""
@@ -253,8 +386,7 @@ class RadixPagePrefixCache:
     def evictable_leaves(self) -> tuple[CachedBlockInfo, ...]:
         with self._lock:
             return tuple(
-                self._ownership.describe(node)
-                for node in self._ownership.evictable_nodes()
+                self._ownership.describe(node) for node in self._ownership.evictable_nodes()
             )
 
     def assert_invariants(self) -> None:
@@ -279,7 +411,3 @@ class RadixPagePrefixCache:
             )
             for chain in self._ownership.terminal_chains()
         )
-
-
-# Compatibility name used before the radix index became canonical.
-HashBlockPrefixCache = RadixPagePrefixCache

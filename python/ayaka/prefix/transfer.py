@@ -15,7 +15,7 @@ from ayaka.executor.ticket import TicketState
 from ayaka.kvcache.manager import KVCapacityError
 from ayaka.memory.buffer import BufferAllocator
 from ayaka.plan import WorkspaceRequest
-from ayaka.prefix.resume import ValidResume
+from ayaka.prefix.interface import ValidResume
 from ayaka.types import MemoryOwner, MemoryTier
 from ayaka.utils.torch_utils import require_torch
 from ayaka.utils.validation import require_int
@@ -111,7 +111,8 @@ class PrefixTransfer:
     ):
         if (host is None) == (value is None):
             raise ValueError("provide exactly one host checkpoint or resident entry")
-        cache.validate_runner(cache.runner)
+        cache = getattr(cache, "service", cache)
+        cache.require_open()
         self.cache, self.credits = cache, credits
         self.backend = cache.backend
         self.storage = cache.kv.storages["default"].storage
@@ -173,15 +174,7 @@ class PrefixTransfer:
                 self.view = self.backend.build_execution_view(self.lease)
             else:
                 assert value is not None
-                if value.cache_id != cache.cache_id or cache._entries.get(value.entry_id) != value:
-                    raise ValueError("spill requires a current complete cache entry")
-                pins = []
-                try:
-                    for entry in value.pages:
-                        self.backend.allocator.pin_page(entry.page)
-                        pins.append(entry)
-                finally:
-                    self._pins = tuple(pins)
+                self._pins = cache.pin(value)
                 tier = (
                     MemoryTier.HOST_PINNED
                     if self.storage.device.type == "cuda"
@@ -318,12 +311,9 @@ class PrefixTransfer:
                 self.backend.commit_step(self.lease)
                 self.backend.retire_step(self.lease)
                 self.lease = None
-                pins = self.backend.pin_prefix(self.sequence, len(self.host.token_ids))
-                try:
-                    self.result = self.cache._insert(self.host.context, self.host.token_ids, pins)
-                except BaseException:
-                    self.backend.unpin_prefix(pins)
-                    raise
+                self.result = self.cache.publish(
+                    self.sequence, self.host.token_ids, context=self.host.context
+                )
             elif succeeded:
                 self.host._version = self.host._tensor._version
                 self.host.ready = True

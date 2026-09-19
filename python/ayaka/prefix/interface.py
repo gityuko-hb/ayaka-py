@@ -5,7 +5,28 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from ayaka.handles import KVPageHandle, PrefixHandle, PrefixMatchHandle
+from ayaka.memory.sequence import PageTableEntry
 from ayaka.prefix.identity import PrefixBlockIdentity, PrefixCacheContext
+
+
+@dataclass(frozen=True, slots=True)
+class ValidResume:
+    """Borrowed canonical-cache capability, including an immutable partial tail.
+
+    Lookup owns no pages. The originating store revalidates this capability
+    before acquiring request or transfer ownership. Entry IDs are never reused
+    within a store incarnation; physical pages carry allocator generations.
+    """
+
+    cache_id: int
+    entry_id: int
+    context: PrefixCacheContext
+    token_ids: tuple[int, ...]
+    pages: tuple[PageTableEntry, ...]
+
+    @property
+    def logical_position(self) -> int:
+        return len(self.token_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +58,7 @@ class PrefixMatch:
             pages=(),
             terminal_handle=None,
         )
+
 
 @dataclass(frozen=True, slots=True)
 class PrefixLookupResult:

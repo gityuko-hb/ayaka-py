@@ -14,7 +14,12 @@ from ayaka.exceptions import (
 from ayaka.handles import KVPageHandle, PrefixHandle
 from ayaka.memory.allocator import PageAllocator
 from ayaka.memory.state import PageAllocationState
-from ayaka.prefix.identity import PrefixBlockIdentity, context_seed, identity_for_block
+from ayaka.prefix.identity import (
+    PrefixBlockIdentity,
+    PrefixCacheContext,
+    context_seed,
+    identity_for_block,
+)
 from ayaka.prefix.interface import CachedBlockInfo, PrefixCacheSnapshot, PrefixMatch
 
 
@@ -40,9 +45,7 @@ class PrefixOwnershipNode:
 
     def release_terminal(self) -> bool:
         if self.terminal_refs <= 0:
-            raise InvalidStateTransitionError(
-                "prefix handle is not a retained terminal entry"
-            )
+            raise InvalidStateTransitionError("prefix handle is not a retained terminal entry")
         self.terminal_refs -= 1
         return self.terminal_refs == 0
 
@@ -139,7 +142,7 @@ class PrefixOwnershipTable:
             for node in planned:
                 self._allocator.acquire_cache_ref(node.page)
                 acquired.append(node.page)
-                self.validate_cached_page(node.page)
+                self.validate_cached_page(node.page, len(node.block_token_ids))
         except Exception:
             for page in reversed(acquired):
                 self._allocator.release_cache_ref(
@@ -171,20 +174,25 @@ class PrefixOwnershipTable:
                 )
             raise
 
-    def validate_source_pages(self, pages: tuple[KVPageHandle, ...]) -> None:
-        """Reject duplicate, partial, non-live, or request-unowned pages."""
+    def validate_source_pages(
+        self, pages: tuple[KVPageHandle, ...], counts: tuple[int, ...] | None = None
+    ) -> None:
+        """Validate committed source coverage before taking durable cache refs."""
 
         if len(set(pages)) != len(pages):
             raise ValueError("a prefix chain cannot contain duplicate pages")
-        for page in pages:
+        counts = (self._page_size,) * len(pages) if counts is None else counts
+        for page, count in zip(pages, counts, strict=True):
+            if not 0 < count <= self._page_size:
+                raise ValueError("invalid cached page token count")
             meta = self._allocator.get_meta(page)
             if (
                 meta.allocation_state is not PageAllocationState.LIVE
                 or meta.request_refs <= 0
-                or meta.valid_tokens != self._page_size
+                or meta.valid_tokens < count
             ):
                 raise InvalidStateTransitionError(
-                    "only request-owned complete live pages can enter the prefix cache"
+                    "only request-owned committed live pages can enter the prefix cache"
                 )
 
     def validate_node(
@@ -196,9 +204,9 @@ class PrefixOwnershipTable:
     ) -> None:
         if node.parent != expected_parent or node.block_token_ids != expected_tokens:
             raise InvariantViolationError("prefix digest collision or corrupted chain metadata")
-        self.validate_cached_page(node.page)
+        self.validate_cached_page(node.page, len(node.block_token_ids))
 
-    def validate_cached_page(self, page: KVPageHandle) -> None:
+    def validate_cached_page(self, page: KVPageHandle, valid_tokens: int | None = None) -> None:
         try:
             meta = self._allocator.get_meta(page)
         except InvalidHandleError as exc:
@@ -208,10 +216,10 @@ class PrefixOwnershipTable:
         if (
             meta.allocation_state is not PageAllocationState.LIVE
             or meta.cache_refs <= 0
-            or meta.valid_tokens != self._page_size
+            or meta.valid_tokens < (self._page_size if valid_tokens is None else valid_tokens)
         ):
             raise InvariantViolationError(
-                "prefix cache refers to a non-cache-owned complete live page"
+                "prefix cache refers to a non-cache-owned or incomplete live page"
             )
 
     def resolve_match(self, match: PrefixMatch) -> list[PrefixOwnershipNode]:
@@ -273,6 +281,44 @@ class PrefixOwnershipTable:
             raise
         return tuple(acquired)
 
+    def pin(self, nodes: Sequence[PrefixOwnershipNode]) -> None:
+        """Take transient transfer pins atomically after store revalidation."""
+        acquired = []
+        try:
+            for node in nodes:
+                self._allocator.pin_page(node.page)
+                acquired.append(node.page)
+        except BaseException:
+            for page in reversed(acquired):
+                self._allocator.unpin_page(page, safe_epoch=self.current_epoch)
+            raise
+
+    def chain(self, handle: PrefixHandle) -> tuple[PrefixOwnershipNode, ...]:
+        nodes: list[PrefixOwnershipNode] = []
+        node = self.get(handle)
+        while True:
+            nodes.append(node)
+            if node.parent is None:
+                return tuple(reversed(nodes))
+            node = self.get(node.parent)
+
+    def children(
+        self, parent: PrefixHandle | None, context: PrefixCacheContext
+    ) -> tuple[PrefixOwnershipNode, ...]:
+        candidates = (
+            self._nodes.values()
+            if parent is None
+            else (
+                self.get(handle)
+                for handle in sorted(self.get(parent).children, key=lambda h: h.index)
+            )
+        )
+        return tuple(
+            node
+            for node in candidates
+            if node.parent == parent and node.identity.context == context
+        )
+
     def touch(self, nodes: Sequence[PrefixOwnershipNode]) -> None:
         self._clock += 1
         for node in nodes:
@@ -295,21 +341,18 @@ class PrefixOwnershipTable:
         return released
 
     def evictable_nodes(self) -> list[PrefixOwnershipNode]:
-        candidates = [
-            node for node in self._nodes.values() if node.terminal and not node.children
-        ]
+        candidates = [node for node in self._nodes.values() if node.terminal and not node.children]
         candidates.sort(key=lambda node: (node.last_access, node.handle.index))
         return candidates
 
     def snapshot(self) -> PrefixCacheSnapshot:
         handles = tuple(
-            node.handle
-            for node in sorted(self._nodes.values(), key=lambda node: node.handle.index)
+            node.handle for node in sorted(self._nodes.values(), key=lambda node: node.handle.index)
         )
         return PrefixCacheSnapshot(
             cached_blocks=len(handles),
             terminal_entries=sum(node.terminal for node in self._nodes.values()),
-            cached_tokens=len(handles) * self._page_size,
+            cached_tokens=sum(len(node.block_token_ids) for node in self._nodes.values()),
             handles=handles,
         )
 
@@ -369,20 +412,18 @@ class PrefixOwnershipTable:
         """Verify chain identity, bidirectional links, and allocator refs."""
 
         if len(self._identity_to_index) != len(self._nodes):
-            raise InvariantViolationError(
-                "prefix identity index and node registry sizes differ"
-            )
+            raise InvariantViolationError("prefix identity index and node registry sizes differ")
 
         expected_cache_refs: Counter[KVPageHandle] = Counter()
         for index, node in self._nodes.items():
             if index != node.handle.index:
-                raise InvariantViolationError(
-                    "prefix node is stored under the wrong handle index"
-                )
+                raise InvariantViolationError("prefix node is stored under the wrong handle index")
             if self._identity_to_index.get(node.identity) != index:
                 raise InvariantViolationError("prefix node is missing from the identity index")
-            if len(node.block_token_ids) != self._page_size:
-                raise InvariantViolationError("prefix node contains a partial token block")
+            if not 0 < len(node.block_token_ids) <= self._page_size:
+                raise InvariantViolationError("prefix node contains an invalid token block")
+            if len(node.block_token_ids) < self._page_size and node.children:
+                raise InvariantViolationError("partial prefix blocks must be leaves")
             if node.terminal_refs < 0:
                 raise InvariantViolationError("negative prefix terminal refcount")
 
@@ -414,15 +455,11 @@ class PrefixOwnershipTable:
             for child_handle in node.children:
                 child = self.get(child_handle)
                 if child.parent != node.handle:
-                    raise InvariantViolationError(
-                        "prefix child does not point back to its parent"
-                    )
+                    raise InvariantViolationError("prefix child does not point back to its parent")
             if not node.children and not node.terminal:
-                raise InvariantViolationError(
-                    "an unretained prefix leaf should have been pruned"
-                )
+                raise InvariantViolationError("an unretained prefix leaf should have been pruned")
 
-            self.validate_cached_page(node.page)
+            self.validate_cached_page(node.page, len(node.block_token_ids))
             expected_cache_refs[node.page] += 1
 
         if self._allocator.snapshot().cache_owned_pages != len(expected_cache_refs):
@@ -431,6 +468,4 @@ class PrefixOwnershipTable:
             )
         for page, expected_refs in expected_cache_refs.items():
             if self._allocator.get_meta(page).cache_refs != expected_refs:
-                raise InvariantViolationError(
-                    "prefix nodes and allocator cache refcounts disagree"
-                )
+                raise InvariantViolationError("prefix nodes and allocator cache refcounts disagree")
