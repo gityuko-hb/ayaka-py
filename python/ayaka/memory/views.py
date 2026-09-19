@@ -218,8 +218,6 @@ class MemorySnapshot:
     cached_prefix_entries: int
     """Number of retained terminal prefix entries."""
     cached_prefix_tokens: int
-    pending_prefix_matches: int
-    """Outstanding one-shot prefix-match handles issued to the scheduler."""
     cache_evictable_pages: int
     """Pages the prefix cache could release under pressure (cache-only refs)."""
 
@@ -257,7 +255,6 @@ class LeakReport:
             and not self.open_transaction_ids
             and not self.active_lease_ids
             and not self.cached_prefix_handles
-            and self.snapshot.pending_prefix_matches == 0
             and self.snapshot.cache_owned_pages == 0
             and self.snapshot.reserved_pages == 0
             and self.snapshot.live_pages == 0

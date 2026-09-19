@@ -44,6 +44,7 @@ from ayaka.types import MemoryOwner
 
 __all__ = [
     "ActivationOverflowError",
+    "WorkspaceCeilingError",
     "WorkspaceLease",
     "WorkspaceManager",
     "WorkspaceStats",
@@ -65,6 +66,16 @@ class ActivationOverflowError(RuntimeError):
     Distinct from ``ValueError`` because the recovery differs: this is not a bad
     argument, it is a profiling run that did not reach the real worst case, and
     the fix is upstream in whichever shape the profiling pass chose.
+    """
+
+
+class WorkspaceCeilingError(RuntimeError):
+    """Workspace growth would exceed the budget frozen at bootstrap.
+
+    The ceiling is reserved in the capacity snapshot; growing past it would
+    invalidate the KV budget that was computed from it, so the step is refused
+    rather than silently reallocated. Recovery is a rebuild with a larger
+    frozen budget, never an in-place grow.
     """
 
 
@@ -104,18 +115,34 @@ class WorkspaceLease:
 
     Not a dict of tensors — a dict of regions. Materialising a tensor is the
     backend's job, and doing it here would put torch in the memory layer.
+    ``close`` must be called when the step no longer reads the regions; the
+    manager refuses to prepare the next step (and therefore to grow the buffer)
+    while a lease is still live.
     """
 
-    __slots__ = ("_generation", "_regions", "step_bytes")
+    __slots__ = ("_closed", "_generation", "_manager", "_regions", "step_bytes")
 
-    def __init__(self, regions: dict[str, MemoryRegion], generation: int, step_bytes: int) -> None:
+    def __init__(
+        self,
+        regions: dict[str, MemoryRegion],
+        generation: int,
+        step_bytes: int,
+        *,
+        manager: WorkspaceManager | None = None,
+    ) -> None:
         self._regions = regions
         self._generation = generation
         self.step_bytes = step_bytes
+        self._manager = manager
+        self._closed = False
 
     @property
     def generation(self) -> int:
         return self._generation
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def __getitem__(self, name: str) -> MemoryRegion:
         region = self._regions.get(name)
@@ -132,23 +159,50 @@ class WorkspaceLease:
     def names(self) -> tuple[str, ...]:
         return tuple(self._regions)
 
+    def close(self) -> None:
+        """End this step's slice; idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._manager is not None:
+            self._manager._release(self)
+
+    def __enter__(self) -> WorkspaceLease:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
 
 class WorkspaceManager:
     """Owns one growing buffer and sub-divides it per step."""
 
-    __slots__ = ("_arenas", "_initial_bytes", "_lock", "_num_steps")
+    __slots__ = (
+        "_arenas",
+        "_initial_bytes",
+        "_live_lease",
+        "_lock",
+        "_num_steps",
+    )
 
     def __init__(
         self,
         allocator: CachingAllocator,
         *,
         initial_bytes: int = 0,
+        workspace_ceiling_bytes: int | None = None,
     ) -> None:
         self._initial_bytes = initial_bytes
         self._num_steps = 0
+        self._live_lease: WorkspaceLease | None = None
         self._lock = threading.Lock()
         self._arenas: dict[MemoryOwner, _OwnedBuffer] = {
-            owner: _OwnedBuffer(allocator, owner, may_grow=growable)
+            owner: _OwnedBuffer(
+                allocator,
+                owner,
+                may_grow=growable,
+                ceiling_bytes=workspace_ceiling_bytes if growable else None,
+            )
             for owner, growable in _GROWABLE.items()
         }
         if initial_bytes:
@@ -187,9 +241,14 @@ class WorkspaceManager:
         live graph produces wrong output with no error.
 
         The activation buffer never contributes to ``grew``, because it never
-        grows — a step that needs more raises instead.
+        grows — a step that needs more raises instead. A previous lease must be
+        closed first: growth is only allowed at a point with no consumer.
         """
         with self._lock:
+            if self._live_lease is not None and not self._live_lease.closed:
+                raise RuntimeError(
+                    "a workspace lease is still live; release it before preparing the next step"
+                )
             by_owner: dict[MemoryOwner, list[WorkspaceRequest]] = {o: [] for o in self._arenas}
             seen: set[str] = set()
             for request in plan.workspaces:
@@ -219,12 +278,22 @@ class WorkspaceManager:
 
             self._num_steps += 1
             used = sum(a.used_bytes for a in self._arenas.values())
-            return WorkspaceLease(regions, generation, used), grew
+            lease = WorkspaceLease(regions, generation, used, manager=self)
+            self._live_lease = lease
+            return lease, grew
+
+    def _release(self, lease: WorkspaceLease) -> None:
+        """Drop a closed lease so a later prepare may reset/grow the arenas."""
+        with self._lock:
+            if self._live_lease is lease:
+                self._live_lease = None
 
     # ── introspection ────────────────────────────────────────────────────────
 
     def close(self) -> None:
         with self._lock:
+            if self._live_lease is not None and not self._live_lease.closed:
+                raise RuntimeError("cannot close the workspace while a lease is still live")
             for arena in self._arenas.values():
                 arena.close()
 
@@ -236,6 +305,16 @@ class WorkspaceManager:
     @property
     def activation_capacity_bytes(self) -> int:
         return self._arenas[MemoryOwner.ACTIVATION].capacity_bytes
+
+    @property
+    def workspace_generation(self) -> int:
+        """Arena generation of the workspace buffer; bumps on every move."""
+        return self._arenas[MemoryOwner.WORKSPACE].generation
+
+    @property
+    def activation_generation(self) -> int:
+        """Arena generation of the fixed activation buffer."""
+        return self._arenas[MemoryOwner.ACTIVATION].generation
 
     def stats_for(self, owner: MemoryOwner) -> WorkspaceStats:
         with self._lock:
@@ -290,6 +369,7 @@ class _OwnedBuffer:
         "_allocator",
         "_arena",
         "_capacity",
+        "_ceiling",
         "_high_water",
         "_may_grow",
         "_num_growths",
@@ -297,10 +377,20 @@ class _OwnedBuffer:
         "_region",
     )
 
-    def __init__(self, allocator: CachingAllocator, owner: MemoryOwner, *, may_grow: bool) -> None:
+    def __init__(
+        self,
+        allocator: CachingAllocator,
+        owner: MemoryOwner,
+        *,
+        may_grow: bool,
+        ceiling_bytes: int | None = None,
+    ) -> None:
+        if ceiling_bytes is not None and ceiling_bytes < 0:
+            raise ValueError("ceiling_bytes must be non-negative")
         self._allocator = allocator
         self._owner = owner
         self._may_grow = may_grow
+        self._ceiling = ceiling_bytes
         self._region: MemoryRegion | None = None
         self._arena: Arena | None = None
         self._capacity = 0
@@ -324,19 +414,28 @@ class _OwnedBuffer:
                 "computed from that figure and cannot be revised now — the profiling "
                 "step did not reach the real worst case."
             )
-        self.grow_to(required)
+        if self._ceiling is not None and required > self._ceiling:
+            raise WorkspaceCeilingError(
+                f"step needs {required} bytes of {self._owner.value} but the frozen "
+                f"ceiling is {self._ceiling}; growth is refused so the KV budget "
+                "computed at bootstrap stays valid. Rebuild with a larger budget."
+            )
+        self.grow_to(required, cap=self._ceiling)
         return True
 
-    def grow_to(self, required: int, *, floor: int = 0) -> None:
+    def grow_to(self, required: int, *, floor: int = 0, cap: int | None = None) -> None:
         # Grow in 2 MiB units with 50% slack. The slack buys a few steps of
         # headroom, which matters because every growth invalidates graphs — and
         # re-capturing them costs far more than the wasted bytes.
         #
         # The non-growable buffer takes this path exactly once, from
         # initialize(), and passes floor=required so it gets what was profiled
-        # plus rounding rather than 50% it will never use.
+        # plus rounding rather than 50% it will never use. ``cap`` is the frozen
+        # ceiling: the allocation never exceeds it, even to satisfy rounding.
         target = max(required if floor else required + required // 2, floor, 2 << 20)
         target = (target + (2 << 20) - 1) // (2 << 20) * (2 << 20)
+        if cap is not None:
+            target = max(required, min(target, cap))
         new_region = self._allocator.allocate(target, owner=self._owner)
         old = self._region
         self._region = new_region

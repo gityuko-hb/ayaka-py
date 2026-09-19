@@ -34,15 +34,13 @@ class ReservationResult:
     ``ReservationFailure`` codes so the scheduler can react without page
     internals. ``required_pages`` is the number of new pages the append needs
     (regardless of success); ``allocated_pages`` counts only pages actually
-    handed out. ``attached_prefix_tokens`` reports how many leading tokens came
-    from a reused cache prefix.
+    handed out.
     """
 
     ok: bool
     handle: KVReservationHandle | None
     required_pages: int
     allocated_pages: int
-    attached_prefix_tokens: int = 0
     reason: ReservationFailure | None = None
 
     @classmethod
@@ -52,7 +50,6 @@ class ReservationResult:
         *,
         required_pages: int,
         allocated_pages: int,
-        attached_prefix_tokens: int = 0,
     ) -> ReservationResult:
         """Build a success result carrying the opaque reservation handle."""
         return cls(
@@ -60,7 +57,6 @@ class ReservationResult:
             handle=handle,
             required_pages=required_pages,
             allocated_pages=allocated_pages,
-            attached_prefix_tokens=attached_prefix_tokens,
         )
 
     @classmethod
@@ -86,8 +82,10 @@ class ReservationRecord:
 
     Captures the sequence version/length at planning time (the rollback
     baseline), the tentative page table, the pages newly allocated as
-    ``RESERVED``, prefix pages tentatively acquired, and the write-slot map the
-    batch builder will materialize into kernel-facing metadata.
+    ``RESERVED``, and the write-slot map the batch builder will materialize
+    into kernel-facing metadata. Cached prefix pages are already committed
+    request ownership before a reservation is planned, so no prefix field
+    exists here.
     """
 
     handle: KVReservationHandle
@@ -96,16 +94,12 @@ class ReservationRecord:
     """Sequence version at planning time; must be unchanged to execute."""
     base_committed_tokens: int
     """Committed token count before the append; a successful step advances it."""
-    attached_prefix_tokens: int
-    """Leading tokens served by the cache; execution_base_tokens includes them."""
     num_new_tokens: int
     """Tokens the step will write; A1 requires all of them to be written."""
     planned_page_table: tuple[PageTableEntry, ...]
     """Full planned table: existing committed entries plus new pages."""
     allocated_pages: tuple[KVPageHandle, ...]
     """Newly reserved pages; rolled back, committed, or abandoned with the step."""
-    acquired_prefix_pages: tuple[KVPageHandle, ...]
-    """Tentative request refs on cache pages; released on rollback/failure."""
     committed: bool = field(default=False, init=False)
     """Whether tentative refs have transferred into committed sequence tables."""
     write_slots: tuple[KVWriteSlot, ...]
@@ -116,7 +110,7 @@ class ReservationRecord:
     @property
     def execution_base_tokens(self) -> int:
         """Attention-visible start position for this step's writes."""
-        return self.base_committed_tokens + self.attached_prefix_tokens
+        return self.base_committed_tokens
 
     @property
     def touched_pages(self) -> tuple[KVPageHandle, ...]:
