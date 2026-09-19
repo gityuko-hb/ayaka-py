@@ -117,6 +117,17 @@ class InvalidStateTransitionError(RuntimeMemoryError):
     """
 
 
+class PrefixCapabilityStaleError(InvalidStateTransitionError):
+    """A borrowed prefix capability no longer matches the canonical store.
+
+    Raised by revalidation when the cache incarnation, entry identity,
+    context, token identity, or chain geometry disagree with the store's
+    current state. ``acquire`` maps this to a clean miss. Allocator faults
+    during reference acquisition raise their own types and propagate, so an
+    invariant violation is never masked as an empty match.
+    """
+
+
 class InvariantViolationError(RuntimeMemoryError):
     """An internal accounting or ownership invariant was violated.
 
