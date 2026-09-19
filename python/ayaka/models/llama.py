@@ -150,6 +150,16 @@ class LlamaConfig(ModelConfigMixin):
         return self.attention_bias or self.bias
 
     @property
+    def qkv_bias_enabled(self) -> bool:
+        """Bias on the q/k/v projections."""
+        return self.attention_bias_enabled
+
+    @property
+    def o_bias_enabled(self) -> bool:
+        """Bias on the o projection; llama ties it to the qkv bias."""
+        return self.attention_bias_enabled
+
+    @property
     def scaling(self) -> float:
         return self.resolved_head_dim**-0.5
 
@@ -188,13 +198,14 @@ def llama_expected_weights(
             spec(f"{prefix}.mlp.up_proj.weight", (inner, hidden)),
             spec(f"{prefix}.mlp.down_proj.weight", (hidden, inner)),
         ]
-        if config.attention_bias_enabled:
+        if config.qkv_bias_enabled:
             specs += [
                 spec(f"{prefix}.self_attn.q_proj.bias", (q_width,)),
                 spec(f"{prefix}.self_attn.k_proj.bias", (kv_width,)),
                 spec(f"{prefix}.self_attn.v_proj.bias", (kv_width,)),
-                spec(f"{prefix}.self_attn.o_proj.bias", (hidden,)),
             ]
+        if config.o_bias_enabled:
+            specs.append(spec(f"{prefix}.self_attn.o_proj.bias", (hidden,)))
         if config.mlp_bias:
             specs += [
                 spec(f"{prefix}.mlp.gate_proj.bias", (inner,)),
@@ -255,7 +266,7 @@ def llama_weight_bindings(config: LlamaConfig) -> dict[str, WeightBinding]:
                 f"{prefix}.mlp.down_proj.weight": WeightBinding(f"{prefix}.mlp.down_proj.weight"),
             }
         )
-        if config.attention_bias_enabled:
+        if config.qkv_bias_enabled:
             bindings.update(
                 {
                     f"{prefix}.self_attn.q_proj.bias": WeightBinding(
@@ -267,10 +278,11 @@ def llama_weight_bindings(config: LlamaConfig) -> dict[str, WeightBinding]:
                     f"{prefix}.self_attn.v_proj.bias": WeightBinding(
                         f"{prefix}.self_attn.qkv_proj.bias", "v"
                     ),
-                    f"{prefix}.self_attn.o_proj.bias": WeightBinding(
-                        f"{prefix}.self_attn.o_proj.bias"
-                    ),
                 }
+            )
+        if config.o_bias_enabled:
+            bindings[f"{prefix}.self_attn.o_proj.bias"] = WeightBinding(
+                f"{prefix}.self_attn.o_proj.bias"
             )
         if config.mlp_bias:
             bindings.update(
@@ -323,7 +335,7 @@ def llama_weight_mapping(config: LlamaConfig) -> ExternMapping:
             func=lambda gate, up: torch.cat([gate, up], dim=0),
         )
         mapping.add_mapping(f"{prefix}.mlp.down_proj.weight", f"{prefix}.mlp.down_proj.weight")
-        if config.attention_bias_enabled:
+        if config.qkv_bias_enabled:
             mapping.add_mapping(
                 f"{prefix}.self_attn.qkv_proj.bias",
                 [
@@ -333,6 +345,7 @@ def llama_weight_mapping(config: LlamaConfig) -> ExternMapping:
                 ],
                 func=lambda q, k, v: torch.cat([q, k, v], dim=0),
             )
+        if config.o_bias_enabled:
             mapping.add_mapping(
                 f"{prefix}.self_attn.o_proj.bias", f"{prefix}.self_attn.o_proj.bias"
             )
@@ -414,13 +427,12 @@ class _LlamaAttention(nn.Module):
         self.head_dim = config.resolved_head_dim
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_kv_heads
-        bias = config.attention_bias_enabled
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=bias,
+            bias=config.qkv_bias_enabled,
             params_dtype=dtype,
             return_bias=False,
             quant_config=quant_config,
@@ -430,7 +442,7 @@ class _LlamaAttention(nn.Module):
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
-            bias=bias,
+            bias=config.o_bias_enabled,
             params_dtype=dtype,
             return_bias=False,
             quant_config=quant_config,

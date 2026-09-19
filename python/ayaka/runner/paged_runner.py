@@ -28,6 +28,7 @@ from ayaka.plan import GraphMode
 from ayaka.request.lifecycle import RequestLifecycle
 from ayaka.request.schema import Request
 from ayaka.runner.model_runner import ModelRunner
+from ayaka.runner.paged_inputs import PagedGroupBinding, validate_paged_inputs
 from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sched.plan import PreparedStep
 from ayaka.types import AttentionType, ForwardMode, KVCacheDtype, KVLayoutKind, MaskKind
@@ -123,6 +124,21 @@ class ReferencePagedAttention(BaseAttentionBackend):
         return result
 
 
+@dataclass(frozen=True, slots=True)
+class PagedForwardTrace:
+    """Host-only record of one model invocation, not a completion/commit proof.
+
+    Query ranges follow packed request order. Failed model invocations count;
+    dense oracle and startup profiling do not pass through this boundary.
+    """
+
+    step_id: int
+    request_ids: tuple[str, ...]
+    query_ranges: tuple[tuple[int, int], ...]
+    sampling_rows: tuple[int, ...]
+    num_tokens: int
+
+
 class PagedModelRunner(ModelRunner):
     """Forward every scheduled query against resident KV, then sample last rows.
 
@@ -148,7 +164,11 @@ class PagedModelRunner(ModelRunner):
             raise ValueError("attention groups must exactly match logical KV groups")
         parameter = next(model.parameters())
         self.device = parameter.device
-        self.kv = kv
+        self.dtype = parameter.dtype
+        self._bindings: dict[str, PagedGroupBinding] = {}
+        self.forward_calls = 0
+        self.forward_tokens = 0
+        self.forward_observer: Callable[[PagedForwardTrace], None] | None = None
         self.backends: dict[str, BaseAttentionBackend] = {}
         self.builders: dict[str, BaseAttentionMetadataBuilder] = {}
         self.layers: dict[int, tuple[str, int]] = {}
@@ -199,6 +219,7 @@ class PagedModelRunner(ModelRunner):
                 implementation = FlashInferBackend(group, cache, self.device)
             self.backends[name] = implementation
             self.builders[name] = implementation.build_metadata_builder()
+            self._bindings[name] = PagedGroupBinding(group, cache.storage.spec)
         if set(self.layers) != set(range(model.config.num_hidden_layers)):
             raise ValueError("every model layer must have one attention group")
 
@@ -222,6 +243,8 @@ class PagedModelRunner(ModelRunner):
         """Validate model features before scheduler admission."""
         if str(request.request_id) in self._request_ir:
             raise ValueError("duplicate runner request")
+        if request.sampling.prompt_logprobs is not None:
+            raise ValueError("paged prompt logprobs require chunk-boundary hidden-state carry")
         if request.multimodal:
             for embedding in request.multimodal:
                 if any(len(row) != self._model.config.hidden_size for row in embedding.rows):
@@ -337,16 +360,25 @@ class PagedModelRunner(ModelRunner):
             mode=mode,
         )
 
-    def _forward_prepared(self, prepared: PreparedStep):
+    def _validate_prepared(self, prepared: PreparedStep) -> None:
         if self._closed:
             raise RuntimeError("paged runner is closed")
         prepared.validate()
         # The executor validated allocator generations before marking IN_FLIGHT.
+        compute = prepared.execution.compute
+        if compute.dtype.torch_dtype != self.dtype or compute.kv_dtype.torch_dtype != self.dtype:
+            raise ValueError("execution dtype disagrees with model/KV binding")
+        if compute.layer_range != (0, self._model.config.num_hidden_layers):
+            raise ValueError("execution layer range disagrees with model binding")
         step = prepared.step
         if step.graph.mode is not GraphMode.EAGER:
             raise ValueError("paged serving runner currently requires eager execution")
         if step.prompt_logprobs:
             raise ValueError("paged prompt logprobs require chunk-boundary hidden-state carry")
+        validate_paged_inputs(prepared, self._bindings, self._model.config.max_position_embeddings)
+
+    def _forward_prepared(self, prepared: PreparedStep):
+        step = prepared.step
         metadata = {
             name: builder.build(self._common(prepared, name))
             for name, builder in self.builders.items()
@@ -360,6 +392,18 @@ class PagedModelRunner(ModelRunner):
         positions = torch.tensor(step.positions, dtype=torch.long, device=self.device)
         with torch.inference_mode():
             embeddings = self._embeddings(step, tokens)
+            if self.forward_observer is not None:
+                self.forward_observer(
+                    PagedForwardTrace(
+                        step.step_id,
+                        step.request_order,
+                        tuple((s.query_start, s.query_end) for s in step.slices),
+                        step.sampling_rows,
+                        tokens.numel(),
+                    )
+                )
+            self.forward_calls += 1
+            self.forward_tokens += tokens.numel()
             if embeddings is None:
                 hidden = self._model.forward_hidden(tokens, positions, attention)
             else:
@@ -373,4 +417,9 @@ class PagedModelRunner(ModelRunner):
         for request_id in tuple(self._request_ir):
             self.forget_request(request_id)
         self._request_source = None
+        self.forward_observer = None
+        # Attention backends hold views into the KV slab; dropping them here is
+        # what lets a runtime resize release the old storage deterministically.
+        self.backends.clear()
+        self.builders.clear()
         self._closed = True

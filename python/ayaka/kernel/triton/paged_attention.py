@@ -561,9 +561,17 @@ def _paged_attention_split_kv_kernel(
             new_running_max = tl.maximum(tl.max(scores, axis=1), running_max)
             rescale_factor = tl.exp(running_max - new_running_max)
             attention_weights = tl.exp(scores - new_running_max[:, None])
-            accumulator = accumulator * rescale_factor[:, None] + tl.dot(
-                attention_weights.to(value.dtype), value
-            )
+            rounded_weights = attention_weights.to(value.dtype)
+            weighted_values = tl.dot(rounded_weights, value)
+            if value.dtype == tl.bfloat16:
+                # Keep the numerator consistent with the FP32 denominator.
+                # BF16 probability rounding alone can bias every output channel;
+                # carry its residual in a second tensor-core product.
+                residual_weights = (attention_weights - rounded_weights.to(tl.float32)).to(
+                    value.dtype
+                )
+                weighted_values += tl.dot(residual_weights, value)
+            accumulator = accumulator * rescale_factor[:, None] + weighted_values
             running_sum = running_sum * rescale_factor + tl.sum(attention_weights, axis=1)
             running_max = new_running_max
 

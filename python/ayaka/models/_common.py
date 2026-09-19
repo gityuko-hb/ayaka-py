@@ -80,6 +80,9 @@ class ModelConfigMixin:
     def _normalize_config(cls, values: Mapping[str, Any]) -> dict[str, Any]:
         normalized: dict[str, Any] = {}
         for key, value in values.items():
+            if key == "dtype" and "torch_dtype" not in values:
+                # HF saves the checkpoint dtype as "dtype" from 5.x on.
+                key = "torch_dtype"
             if key == "rope_parameters" and isinstance(value, Mapping):
                 theta = value.get("rope_theta")
                 if theta is not None:

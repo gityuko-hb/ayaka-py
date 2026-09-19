@@ -135,6 +135,7 @@ class ModelRunner:
         self._ban_applier.apply(logits, bans)
 
     def __call__(self, prepared: PreparedStep) -> SampleOutputs:
+        self._validate_prepared(prepared)
         step = prepared.step
         plan = step.sampling
         self._coordinator.flush()
@@ -197,7 +198,7 @@ class ModelRunner:
                     prompt_ks,
                 )
         else:
-            token_ids = torch.empty(0, dtype=torch.long)
+            token_ids = torch.empty(0, dtype=torch.long, device=hidden_packed.device)
             ids_logprobs, ids_rows, ids_counts = None, (), ()
 
         return SampleOutputs(
@@ -250,6 +251,10 @@ class ModelRunner:
         return _GenerationReport(
             raw=tuple(raw), sampling=tuple(sampling), ids=tuple(ids), ids_raw_count=ids_raw_count
         )
+
+    def _validate_prepared(self, prepared: PreparedStep) -> None:
+        """Validate host contracts before even flushing sampling device updates."""
+        prepared.validate()
 
     def _forward_prepared(self, prepared: PreparedStep):
         """Forward hook for runners consuming execution-lease KV addresses."""
