@@ -28,6 +28,7 @@ from ayaka.exceptions import (
     InvalidHandleError,
     InvalidStateTransitionError,
     InvariantViolationError,
+    PrefixCapabilityStaleError,
     SequenceBusyError,
     StorageUnavailableError,
 )
@@ -36,7 +37,6 @@ from ayaka.handles import (
     KVReservationHandle,
     MemoryTransactionHandle,
     PrefixHandle,
-    PrefixMatchHandle,
     SequenceHandle,
     StepMemoryLeaseHandle,
 )
@@ -83,12 +83,8 @@ from ayaka.memory.views import (
     SequenceCacheView,
     SequenceExecutionView,
 )
-from ayaka.prefix.identity import (
-    PrefixBlockIdentity,
-    PrefixCacheContext,
-    build_prefix_block_identities,
-)
-from ayaka.prefix.interface import CachedBlockInfo, PrefixLookupResult, PrefixMatch
+from ayaka.prefix.identity import PrefixBlockIdentity, PrefixCacheContext
+from ayaka.prefix.interface import CachedBlockInfo, PrefixMatch, ValidResume
 from ayaka.prefix.store import RadixPagePrefixCache
 from ayaka.utils.validation import require_int
 
@@ -151,13 +147,11 @@ class RuntimeMemoryManager:
         self._transactions: dict[int, TransactionRecord] = {}
         self._reservations: dict[int, ReservationRecord] = {}
         self._leases: dict[int, LeaseRecord] = {}
-        self._prefix_matches: dict[int, tuple[PrefixMatchHandle, PrefixMatch]] = {}
         # Index counters are monotonic; generation stays 1 because handles are
         # never recycled while live (the dict entries are the source of truth).
         self._next_transaction_index = 0
         self._next_reservation_index = 0
         self._next_lease_index = 0
-        self._next_prefix_match_index = 0
         self._kv_prefix_evictions_total = 0
         self._pressure_reclaim_attempts_total = 0
         self._pressure_reclaim_progress_total = 0
@@ -456,6 +450,100 @@ class RuntimeMemoryManager:
             finally:
                 self.unpin_prefix(entries)
 
+    def cache_resume(
+        self, sequence: SequenceHandle, token_ids: Sequence[int], *, context: PrefixCacheContext
+    ) -> ValidResume | None:
+        """Publish only retired, committed resident KV, including a partial tail.
+
+        This uses the same canonical cache refs, pressure eviction and accounting
+        as complete-page caching. Tiered checkpoint restore is a separate policy.
+        """
+        with self._lock:
+            if self.tiering_enabled:
+                raise ValueError("partial resume requires resident KV")
+            state = self.get_sequence(sequence)
+            if (
+                state.busy
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("prefix producer has not retired successfully")
+            tokens = tuple(token_ids)
+            if len(tokens) > state.committed_tokens:
+                raise ValueError("prefix exceeds completed KV")
+            entries = state.page_table[: ceil(len(tokens) / self.page_size)]
+            return self.prefix_cache.insert_resume(
+                tokens, tuple(e.page for e in entries), context=context
+            )
+
+    def attach_resume(self, sequence: SequenceHandle, match: ValidResume) -> int:
+        """Acquire canonical cache refs as request ownership before publishing progress.
+
+        A capability that revalidates cleanly but cannot fit the sequence limit
+        raises ``PrefixCapabilityStaleError`` so ``acquire`` reports a miss.
+        Sequence-state violations (busy, non-empty, stale) propagate: they are
+        caller bugs, not cache misses.
+        """
+        with self._lock, self.sequences.mutate(sequence) as state:
+            if state.committed_tokens or state.page_table.entries:
+                raise InvalidStateTransitionError("resume requires an empty sequence")
+            if (
+                state.pending_transaction_index is not None
+                or state.active_lease_index is not None
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("resume requires an idle sequence")
+            if (
+                self.max_sequence_tokens is not None
+                and match.logical_position > self.max_sequence_tokens
+            ):
+                raise PrefixCapabilityStaleError("resume exceeds sequence limit")
+            entries = self.prefix_cache.acquire_resume(match)
+            state.page_table.entries = list(entries)
+            state.committed_tokens = match.logical_position
+            state.version += 1
+            return match.logical_position
+
+    def privatize_prefix_tail(self, sequence: SequenceHandle) -> bool:
+        """Relinquish cache-only sharing when COW cannot fit in resident capacity.
+
+        A sole idle request can take exclusive ownership of its truncated tail.
+        Evict every canonical path using that page before narrowing physical
+        validity to the request boundary. Pins and in-flight readers forbid this
+        optimization. No committed request token, version or device byte changes.
+        """
+        with self._lock:
+            if self.tiering_enabled:
+                return False
+            state = self.get_sequence(sequence)
+            if (
+                state.busy
+                or state.release_requested
+                or not state.page_table
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                return False
+            tail = state.page_table[-1]
+            meta = self.allocator.get_meta(tail.page)
+            if (
+                tail.valid_tokens == self.page_size
+                or meta.request_refs != 1
+                or meta.cache_refs == 0
+                or meta.pin_refs
+                or meta.inflight_refs
+                or meta.reservation_refs
+            ):
+                return False
+            released = self.prefix_cache.evict_page(tail.page, safe_epoch=self.current_epoch)
+            # All cache refs on this physical generation must have canonical owners.
+            if not self.allocator.get_meta(tail.page).can_mutate:
+                raise InvariantViolationError("prefix tail still has another durable owner")
+            self.allocator.set_valid_tokens(tail.page, tail.valid_tokens)
+            self._kv_prefix_evictions_total += released
+            self.allocator.reclaim_completed()
+            return True
+
     def cache_prefix(
         self,
         sequence: SequenceHandle,
@@ -524,132 +612,12 @@ class RuntimeMemoryManager:
     ) -> PrefixMatch:
         """Return the longest compatible complete-page prefix.
 
-        Internal (non-scheduler) matching API that exposes the raw page chain
-        for manager-internal use; the scheduler-facing path is
-        :meth:`lookup_prefix`.
+        Full-page matching primitive retained with its original semantics;
+        policy (lookup, attachment, resume) lives in
+        :class:`~ayaka.prefix.service.PrefixService` above this manager.
         """
         with self._lock:
             return self.prefix_cache.match(token_ids, context=context)
-
-    def lookup_prefix(
-        self,
-        token_ids: Sequence[int],
-        *,
-        context: PrefixCacheContext,
-        max_matched_tokens: int | None = None,
-    ) -> PrefixLookupResult:
-        """Return logical match information plus a one-shot opaque handle.
-
-        The scheduler never receives the physical page chain. The handle owns
-        no page references: :meth:`try_reserve` must still revalidate the cache
-        entry and acquire tentative request ownership transactionally.
-
-        Args:
-            token_ids: Candidate prompt tokens.
-            context: Compatibility context for the lookup.
-            max_matched_tokens: Optional cap on the searched prefix length.
-
-        Returns:
-            The matched token count plus an opaque, one-shot handle (empty when
-            nothing matched).
-        """
-
-        if max_matched_tokens is not None:
-            if not isinstance(max_matched_tokens, int) or isinstance(
-                max_matched_tokens,
-                bool,
-            ):
-                raise TypeError("max_matched_tokens must be an integer or None")
-            if max_matched_tokens < 0:
-                raise ValueError("max_matched_tokens must be non-negative")
-        normalized = tuple(token_ids)
-        # Cap the search window before hashing to bound work.
-        searchable = normalized if max_matched_tokens is None else normalized[:max_matched_tokens]
-        with self._lock:
-            match = self.prefix_cache.match(searchable, context=context)
-            self._request_promotions_locked(searchable, match, context=context)
-            if match.matched_tokens == 0:
-                return PrefixLookupResult.empty()
-            handle = PrefixMatchHandle(
-                index=self._next_prefix_match_index,
-                generation=1,
-            )
-            self._next_prefix_match_index += 1
-            self._prefix_matches[handle.index] = (handle, match)
-            return PrefixLookupResult(
-                matched_tokens=match.matched_tokens,
-                handle=handle,
-            )
-
-    def discard_prefix_match(self, handle: PrefixMatchHandle) -> None:
-        """Discard an unused lookup capability without changing page refs.
-
-        The scheduler calls this when a prefix match is not used by any
-        reservation, keeping the pending-match registry tidy.
-
-        Raises:
-            InvalidHandleError: if the handle is stale.
-        """
-
-        if not isinstance(handle, PrefixMatchHandle):
-            raise TypeError("handle must be a PrefixMatchHandle")
-        with self._lock:
-            stored = self._prefix_matches.get(handle.index)
-            if stored is None or stored[0] != handle:
-                raise InvalidHandleError(f"stale prefix-match handle: {handle}")
-            self._prefix_matches.pop(handle.index)
-
-    def attach_prefix(
-        self,
-        sequence: SequenceHandle,
-        match: PrefixMatch,
-    ) -> int:
-        """Attach a revalidated cache match to an empty sequence.
-
-        Converts cache-page request refs into committed page-table entries so
-        an already-cached prompt does not need recomputation.
-
-        Args:
-            sequence: A live, empty, idle sequence.
-            match: A revalidated cache match.
-
-        Returns:
-            The number of tokens attached.
-
-        Raises:
-            InvalidStateTransitionError: if the sequence is not empty.
-            SequenceBusyError: if the sequence is busy or blocked.
-        """
-
-        with self._lock, self.sequences.mutate(sequence) as state:
-            if state.committed_tokens or state.page_table.entries:
-                raise InvalidStateTransitionError(
-                    "a cached prefix can only attach to an empty sequence"
-                )
-            if (
-                state.pending_transaction_index is not None
-                or state.active_lease_index is not None
-                or state.release_requested
-                or state.blocked_until_epoch > self.current_epoch
-            ):
-                raise SequenceBusyError("cannot attach a prefix to a busy sequence")
-            if (
-                self.max_sequence_tokens is not None
-                and match.matched_tokens > self.max_sequence_tokens
-            ):
-                raise InvalidStateTransitionError(
-                    "cached prefix exceeds the configured sequence limit"
-                )
-
-            pages = self.prefix_cache.acquire_match(match)
-            if not pages:
-                return 0
-            state.page_table.entries = [
-                PageTableEntry(page=page, valid_tokens=self.page_size) for page in pages
-            ]
-            state.committed_tokens = match.matched_tokens
-            state.version += 1
-            return match.matched_tokens
 
     def release_prefix(
         self,
@@ -920,42 +888,6 @@ class RuntimeMemoryManager:
         if self._tier is not None:
             self._tier.reconcile(self.prefix_cache.cached_block_index())
 
-    def _request_promotions_locked(
-        self,
-        token_ids: tuple[int, ...],
-        match: PrefixMatch,
-        *,
-        context: PrefixCacheContext,
-    ) -> int:
-        """Start pulling back the host blocks that would extend a match.
-
-        This is the whole of A11-07 on the read path: a lookup reports only
-        what is device resident right now, and promotion happens in the
-        background. The scheduler sees a prefix that grows over subsequent
-        lookups, expressed purely through ``matched_tokens`` -- no tier state,
-        no placement, and no new failure mode.
-        """
-
-        if self._tier is None or not self._tier.has_host_blocks:
-            # Rebuilding the identity chain re-hashes the whole prefix, which
-            # the match already did; skip it entirely while the host tier holds
-            # nothing to promote.
-            return 0
-        identities = build_prefix_block_identities(
-            token_ids,
-            page_size=self.page_size,
-            context=context,
-        )
-        matched_blocks = match.matched_tokens // self.page_size
-        if matched_blocks >= len(identities):
-            return 0
-        started = 0
-        for identity in self._tier.host_chain_after(identities, start=matched_blocks):
-            if self._tier.begin_promotion(identity) is None:
-                break
-            started += 1
-        return started
-
     def preempt_sequence(
         self,
         sequence: SequenceHandle,
@@ -1068,38 +1000,21 @@ class RuntimeMemoryManager:
         transaction: MemoryTransactionHandle,
         sequence: SequenceHandle,
         num_new_tokens: int,
-        *,
-        prefix_match: PrefixMatchHandle | None = None,
     ) -> ReservationResult:
         """Tentatively reserve append slots without changing committed KV length.
 
-        On success the reservation record holds the planned page table, newly
-        RESERVED pages, and any tentatively acquired prefix refs; nothing is
-        committed until ``prepare_step``/``complete_step``. Failure paths
-        release any tentatively acquired refs so the plan is fully reversible.
-
-        Args:
-            transaction: Open transaction handle.
-            sequence: Sequence to extend.
-            num_new_tokens: Positive token count to plan for.
-            prefix_match: Optional one-shot handle from
-                :meth:`lookup_prefix`; consumed on use.
-
-        Returns:
-            Success (with opaque reservation handle) or a structured failure.
+        On success the reservation record holds the planned page table and the
+        newly RESERVED pages; nothing is committed until
+        ``prepare_step``/``complete_step``. Failure paths roll back so the plan
+        is fully reversible. Cached prefix attachment happens before
+        reservation through :meth:`attach_resume`, not here.
         """
 
         with self._lock:
             tx = self._get_transaction(transaction)
             LifecycleTransitions.require_open(tx)
-            # Cheap argument validation comes first: consuming the one-shot
-            # prefix handle on a rejection that has nothing to do with the
-            # cache would destroy a match the caller could still have used.
             if num_new_tokens <= 0:
                 return ReservationResult.failure(ReservationFailure.INVALID_TOKEN_COUNT)
-            match = self._consume_prefix_match_locked(prefix_match)
-            if prefix_match is not None and match is None:
-                return ReservationResult.failure(ReservationFailure.PREFIX_NOT_RESIDENT)
 
             # Hold the arena lock across the whole plan: resolving the handle
             # and reserving against it must observe one consistent sequence.
@@ -1120,24 +1035,12 @@ class RuntimeMemoryManager:
                 ):
                     return ReservationResult.failure(ReservationFailure.SEQUENCE_BUSY)
 
-                attached_prefix_tokens = 0 if match is None else match.matched_tokens
-                # A cache prefix may only attach to an empty sequence: committed
-                # pages and cache pages would otherwise share the same positions.
-                if match is not None and (
-                    state.committed_tokens
-                    or state.page_table.entries
-                    or match.page_size != self.page_size
-                ):
-                    return ReservationResult.failure(ReservationFailure.PREFIX_NOT_RESIDENT)
-
-                execution_base_tokens = state.committed_tokens + attached_prefix_tokens
+                execution_base_tokens = state.committed_tokens
                 final_tokens = execution_base_tokens + num_new_tokens
                 usable_pages = self.allocator.snapshot().usable_pages
                 # ceil(final / page_size) - existing blocks = pages to allocate.
                 required_total_pages = ceil(final_tokens / self.page_size)
-                existing_page_count = len(state.page_table.entries) + (
-                    attached_prefix_tokens // self.page_size
-                )
+                existing_page_count = len(state.page_table.entries)
                 required_new_pages = required_total_pages - existing_page_count
                 old_entries = state.page_table.snapshot()
                 cow_tail = bool(
@@ -1159,38 +1062,14 @@ class RuntimeMemoryManager:
                         required_pages=max(0, required_new_pages),
                     )
 
-                acquired_prefix_pages: tuple[KVPageHandle, ...] = ()
-                if match is not None:
-                    try:
-                        acquired_prefix_pages = self.prefix_cache.acquire_match(match)
-                    except (
-                        InvalidHandleError,
-                        InvalidStateTransitionError,
-                        InvariantViolationError,
-                    ):
-                        # The chain vanished or changed between lookup and use.
-                        return ReservationResult.failure(
-                            ReservationFailure.PREFIX_NOT_RESIDENT,
-                        )
-                    if len(acquired_prefix_pages) * self.page_size != attached_prefix_tokens:
-                        self._release_tentative_prefix_pages(acquired_prefix_pages)
-                        raise InvariantViolationError(
-                            "acquired prefix pages do not match the logical prefix length"
-                        )
-
                 allocated = self.allocator.allocate(max(0, required_new_pages))
                 if allocated is None:
-                    self._release_tentative_prefix_pages(acquired_prefix_pages)
                     return ReservationResult.failure(
                         ReservationFailure.NO_CAPACITY,
                         required_pages=max(0, required_new_pages),
                     )
 
                 try:
-                    prefix_entries = tuple(
-                        PageTableEntry(page=page, valid_tokens=self.page_size)
-                        for page in acquired_prefix_pages
-                    )
                     # Plan the full post-append table; the committed table is
                     # unchanged until execution succeeds.
                     copies = ()
@@ -1203,14 +1082,13 @@ class RuntimeMemoryManager:
                         )
                         append_pages = allocated[1:]
                     planned_table, write_slots = self._plan_append(
-                        old_entries + prefix_entries,
+                        old_entries,
                         append_pages,
                         base_committed_tokens=execution_base_tokens,
                         num_new_tokens=num_new_tokens,
                     )
                 except Exception:
                     self.allocator.rollback_reserved(allocated)
-                    self._release_tentative_prefix_pages(acquired_prefix_pages)
                     raise
 
                 index = self._next_reservation_index
@@ -1225,11 +1103,9 @@ class RuntimeMemoryManager:
                     sequence=sequence,
                     base_sequence_version=state.version,
                     base_committed_tokens=state.committed_tokens,
-                    attached_prefix_tokens=attached_prefix_tokens,
                     num_new_tokens=num_new_tokens,
                     planned_page_table=planned_table,
                     allocated_pages=allocated,
-                    acquired_prefix_pages=acquired_prefix_pages,
                     write_slots=write_slots,
                     copies=copies,
                 )
@@ -1241,7 +1117,6 @@ class RuntimeMemoryManager:
                     reservation_handle,
                     required_pages=max(0, required_new_pages),
                     allocated_pages=len(allocated),
-                    attached_prefix_tokens=attached_prefix_tokens,
                 )
 
     def rollback_transaction(self, transaction: MemoryTransactionHandle) -> None:
@@ -1485,7 +1360,6 @@ class RuntimeMemoryManager:
             records = [self._get_reservation(handle) for handle in lease.reservation_handles]
             for record in records:
                 self.allocator.rollback_reserved(record.allocated_pages)
-                self._release_tentative_prefix_pages(record.acquired_prefix_pages)
                 with self.sequences.mutate(record.sequence) as state:
                     state.active_lease_index = None
             LifecycleTransitions.transition_lease(
@@ -1527,11 +1401,6 @@ class RuntimeMemoryManager:
 
             # Partially written bytes cannot be trusted: defer, do not reuse.
             self.allocator.abandon_reserved(new_pages, safe_epoch=safe_epoch)
-            for record in records:
-                self._release_tentative_prefix_pages(
-                    record.acquired_prefix_pages,
-                    safe_epoch=safe_epoch,
-                )
             self.allocator.unmark_inflight(touched_pages)
             for record in records:
                 with self.sequences.mutate(record.sequence) as state:
@@ -1662,7 +1531,6 @@ class RuntimeMemoryManager:
                 cached_prefix_blocks=prefix_cache.cached_blocks,
                 cached_prefix_entries=prefix_cache.terminal_entries,
                 cached_prefix_tokens=prefix_cache.cached_tokens,
-                pending_prefix_matches=len(self._prefix_matches),
                 cache_evictable_pages=allocator.evictable_pages,
             )
 
@@ -1723,21 +1591,6 @@ class RuntimeMemoryManager:
                                 "sequence points to a missing active lease"
                             )
 
-            for record in self._reservations.values():
-                if record.attached_prefix_tokens != (
-                    len(record.acquired_prefix_pages) * self.page_size
-                ):
-                    raise InvariantViolationError(
-                        "reservation prefix refs disagree with its logical attachment"
-                    )
-                for page in () if record.committed else record.acquired_prefix_pages:
-                    meta = self.allocator.get_meta(page)
-                    if meta.allocation_state is not PageAllocationState.LIVE:
-                        raise InvariantViolationError(
-                            "tentative prefix ownership refers to a non-live page"
-                        )
-                    sequence_page_refs[page] = sequence_page_refs.get(page, 0) + 1
-
             if self._tier is not None:
                 self._tier.assert_invariants()
                 # A spill in flight holds an ordinary request reference on its
@@ -1766,9 +1619,6 @@ class RuntimeMemoryManager:
                 raise InvariantViolationError(
                     "reservation registry does not match reserved-page accounting"
                 )
-            for index, (match_handle, match) in self._prefix_matches.items():
-                if index != match_handle.index or match.matched_tokens <= 0:
-                    raise InvariantViolationError("invalid scheduler-facing prefix match registry")
             padding = self.allocator.get_meta(self.padding_page)
             if padding.allocation_state is not PageAllocationState.PERMANENT:
                 raise InvariantViolationError("padding page lost permanent ownership")
@@ -1859,7 +1709,6 @@ class RuntimeMemoryManager:
             for reservation_handle in tx.reservation_handles:
                 record = self._get_reservation(reservation_handle)
                 self.allocator.rollback_reserved(record.allocated_pages)
-                self._release_tentative_prefix_pages(record.acquired_prefix_pages)
                 with self.sequences.mutate(record.sequence) as state:
                     if state.pending_transaction_index == tx.handle.index:
                         state.pending_transaction_index = None
@@ -1993,24 +1842,6 @@ class RuntimeMemoryManager:
         if record is None or record.handle != handle:
             raise InvalidHandleError(f"stale transaction handle: {handle}")
         return record
-
-    def _consume_prefix_match_locked(
-        self,
-        handle: PrefixMatchHandle | None,
-    ) -> PrefixMatch | None:
-        """Consume a one-shot prefix-match handle under lock.
-
-        The match is removed from the registry even on failure so it cannot be
-        replayed; a stale or missing handle resolves to None.
-        """
-        if handle is None:
-            return None
-        if not isinstance(handle, PrefixMatchHandle):
-            raise TypeError("prefix_match must be a PrefixMatchHandle or None")
-        stored = self._prefix_matches.pop(handle.index, None)
-        if stored is None or stored[0] != handle:
-            return None
-        return stored[1]
 
     def _release_tentative_prefix_pages(
         self,
