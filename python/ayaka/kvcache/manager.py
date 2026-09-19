@@ -10,16 +10,31 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 from ayaka.exceptions import InvalidHandleError, InvalidStateTransitionError
+from ayaka.handles import KVPageHandle, KVReservationHandle, SequenceHandle, StepMemoryLeaseHandle
 from ayaka.kvcache.grouped_manager import KVCacheGroupManager
 from ayaka.kvcache.materialize import KVStorageLease, KVStoragePin
 from ayaka.kvcache.retention.range import retained_page_range
+from ayaka.memory.capacity import CapacitySnapshot, ResourceGeneration
 from ayaka.memory.ledger import MemoryLedger
 from ayaka.memory.manager import RuntimeMemoryManager
-from ayaka.memory.state import ReservationFailure
-from ayaka.memory.views import ExecutionMemoryView, GroupedExecutionMemoryView
+from ayaka.memory.pressure import MemoryPressureResult, SequencePreemptionResult
+from ayaka.memory.sequence import GroupedSequenceSnapshot, SequenceMemorySnapshot
+from ayaka.memory.state import ReleaseStatus, ReservationFailure
+from ayaka.memory.views import (
+    ExecutionMemoryView,
+    GroupedExecutionMemoryView,
+    GroupedLeakReport,
+    GroupedMemorySnapshot,
+    LeakReport,
+    MemorySnapshot,
+)
+from ayaka.prefix.service import PrefixService
 from ayaka.sched.plan import BatchStepPlan
 
 MemoryView = ExecutionMemoryView | GroupedExecutionMemoryView
+SequenceSnapshotView = SequenceMemorySnapshot | GroupedSequenceSnapshot
+MemorySnapshotView = MemorySnapshot | GroupedMemorySnapshot
+LeakReportView = LeakReport | GroupedLeakReport
 
 
 class KVCapacityError(RuntimeError):
@@ -54,6 +69,8 @@ class LogicalKVManager:
         self.storages = MappingProxyType(dict(storages))
         self._pins: list[KVStoragePin] = []
         self.closed = False
+        self.capacity: CapacitySnapshot | None = None
+        self._prefix_service: PrefixService | None = None
         self._validate_storage_bindings()
         ledgers = {id(lease.ledger) for lease in self.storages.values()}
         if len(ledgers) != 1:
@@ -68,10 +85,169 @@ class LogicalKVManager:
             raise
 
     @property
+    def prefix_service(self) -> PrefixService:
+        """Return the single canonical resident prefix policy for this KV owner."""
+        if self._prefix_service is None:
+            self._prefix_service = PrefixService(self)
+        return self._prefix_service
+
+    @property
     def group_names(self) -> tuple[str, ...]:
         if isinstance(self.backend, KVCacheGroupManager):
             return tuple(group.name for group in self.backend.cache_groups)
         return ("default",)
+
+    @property
+    def fingerprint(self) -> tuple[str, ...]:
+        """Immutable identity of the bound physical slabs.
+
+        Group name, ledger label and geometry; a capacity snapshot must carry
+        exactly this fingerprint before it can be frozen onto this manager.
+        """
+        return tuple(
+            f"{name}:{lease.label}:{lease.storage.spec.capacity_pages}:"
+            f"{lease.storage.spec.page_size}"
+            for name, lease in sorted(self.storages.items())
+        )
+
+    @property
+    def generation(self) -> ResourceGeneration | None:
+        """Frozen resource generation, or None while capacity is unbound."""
+        return None if self.capacity is None else self.capacity.generation
+
+    def bind_capacity(self, snapshot: CapacitySnapshot) -> None:
+        """Freeze one capacity snapshot for this slab set, exactly once."""
+        self._require_open()
+        if self.capacity is not None:
+            raise RuntimeError("capacity is already bound to this logical KV manager")
+        if not isinstance(snapshot, CapacitySnapshot):
+            raise TypeError("snapshot must be a CapacitySnapshot")
+        if snapshot.generation.kv_storage != self.fingerprint:
+            raise ValueError("capacity snapshot does not describe this manager's KV storage")
+        self.capacity = snapshot
+
+    # ------------------------------------------------------------------
+    # public sequence/step boundary
+    #
+    # The runtime adapters (sequence allocator, request preparer, execution
+    # resources, step runtime) own policy and call these verbs. They must not
+    # reach into ``backend`` or its allocator: physical page state, transactions
+    # and deferred reclaim stay behind this facade.
+    # ------------------------------------------------------------------
+
+    def _require_open(self) -> None:
+        if self.closed:
+            raise RuntimeError("logical KV manager is closed")
+
+    def create_sequence(self, request_id: str) -> SequenceHandle:
+        """Allocate a generation-safe sequence identity for admission."""
+        self._require_open()
+        return self.backend.create_sequence(request_id)
+
+    def release_sequence(
+        self, sequence: SequenceHandle, *, safe_epoch: int | None = None
+    ) -> ReleaseStatus:
+        """Drop request ownership now or behind the sequence's active step."""
+        self._require_open()
+        return self.backend.release_sequence(sequence, safe_epoch=safe_epoch)
+
+    def get_sequence(self, sequence: SequenceHandle) -> SequenceSnapshotView:
+        """Return the immutable logical state used for staleness validation."""
+        self._require_open()
+        return self.backend.get_sequence(sequence)
+
+    def preempt_sequence(
+        self, sequence: SequenceHandle, *, safe_epoch: int | None = None
+    ) -> SequencePreemptionResult:
+        """Release request-owned KV while preserving sequence identity."""
+        self._require_open()
+        return self.backend.preempt_sequence(sequence, safe_epoch=safe_epoch)
+
+    @property
+    def current_epoch(self) -> int:
+        """Epoch of the newest completed step, common across groups."""
+        return self.backend.current_epoch
+
+    def advance_epoch(self, completed_epoch: int) -> int:
+        """Publish a completed-step watermark; never regresses."""
+        self._require_open()
+        return self.backend.advance_epoch(completed_epoch)
+
+    def mark_step_in_flight(self, lease: StepMemoryLeaseHandle) -> None:
+        """Acquire transient page ownership before the executor enqueues work."""
+        self._require_open()
+        self.backend.mark_step_in_flight(lease)
+
+    def commit_step(
+        self,
+        lease: StepMemoryLeaseHandle,
+        *,
+        written_tokens: Mapping[KVReservationHandle, int] | None = None,
+    ) -> None:
+        """Publish committed KV only under executor-authored completion proof."""
+        self._require_open()
+        self.backend.commit_step(lease, written_tokens=written_tokens)
+
+    def retire_step(self, lease: StepMemoryLeaseHandle) -> None:
+        """Drop last-use execution ownership after logical settlement."""
+        self._require_open()
+        self.backend.retire_step(lease)
+
+    def abort_prepared_step(self, lease: StepMemoryLeaseHandle) -> None:
+        """Roll back a not-yet-launched step; the caller must still own it."""
+        self._require_open()
+        self.backend.abort_prepared_step(lease)
+
+    def fail_in_flight_step(self, lease: StepMemoryLeaseHandle, *, safe_epoch: int) -> None:
+        """Abandon partially written KV into deferred reclaim until ``safe_epoch``."""
+        self._require_open()
+        self.backend.fail_in_flight_step(lease, safe_epoch=safe_epoch)
+
+    def reclaim_deferred(self) -> MemoryPressureResult:
+        """Reclaim pages whose deferred epoch has completed."""
+        self._require_open()
+        return self.backend.reclaim_deferred()
+
+    def evict_prefixes_for_pressure(self, required_pages: int) -> MemoryPressureResult:
+        """Release cache-only pages under reservation pressure."""
+        self._require_open()
+        return self.backend.evict_prefixes_for_pressure(required_pages)
+
+    def privatize_prefix_tail(self, sequence: SequenceHandle) -> bool:
+        """Relinquish cache sharing on a sole-consumer partial tail.
+
+        Grouped backends have no canonical prefix cache, so there is nothing to
+        privatize and the method reports ``False`` rather than raising.
+        """
+        self._require_open()
+        if isinstance(self.backend, RuntimeMemoryManager):
+            return self.backend.privatize_prefix_tail(sequence)
+        return False
+
+    def clear_prefix_cache(self, *, safe_epoch: int | None = None) -> int:
+        """Teardown-only: drop every resident prefix entry; policy stays in PrefixService."""
+        self._require_open()
+        if isinstance(self.backend, RuntimeMemoryManager):
+            return self.backend.clear_prefix_cache(safe_epoch=safe_epoch)
+        return 0
+
+    def physical_page(self, group_name: str, page: KVPageHandle) -> int:
+        """Resolve a generation-safe page handle to its kernel slot address."""
+        self._require_open()
+        if isinstance(self.backend, KVCacheGroupManager):
+            return self.backend.physical_page(group_name, page)
+        if group_name != "default":
+            raise ValueError(f"homogeneous KV has no group {group_name!r}")
+        return self.backend.allocator.physical_id(page).value
+
+    def snapshot(self) -> MemorySnapshotView:
+        """Capacity accounting for diagnostics and status reporting."""
+        self._require_open()
+        return self.backend.snapshot()
+
+    def leak_report(self) -> LeakReportView:
+        """Deterministic ownership report; ``clean`` gates storage teardown."""
+        return self.backend.leak_report()
 
     def _validate_storage_bindings(self) -> None:
         if self.closed:
@@ -170,9 +346,19 @@ class LogicalKVManager:
             self.backend.validate_execution_view(view)
 
     def close(self) -> None:
-        """Release slab pins only when the logical manager has no remaining owners."""
+        """Close the shared prefix service, then release slab pins when clean.
+
+        The prefix service belongs to this manager: closing it drops cache
+        ownership (after transfers retire) so the leak check can pass. A
+        pending transfer refuses the close; retire it first. Callers then
+        close the storage leases explicitly.
+        """
         if self.closed:
             return
+        if isinstance(self.backend, RuntimeMemoryManager):
+            service = self._prefix_service
+            if service is not None and not service.closed and not service.close():
+                raise RuntimeError("prefix service still has active transfers")
         if not self.backend.leak_report().clean:
             raise RuntimeError("logical KV still owns sequences, cache pages, or execution leases")
         for pin in reversed(self._pins):
