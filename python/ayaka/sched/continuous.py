@@ -141,7 +141,14 @@ class ContinuousScheduler(SchedulerCore):
         self._preemption = preemption
         self._decode_first = bool(decode_first)
         self._allow_mixed_batches = bool(allow_mixed_batches)
-        self._prefill_chunk_size = prefill_chunk_size
+        chunk_cap = plan.max_prefill_chunk_tokens if plan.enable_chunked_prefill else None
+        if prefill_chunk_size is not None:
+            if not plan.enable_chunked_prefill:
+                raise ValueError("prefill_chunk_size requires chunked prefill in the resolved plan")
+            chunk_cap = (
+                prefill_chunk_size if chunk_cap is None else min(chunk_cap, prefill_chunk_size)
+            )
+        self._prefill_chunk_size = chunk_cap
         self._max_bypass = max_bypass
 
         self._inflight_slices: dict[TicketId, tuple[_InflightSlice, ...]] = {}

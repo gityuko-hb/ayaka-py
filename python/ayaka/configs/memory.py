@@ -87,9 +87,15 @@ class MemoryConfig(ConfigMixin):
 
 @dataclass(frozen=True, slots=True)
 class MemoryProfile(ConfigMixin):
-    """Measured non-KV allocations; zeros mean an optimistic preflight profile."""
+    """Measured non-KV allocations; zeros mean an optimistic preflight profile.
+
+    ``activation_bytes`` is the measured bootstrap activation peak;
+    ``activation_reserve_bytes`` on :class:`MemoryConfig` is additional
+    headroom. Both may be set on purpose and each is subtracted exactly once.
+    """
 
     weights_bytes: int = 0
+    activation_bytes: int = 0
     graph_pool_bytes: int = 0
     kernel_workspace_bytes: int = 0
     collective_bytes: int = 0
@@ -100,6 +106,7 @@ class MemoryProfile(ConfigMixin):
     def __post_init__(self) -> None:
         for name in (
             "weights_bytes",
+            "activation_bytes",
             "graph_pool_bytes",
             "kernel_workspace_bytes",
             "collective_bytes",
@@ -116,6 +123,7 @@ class MemoryProfile(ConfigMixin):
         return sum(
             (
                 self.weights_bytes,
+                self.activation_bytes,
                 self.graph_pool_bytes,
                 self.kernel_workspace_bytes,
                 self.collective_bytes,

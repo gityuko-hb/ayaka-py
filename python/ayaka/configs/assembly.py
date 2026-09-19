@@ -586,25 +586,31 @@ def resident_ledger(
 ) -> MemoryLedger:
     """Build the ledger every resident KV lease is charged against.
 
-    A CPU diagnostic run materializes into host-pageable memory, so that tier
-    must be present; a device run charges the device tier. Either way the
-    account capacity is the KV budget the memory planner already resolved, not
-    the raw device total.
+    The account capacity is the full policy budget, not the KV portion: every
+    backing owner (weights, KV, activation, workspace, graph, staging) is a
+    claim inside one budget, and using the KV figure here would hide the
+    non-KV allocations behind a second, virtual account. A CPU diagnostic run
+    materializes into host-pageable memory, so that tier carries the same
+    capacity; only it is charged on that lane (the DEVICE tier stays empty).
     """
     if device_total_bytes < 1:
         raise ConfigError(
             "memory.total_bytes", "DEVICE_MEMORY_UNKNOWN", "device memory must be positive"
         )
+    if memory.policy_budget_bytes < 1:
+        raise ConfigError(
+            "memory.policy_budget_bytes", "DEVICE_MEMORY_UNKNOWN", "policy budget must be positive"
+        )
     if device.strip().lower() == "cpu":
         return MemoryLedger.for_device(
-            device_budget_bytes=memory.kv_cache_bytes,
+            device_budget_bytes=memory.policy_budget_bytes,
             device_total_bytes=device_total_bytes,
-            host_pageable_bytes=memory.kv_cache_bytes,
+            host_pageable_bytes=memory.policy_budget_bytes,
             host_total_bytes=device_total_bytes,
             device_index=device_index,
         )
     return MemoryLedger.for_device(
-        device_budget_bytes=memory.kv_cache_bytes,
+        device_budget_bytes=memory.policy_budget_bytes,
         device_total_bytes=device_total_bytes,
         device_index=device_index,
     )
