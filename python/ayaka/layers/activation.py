@@ -40,7 +40,12 @@ class _Activation(BaseLayer):
             return self.run_kernel(self.op, x, out=out)
         if not self._gated:
             value = x.float()
-            result = (value * torch.sigmoid(1.702 * value)).to(x.dtype)
+            if self._kernel_name == "gelu":
+                result = F.gelu(value, approximate="none").to(x.dtype)
+            elif self._kernel_name == "gelu_tanh":
+                result = F.gelu(value, approximate="tanh").to(x.dtype)
+            else:
+                result = (value * torch.sigmoid(1.702 * value)).to(x.dtype)
         else:
             gate, up = x.chunk(2, dim=-1)
             if self._kernel_name == "silu_and_mul":
@@ -82,6 +87,32 @@ class GeluAndMul(_Activation):
         return f"approximate={self.approximate!r}, {super().extra_repr()}"
 
 
+class Gelu(_Activation):
+    """Ungated GELU with exact-erf (``none``) or the ``tanh`` approximation.
+
+    Preserves the input shape; unlike :class:`GeluAndMul` there is no gate half
+    to multiply against.
+    """
+
+    _gated = False
+
+    def __init__(
+        self,
+        approximate: Literal["none", "tanh"] = "none",
+        *,
+        backend: LayerBackend = "triton",
+        **runtime: Any,
+    ) -> None:
+        if approximate not in ("none", "tanh"):
+            raise ValueError("approximate must be 'none' or 'tanh'")
+        self.approximate = approximate
+        self._kernel_name = "gelu" if approximate == "none" else "gelu_tanh"
+        super().__init__(backend=backend, **runtime)
+
+    def extra_repr(self) -> str:
+        return f"approximate={self.approximate!r}, {super().extra_repr()}"
+
+
 class QuickGELU(_Activation):
     """Ungated QuickGELU: ``x * sigmoid(1.702 * x)``; preserves input shape."""
 
@@ -93,13 +124,18 @@ def get_act_fn(name: str, *, backend: LayerBackend = "triton", **runtime: Any) -
     """Build a fresh layer for a semantic activation name; unknown names raise.
 
     Gated names are explicit so a model's plain ``silu``/``gelu`` configuration
-    cannot silently halve its hidden dimension.
+    cannot silently halve its hidden dimension. Ungated ``gelu`` is exact-erf;
+    HF's ``gelu_new``/``gelu_fast`` names select the tanh approximation.
     """
     if name == "silu_and_mul":
         return SiluAndMul(backend=backend, **runtime)
     if name in ("gelu_and_mul", "gelu_tanh_and_mul"):
         approximate = "tanh" if name == "gelu_tanh_and_mul" else "none"
         return GeluAndMul(approximate, backend=backend, **runtime)
+    if name == "gelu":
+        return Gelu("none", backend=backend, **runtime)
+    if name in ("gelu_tanh", "gelu_new", "gelu_fast", "gelu_pytorch_tanh"):
+        return Gelu("tanh", backend=backend, **runtime)
     if name in ("gelu_quick", "quick_gelu"):
         return QuickGELU(backend=backend, **runtime)
     raise ValueError(f"unsupported activation {name!r}")

@@ -1,4 +1,4 @@
-"""Launch a native Ayaka HTTP server from a local QWen checkpoint."""
+"""Launch a native Ayaka HTTP server from a local QWen, GPT-2, Phi or LLaMA checkpoint."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from pathlib import Path
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="ayaka")
     commands = parser.add_subparsers(dest="command", required=True)
-    serve = commands.add_parser("serve", help="serve a native QWen safetensors checkpoint")
+    serve = commands.add_parser(
+        "serve", help="serve a native QWen, GPT-2, Phi or LLaMA safetensors checkpoint"
+    )
     serve.add_argument("model_path", type=Path)
     serve.add_argument("--tokenizer", type=Path)
     serve.add_argument("--served-model-name", default="ayaka")
@@ -35,22 +37,40 @@ def main(argv=None) -> None:
     import uvicorn
 
     from ayaka.configs.serving import ServingConfig
+    from ayaka.models.gpt2 import GPT2Config, GPT2ForCausalLM, load_gpt2_weights
+    from ayaka.models.llama import LlamaConfig, LlamaForCausalLM, load_llama_weights
+    from ayaka.models.phi import PhiConfig, PhiForCausalLM, load_phi_weights
     from ayaka.models.qwen import QwenConfig, QwenForCausalLM, load_qwen_weights
     from ayaka.runtime.serving import ServingRuntime
 
     values = json.loads((args.model_path / "config.json").read_text(encoding="utf-8"))
-    if values.get("model_type") != "qwen":
-        parser.error("this native runner currently supports model_type=qwen (original QWen)")
-    config = QwenConfig.from_dict(values)
-    model = QwenForCausalLM(
-        config,
-        device=args.device,
-        dtype=getattr(
-            torch, args.dtype or ("float16" if args.device.startswith("cuda") else "float32")
-        ),
-        backend="torch" if args.backend == "reference" else "triton",
+    model_type = values.get("model_type")
+    dtype = getattr(
+        torch, args.dtype or ("float16" if args.device.startswith("cuda") else "float32")
     )
-    load_qwen_weights(model, args.model_path)
+    backend = "torch" if args.backend == "reference" else "triton"
+    if model_type == "qwen":
+        model = QwenForCausalLM(
+            QwenConfig.from_dict(values), device=args.device, dtype=dtype, backend=backend
+        )
+        load_qwen_weights(model, args.model_path)
+    elif model_type == "gpt2":
+        model = GPT2ForCausalLM(
+            GPT2Config.from_dict(values), device=args.device, dtype=dtype, backend=backend
+        )
+        load_gpt2_weights(model, args.model_path)
+    elif model_type == "phi":
+        model = PhiForCausalLM(
+            PhiConfig.from_dict(values), device=args.device, dtype=dtype, backend=backend
+        )
+        load_phi_weights(model, args.model_path)
+    elif model_type == "llama":
+        model = LlamaForCausalLM(
+            LlamaConfig.from_dict(values), device=args.device, dtype=dtype, backend=backend
+        )
+        load_llama_weights(model, args.model_path)
+    else:
+        parser.error("this native runner currently supports model_type in {qwen, gpt2, phi, llama}")
     model.eval()
     keys = args.api_key if args.api_key is not None else os.getenv("AYAKA_API_KEY", "")
     runtime = ServingRuntime(

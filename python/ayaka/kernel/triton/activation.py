@@ -72,6 +72,30 @@ def _gelu_quick_kernel(
     tl.store(output_ptr + offsets, activated_f32.to(x.dtype), mask=mask)
 
 
+@triton.jit
+def _gelu_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    ACTIVATION: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block = tl.program_id(axis=0).to(tl.int64)
+    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    x_f32 = x.to(tl.float32)
+
+    if ACTIVATION == 1:
+        activated_f32 = x_f32 * (0.5 * (1.0 + tl.erf(x_f32 * 0.7071067811865476)))
+    else:
+        x_cubed = x_f32 * x_f32 * x_f32
+        cdf = 0.5 * (1.0 + tanh(0.7978845608028654 * (x_f32 + 0.044715 * x_cubed)))
+        activated_f32 = x_f32 * cdf
+
+    tl.store(output_ptr + offsets, activated_f32.to(x.dtype), mask=mask)
+
+
 def _validate_input(input: torch.Tensor) -> None:
     if not isinstance(input, torch.Tensor):
         raise TypeError("input must be a torch.Tensor")
@@ -128,6 +152,29 @@ def _act_and_mul(
             input,
             output,
             d,
+            ACTIVATION=activation,
+            BLOCK_SIZE=_BLOCK_SIZE,
+            num_warps=_NUM_WARPS,
+        )
+    return output
+
+
+def _gelu_impl(
+    input: torch.Tensor,
+    activation: int,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    _validate_input(input=input)
+    output = _prepare_output(input, tuple(input.shape), out)
+    if input.numel() == 0:
+        return output
+
+    grid = (triton.cdiv(input.numel(), _BLOCK_SIZE),)
+    with torch.cuda.device(input.device):
+        cast(Any, _gelu_kernel)[grid](
+            input,
+            output,
+            input.numel(),
             ACTIVATION=activation,
             BLOCK_SIZE=_BLOCK_SIZE,
             num_warps=_NUM_WARPS,
@@ -204,6 +251,28 @@ def _gelu_quick_ref(
     return res
 
 
+def _gelu_ref(
+    input: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    res = F.gelu(input.float(), approximate="none").to(input.dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
+    return res
+
+
+def _gelu_tanh_ref(
+    input: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    res = F.gelu(input.float(), approximate="tanh").to(input.dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
+    return res
+
+
 @custom_op(
     namespace="ayaka",
     name="silu_and_mul",
@@ -268,3 +337,29 @@ def gelu_quick(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Te
             num_warps=_NUM_WARPS,
         )
     return output
+
+
+@custom_op(
+    namespace="ayaka",
+    name="gelu",
+    out_shape="input",
+    reference=_gelu_ref,
+    dispatch_key="CUDA",
+    mutates_args=["out"],
+)
+def gelu(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Compute exact-erf GELU without a multiply-gate input."""
+    return _gelu_impl(input, _ACT_GELU, out)
+
+
+@custom_op(
+    namespace="ayaka",
+    name="gelu_tanh",
+    out_shape="input",
+    reference=_gelu_tanh_ref,
+    dispatch_key="CUDA",
+    mutates_args=["out"],
+)
+def gelu_tanh(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Compute tanh-approximate GELU without a multiply-gate input."""
+    return _gelu_impl(input, _ACT_GELU_TANH, out)
