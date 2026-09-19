@@ -355,6 +355,8 @@ class FlashInferMetadataBuilder(BaseAttentionMetadataBuilder):
 
 
 class FlashInferBackend(BaseAttentionBackend):
+    supports_ragged_mixed = True
+
     def __init__(
         self,
         group: AttentionGroupSpec,

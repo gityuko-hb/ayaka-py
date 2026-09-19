@@ -677,6 +677,11 @@ class ContinuousScheduler(SchedulerCore):
         self._bypasses += 1
 
     @property
+    def mixed_batches_enabled(self) -> bool:
+        """Whether this scheduler may admit prefill and decode in one step."""
+        return self._allow_mixed_batches
+
+    @property
     def stats(self) -> ContinuousSchedulerStats:
         last = self._last_step
         return ContinuousSchedulerStats(

@@ -228,6 +228,7 @@ class ResidentKVEngine(Engine):
             request_preparer=self.preparer,
             prefix_hints=self.preparer,
             preemption=self.preparer if plan.preemption_mode is PreemptionMode.RECOMPUTE else None,
+            allow_mixed_batches=bool(getattr(runner, "supports_mixed_batches", False)),
         )
         super().__init__(
             plan,

@@ -222,6 +222,8 @@ class FlashAttentionBackend(BaseAttentionBackend):
     internal allocation belongs to the graph's private pool, and the ``copy_`` is replayed.
     """
 
+    supports_ragged_mixed = True
+
     def __init__(
         self, group: AttentionGroupSpec, kv_cache: PagedKVCache, device: torch.device
     ) -> None:

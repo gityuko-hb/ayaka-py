@@ -24,6 +24,12 @@ class BaseAttentionBackend(ABC):
     #: Registry name; set by @register_backend.
     name: ClassVar[str] = ""
 
+    #: Whether eager execution accepts different query lengths and a mixture of
+    #: prefill/decode slice semantics in one packed batch. The serving scheduler
+    #: reads the aggregate runner capability before it admits mixed work; a new
+    #: backend must opt in instead of failing after enqueue.
+    supports_ragged_mixed: ClassVar[bool] = False
+
     def __init__(
         self,
         group: AttentionGroupSpec,

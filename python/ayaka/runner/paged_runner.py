@@ -30,7 +30,7 @@ from ayaka.request.schema import Request
 from ayaka.runner.model_runner import ModelRunner
 from ayaka.runner.paged_inputs import PagedGroupBinding, validate_paged_inputs
 from ayaka.sampling.engine import SamplingCoordinator
-from ayaka.sched.plan import PreparedStep
+from ayaka.sched.plan import BatchMode, Phase, PreparedStep
 from ayaka.types import AttentionType, ForwardMode, KVCacheDtype, KVLayoutKind, MaskKind
 
 if TYPE_CHECKING:
@@ -87,6 +87,8 @@ class _ReferenceBuilder(BaseAttentionMetadataBuilder[ReferenceMetadata]):
 class ReferencePagedAttention(BaseAttentionBackend):
     """Explicit eager SDPA reference with actual paged writes and cached reads."""
 
+    supports_ragged_mixed = True
+
     def build_metadata_builder(self) -> _ReferenceBuilder:
         return _ReferenceBuilder(self.group, self.kv_cache, self.device)
 
@@ -134,6 +136,9 @@ class PagedForwardTrace:
 
     step_id: int
     request_ids: tuple[str, ...]
+    phases: tuple[Phase, ...]
+    semantic_mode: BatchMode
+    forward_mode: ForwardMode
     query_ranges: tuple[tuple[int, int], ...]
     sampling_rows: tuple[int, ...]
     num_tokens: int
@@ -220,6 +225,9 @@ class PagedModelRunner(ModelRunner):
             self.backends[name] = implementation
             self.builders[name] = implementation.build_metadata_builder()
             self._bindings[name] = PagedGroupBinding(group, cache.storage.spec)
+        self.supports_mixed_batches = all(
+            implementation.supports_ragged_mixed for implementation in self.backends.values()
+        )
         if set(self.layers) != set(range(model.config.num_hidden_layers)):
             raise ValueError("every model layer must have one attention group")
 
@@ -308,12 +316,11 @@ class PagedModelRunner(ModelRunner):
         group = self.backends[name].group
         page_size = group.page_size
         lengths = [s.query_end for s in step.slices]
-        starts = [0]
+        starts = list(step.query_start_loc)
         tables = []
         slots = []
         width = (max(lengths) + page_size - 1) // page_size
-        for scheduled, view in zip(step.slices, prepared.memory_view.sequences, strict=True):
-            starts.append(starts[-1] + scheduled.query_count)
+        for view in prepared.memory_view.sequences:
             if isinstance(view, SequenceExecutionView):
                 table = list(view.block_table)
                 slots.extend(slot.flat_slot for slot in view.write_slots)
@@ -337,13 +344,6 @@ class PagedModelRunner(ModelRunner):
             return torch.tensor(values, dtype=torch.int32, device=self.device)
 
         starts_cpu, lens_cpu = host(starts), host(lengths)
-        mode = (
-            ForwardMode.DECODE
-            if step.is_pure_decode
-            else ForwardMode.EXTEND
-            if any(s.query_start for s in step.slices)
-            else ForwardMode.PREFILL
-        )
         return CommonAttentionMetadata(
             query_start_loc=starts_cpu.to(self.device, non_blocking=True),
             seq_lens=lens_cpu.to(self.device, non_blocking=True),
@@ -357,7 +357,7 @@ class PagedModelRunner(ModelRunner):
             num_tokens=step.num_tokens,
             max_query_len=max(s.query_count for s in step.slices),
             max_seq_len=max(lengths),
-            mode=mode,
+            mode=step.forward_mode,
         )
 
     def _validate_prepared(self, prepared: PreparedStep) -> None:
@@ -395,11 +395,14 @@ class PagedModelRunner(ModelRunner):
             if self.forward_observer is not None:
                 self.forward_observer(
                     PagedForwardTrace(
-                        step.step_id,
-                        step.request_order,
-                        tuple((s.query_start, s.query_end) for s in step.slices),
-                        step.sampling_rows,
-                        tokens.numel(),
+                        step_id=step.step_id,
+                        request_ids=step.request_order,
+                        phases=tuple(s.phase for s in step.slices),
+                        semantic_mode=step.semantic_mode,
+                        forward_mode=step.forward_mode,
+                        query_ranges=tuple((s.query_start, s.query_end) for s in step.slices),
+                        sampling_rows=step.sampling_rows,
+                        num_tokens=tokens.numel(),
                     )
                 )
             self.forward_calls += 1

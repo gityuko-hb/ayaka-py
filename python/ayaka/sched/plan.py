@@ -31,9 +31,11 @@ from ayaka.plan import (
     SamplingPlan,
     WeightResidencyPlan,
 )
+from ayaka.types import ForwardMode
 from ayaka.utils.validation import require_frozen, require_int, require_text
 
 __all__ = [
+    "BatchMode",
     "BatchStepPlan",
     "DistributedStepIdentity",
     "KVRequirement",
@@ -56,6 +58,22 @@ class Phase(StrEnum):
 
     PREFILL = "prefill"
     DECODE = "decode"
+
+
+class BatchMode(StrEnum):
+    """Semantic composition of a batch, independent of backend dispatch mode.
+
+    Backends keep their existing :class:`~ayaka.types.ForwardMode` vocabulary:
+    a mixed batch dispatches as ``EXTEND`` so every ragged row uses the
+    prefill-capable path. Per-request truth remains on :class:`Phase`, which is
+    why a one-query prefill can never become decode merely because its length is
+    one.
+    """
+
+    IDLE = "idle"
+    PREFILL = "prefill"
+    DECODE = "decode"
+    MIXED = "mixed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,12 +442,48 @@ class BatchStepPlan:
         return sum(scheduled.query_count for scheduled in self.slices)
 
     @property
+    def query_start_loc(self) -> tuple[int, ...]:
+        """Packed ragged-query offsets, including the terminal token count."""
+        offsets = [0]
+        for scheduled in self.slices:
+            offsets.append(offsets[-1] + scheduled.query_count)
+        return tuple(offsets)
+
+    @property
+    def semantic_mode(self) -> BatchMode:
+        """Batch-level semantics derived only from explicit slice phases."""
+        if not self.slices:
+            return BatchMode.IDLE
+        has_prefill = any(s.phase is Phase.PREFILL for s in self.slices)
+        has_decode = any(s.phase is Phase.DECODE for s in self.slices)
+        if has_prefill and has_decode:
+            return BatchMode.MIXED
+        return BatchMode.PREFILL if has_prefill else BatchMode.DECODE
+
+    @property
+    def forward_mode(self) -> ForwardMode:
+        """Map scheduler semantics onto the existing attention backend modes.
+
+        Mixed batches deliberately use ``EXTEND``. A pure prefill is ``PREFILL``
+        only when every slice starts at logical position zero; prefix hits and
+        chunk continuations are ``EXTEND``. Query length is never consulted.
+        """
+        semantic = self.semantic_mode
+        if semantic is BatchMode.IDLE:
+            return ForwardMode.IDLE
+        if semantic is BatchMode.DECODE:
+            return ForwardMode.DECODE
+        if semantic is BatchMode.PREFILL and all(s.query_start == 0 for s in self.slices):
+            return ForwardMode.PREFILL
+        return ForwardMode.EXTEND
+
+    @property
     def is_pure_decode(self) -> bool:
-        return bool(self.slices) and all(s.phase is Phase.DECODE for s in self.slices)
+        return self.semantic_mode is BatchMode.DECODE
 
     @property
     def is_mixed(self) -> bool:
-        return self.num_prefill_tokens > 0 and self.num_decode_tokens > 0
+        return self.semantic_mode is BatchMode.MIXED
 
     @property
     def num_prefill_tokens(self) -> int:

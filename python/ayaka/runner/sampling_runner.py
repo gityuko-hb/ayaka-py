@@ -41,6 +41,8 @@ class LogitsProvider(Protocol):
 class SampleRunner(Protocol):
     """Executor-facing runner contract shared by provider and model runners."""
 
+    supports_mixed_batches: bool
+
     def __call__(self, prepared: PreparedStep) -> SampleOutputs: ...
 
     def close(self) -> None: ...
@@ -48,6 +50,8 @@ class SampleRunner(Protocol):
 
 class SamplingRunner:
     """Sample one token per sampling row for a prepared step."""
+
+    supports_mixed_batches = False
 
     __slots__ = (
         "_ban_applier",

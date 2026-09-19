@@ -390,6 +390,7 @@ class TritonAttentionBackend(BaseAttentionBackend):
     """Ayaka attention backend backed by the in-tree Triton paged kernels."""
 
     name = "triton"
+    supports_ragged_mixed = True
 
     def __init__(
         self,
