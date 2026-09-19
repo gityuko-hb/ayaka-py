@@ -10,7 +10,12 @@ from contextlib import aclosing, asynccontextmanager
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
-from ayaka.serving.errors import InvalidRequestError, ServingError
+from ayaka.kvcache.resize import CacheRebuildRejected
+from ayaka.serving.errors import (
+    InvalidRequestError,
+    ServingError,
+    cache_resize_error,
+)
 from ayaka.serving.generation import GenerationPipeline
 from ayaka.serving.protocol import (
     Result,
@@ -23,6 +28,8 @@ from ayaka.serving.protocol import (
 
 def error_response(exc: ServingError, path: str):
     error = {"message": exc.message, "type": exc.code, "code": exc.code, "param": exc.param}
+    if exc.detail:
+        error["detail"] = exc.detail
     payload = {"error": error}
     if path.startswith("/v1/messages"):
         error_type = {
@@ -149,7 +156,7 @@ async def _while_connected(request, operation):
         await asyncio.gather(worker, watcher, return_exceptions=True)
 
 
-def create_app(service, processor, *, close=None) -> FastAPI:
+def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
     pipeline = GenerationPipeline(service, processor)
 
     @asynccontextmanager
@@ -207,6 +214,26 @@ def create_app(service, processor, *, close=None) -> FastAPI:
             "frontend_active": pipeline.active,
             "recent_requests": service.stats.recent(),
         }
+
+    if admin is not None:
+
+        @app.get("/v1/cache/status")
+        async def cache_status():
+            return await asyncio.to_thread(admin.cache_status)
+
+        @app.post("/v1/cache/resize")
+        async def cache_resize(request: Request):
+            body = await _body(request)
+            pages = body.get("pages")
+            if not isinstance(pages, int) or isinstance(pages, bool):
+                raise InvalidRequestError("pages must be an integer")
+            if pages < 2:
+                raise InvalidRequestError("pages must be at least 2")
+            try:
+                status = await asyncio.to_thread(admin.resize, pages)
+            except CacheRebuildRejected as exc:
+                raise cache_resize_error(exc) from exc
+            return status.as_dict()
 
     async def generate(request: Request, protocol: str):
         body = await _body(request)

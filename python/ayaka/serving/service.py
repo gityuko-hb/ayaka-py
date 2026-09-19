@@ -11,6 +11,12 @@ from collections import deque
 from concurrent.futures import Future
 
 from ayaka.configs.serving import ServingConfig
+from ayaka.kvcache.resize import (
+    CacheRebuildRejected,
+    CacheResizeFatal,
+    ResizeRejectionReason,
+)
+from ayaka.kvcache.status import CacheStatus
 from ayaka.request.schema import Request
 from ayaka.request.states import RequestState
 from ayaka.serving.errors import EngineUnavailableError, InvalidRequestError, OverloadedError
@@ -86,11 +92,18 @@ class ServingService:
     """Transport never reads or mutates live scheduler/lifecycle dictionaries."""
 
     def __init__(
-        self, engine, config: ServingConfig, *, constraints=None, stats: ServingStats | None = None
+        self,
+        engine,
+        config: ServingConfig,
+        *,
+        constraints=None,
+        stats: ServingStats | None = None,
+        controller=None,
     ):
         self.engine, self.config = engine, config
         self.stats = stats or ServingStats()
         self._commands: queue.Queue = queue.Queue(maxsize=config.max_pending_commands)
+        self._controls: queue.Queue = queue.Queue()
         self._handles: dict[str, GenerationHandle] = {}
         self._closing = threading.Event()
         self._stopped = threading.Event()
@@ -98,6 +111,8 @@ class ServingService:
         self._lock = threading.Lock()
         self._fatal: BaseException | None = None
         self._drained = False
+        #: Engine-thread owner of KV rebuilds; ``apply_resize`` is only safe here.
+        self._controller = controller
         runner = engine.executor.runner
         runner.set_request_source(engine.requests.get, constraints=constraints)
         self._thread = threading.Thread(target=self._run, name="ayaka-engine", daemon=True)
@@ -106,6 +121,64 @@ class ServingService:
     @property
     def ready(self) -> bool:
         return not self._closing.is_set() and self._fatal is None and not self._stopped.is_set()
+
+    def resize(self, pages: int, *, timeout: float = 30.0) -> CacheStatus:
+        """Queue a cache resize on the engine owner thread and wait for it.
+
+        The engine thread rejects the request while any generation handle is
+        active, before touching the cache, so the caller can retry when idle.
+        """
+        if not isinstance(pages, int) or isinstance(pages, bool):
+            raise TypeError("pages must be an integer")
+        if not self.ready:
+            raise EngineUnavailableError("engine is unavailable")
+        future: Future = Future()
+        with self._lock:
+            self._controls.put_nowait((pages, future))
+        self._signal.set()
+        try:
+            result = future.result(timeout)
+        except TimeoutError as exc:
+            raise EngineUnavailableError("cache resize did not complete in time") from exc
+        if not isinstance(result, CacheStatus):
+            raise EngineUnavailableError("cache resize returned no status")
+        return result
+
+    def _apply_controls(self) -> None:
+        """Run queued cache controls on the engine thread between steps.
+
+        Raises:
+            CacheResizeFatal: When a rebuild cannot be recovered; the run loop
+                treats it like any fatal engine error and drains resources.
+        """
+        while True:
+            try:
+                pages, future = self._controls.get_nowait()
+            except queue.Empty:
+                return
+            if future.cancelled():
+                continue
+            controller = self._controller
+            if controller is None or self._closing.is_set() or self._fatal is not None:
+                future.set_exception(EngineUnavailableError("engine is unavailable"))
+                continue
+            try:
+                if self._handles:
+                    raise CacheRebuildRejected(
+                        "engine is busy; resize requires an idle server; old cache kept",
+                        reason=ResizeRejectionReason.BUSY,
+                        requested_pages=pages,
+                    )
+                result = controller.apply_resize(pages)
+            except BaseException as exc:
+                self.engine = controller.engine
+                if not future.done():
+                    future.set_exception(exc)
+                if isinstance(exc, CacheResizeFatal):
+                    raise
+            else:
+                self.engine = controller.engine
+                future.set_result(result)
 
     def submit(self, request: Request, spec: GenerationSpec) -> Future[GenerationHandle]:
         future: Future[GenerationHandle] = Future()
@@ -226,7 +299,7 @@ class ServingService:
     def _gauges(self):
         self.stats.running.set(self.engine.scheduler.num_running)
         self.stats.waiting.set(self.engine.scheduler.num_waiting)
-        snapshot = self.engine.kv.backend.snapshot()
+        snapshot = self.engine.kv.snapshot()
         self.stats.kv_free.set(snapshot.free_pages)
         self.stats.kv_total.set(snapshot.total_pages)
 
@@ -239,6 +312,7 @@ class ServingService:
                     except queue.Empty:
                         break
                     self._admit(request, spec, future)
+                self._apply_controls()
                 if self._closing.is_set():
                     result = self.engine.close()
                     self._collect()
@@ -275,6 +349,13 @@ class ServingService:
                 while True:
                     try:
                         _, _, future = self._commands.get_nowait()
+                    except queue.Empty:
+                        break
+                    if not future.done():
+                        future.set_exception(EngineUnavailableError("engine owner stopped"))
+                while True:
+                    try:
+                        _, future = self._controls.get_nowait()
                     except queue.Empty:
                         break
                     if not future.done():

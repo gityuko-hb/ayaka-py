@@ -34,8 +34,14 @@ from ayaka.configs.scheduler import (
 from ayaka.executor.base import Executor
 from ayaka.executor.completion import CompletionCoordinator, ShutdownResult
 from ayaka.executor.ticket import CompletionFence, ExecutionTicket, FenceResult, WorkState
-from ayaka.kvcache.grouped_manager import KVCacheGroupManager
 from ayaka.kvcache.manager import LogicalKVManager
+from ayaka.memory.capacity import (
+    MemoryLane,
+    build_capacity_snapshot,
+    mint_generation,
+    reconcile_actual_usage,
+)
+from ayaka.memory.workspace import WorkspaceManager
 from ayaka.plan import EMPTY_MEMORY_PLAN
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.schema import Request
@@ -113,14 +119,9 @@ class ResidentKVExecutor(Executor):
             self.track_fence(ticket, self._fence())
 
     def _copy_pages(self, ticket: ExecutionTicket) -> None:
-        backend = self.kv.backend
         for copy in ticket.prepared.memory_view.copies:
-            if isinstance(backend, KVCacheGroupManager):
-                source = backend.physical_page(copy.group_name, copy.source)
-                destination = backend.physical_page(copy.group_name, copy.destination)
-            else:
-                source = backend.allocator.physical_id(copy.source).value
-                destination = backend.allocator.physical_id(copy.destination).value
+            source = self.kv.physical_page(copy.group_name, copy.source)
+            destination = self.kv.physical_page(copy.group_name, copy.destination)
             storage = self.kv.storages[copy.group_name].storage
             if not 0 < copy.valid_tokens <= storage.page_size:
                 raise ValueError("invalid COW copy length")
@@ -164,8 +165,8 @@ class ResidentKVEngine(Engine):
     """Engine plus resident adapters; the caller retains ownership of KV slabs.
 
     close cancels all requests, settles tickets and aborts unadopted preparation.
-    Cached prefixes remain in the supplied manager for reuse; clear them explicitly
-    before LogicalKVManager.close(), then close its storage leases.
+    LogicalKVManager.close() drops prefix-cache ownership and its slab pins; the
+    caller then closes its storage leases.
     """
 
     def __init__(
@@ -178,6 +179,7 @@ class ResidentKVEngine(Engine):
         output: OutputProcessor | None = None,
         sampling: SamplingCoordinator | None = None,
         prefix_context: PrefixContextProvider | None = None,
+        workspace: WorkspaceManager | None = None,
     ) -> None:
         kind = kind.strip().lower().replace("-", "_")
         if (
@@ -185,8 +187,10 @@ class ResidentKVEngine(Engine):
             and plan.scheduling_policy is SchedulingPolicy.LONGEST_PREFIX_MATCH
         ):
             raise ValueError("LPM ranking requires the continuous scheduler")
-        if plan.workspace != EMPTY_MEMORY_PLAN:
-            raise ValueError("resident engine does not bind runner workspace plans")
+        if plan.workspace != EMPTY_MEMORY_PLAN and workspace is None:
+            raise ValueError(
+                "resident engine requires a workspace manager for a non-empty workspace plan"
+            )
         if (
             plan.scheduling_policy is SchedulingPolicy.LONGEST_PREFIX_MATCH
             and prefix_context is None
@@ -210,6 +214,7 @@ class ResidentKVEngine(Engine):
             self.coordinator,
             requests=self.preparer,
             graph_planner=getattr(runner, "graph_pool", None),
+            workspace=workspace,
         )
         output = output or OutputProcessor()
         scheduler = create_scheduler(
@@ -234,6 +239,7 @@ class ResidentKVEngine(Engine):
         )
         self.kv = kv
         self.allocator = allocator
+        self.workspace = workspace
         self._closing = False
         self._runner_requests: set[str] = set()
         set_source = getattr(runner, "set_request_source", None)
@@ -334,6 +340,37 @@ class ResidentKVEngine(Engine):
                 memory=ledger.snapshot(),
                 workspace=EMPTY_MEMORY_PLAN,
             )
+            lane = MemoryLane.CPU if str(device).strip().lower() == "cpu" else MemoryLane.CUDA
+            measured = profile
+            generation = mint_generation(
+                model_id=model_id,
+                model_revision=model_revision,
+                weights_revision=weights_revision,
+                kv_storage=kv.fingerprint,
+                backend=type(kv.backend).__name__,
+            )
+            snapshot = build_capacity_snapshot(
+                generation=generation,
+                lane=lane,
+                dtype=compute_dtype.label,
+                kv_dtype=cache_config.kv_dtype.label,
+                page_size=kv_plan.storage_specs[0][1].page_size,
+                group_pages={group.group_id: group.num_pages for group in kv_plan.physical.groups},
+                max_model_len=kv_plan.max_model_len,
+                max_num_seqs=resolved_scheduler.max_num_seqs,
+                max_num_batched_tokens=resolved_scheduler.max_num_batched_tokens,
+                max_inflight=resolved_scheduler.max_inflight,
+                activation_bytes=measured.activation_bytes if measured else 0,
+                workspace_ceiling_bytes=measured.kernel_workspace_bytes if measured else 0,
+                graph_bytes=measured.graph_pool_bytes if measured else 0,
+                staging_bytes=0,
+                budget_bytes=kv_plan.memory.policy_budget_bytes,
+                kv_budget_bytes=kv_plan.memory.kv_cache_bytes,
+                weights_bytes=measured.weights_bytes if measured else 0,
+                ledger=ledger,
+            )
+            kv.bind_capacity(snapshot)
+            reconcile_actual_usage(ledger, snapshot)
             return cls(
                 plan,
                 kv,
@@ -389,5 +426,5 @@ class ResidentKVEngine(Engine):
             self.scheduler.update_from_output(completed)
         if result.closed:
             self.scheduler.flush_reports()
-            self.kv.backend.reclaim_deferred()
+            self.kv.reclaim_deferred()
         return result

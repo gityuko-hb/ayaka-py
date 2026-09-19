@@ -41,6 +41,7 @@ def main(argv=None) -> None:
     from ayaka.models.llama import LlamaConfig, LlamaForCausalLM, load_llama_weights
     from ayaka.models.phi import PhiConfig, PhiForCausalLM, load_phi_weights
     from ayaka.models.qwen import QwenConfig, QwenForCausalLM, load_qwen_weights
+    from ayaka.models.qwen2 import Qwen2Config, Qwen2ForCausalLM, load_qwen2_weights
     from ayaka.runtime.serving import ServingRuntime
 
     values = json.loads((args.model_path / "config.json").read_text(encoding="utf-8"))
@@ -54,6 +55,11 @@ def main(argv=None) -> None:
             QwenConfig.from_dict(values), device=args.device, dtype=dtype, backend=backend
         )
         load_qwen_weights(model, args.model_path)
+    elif model_type == "qwen2":
+        model = Qwen2ForCausalLM(
+            Qwen2Config.from_dict(values), device=args.device, dtype=dtype, backend=backend
+        )
+        load_qwen2_weights(model, args.model_path)
     elif model_type == "gpt2":
         model = GPT2ForCausalLM(
             GPT2Config.from_dict(values), device=args.device, dtype=dtype, backend=backend
@@ -70,7 +76,9 @@ def main(argv=None) -> None:
         )
         load_llama_weights(model, args.model_path)
     else:
-        parser.error("this native runner currently supports model_type in {qwen, gpt2, phi, llama}")
+        parser.error(
+            "this native runner currently supports model_type in {qwen, qwen2, gpt2, phi, llama}"
+        )
     model.eval()
     keys = args.api_key if args.api_key is not None else os.getenv("AYAKA_API_KEY", "")
     runtime = ServingRuntime(

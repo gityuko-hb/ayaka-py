@@ -11,10 +11,10 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ayaka.configs.scheduler import ResolvedSchedulerPlan
+from ayaka.configs.scheduler import ResolvedSchedulerPlan, SchedulingPolicy
 from ayaka.executor.completion import CompletionResult
 from ayaka.executor.ticket import ExecutionTicket, TerminalStatus, TicketId
-from ayaka.request.lifecycle import LifecycleManager
+from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.states import RequestState
 from ayaka.sched.budget import BatchBudget
 from ayaka.sched.core import SchedulerCore
@@ -331,6 +331,7 @@ class ContinuousScheduler(SchedulerCore):
             and entry.lifecycle.request_id not in self._inflight_ids_all
             and entry.ready_ns <= now
         ]
+        self._refresh_candidate_hints(eligible)
         ranked = order(
             eligible,
             round_id=self._round,
@@ -631,16 +632,45 @@ class ContinuousScheduler(SchedulerCore):
     # ------------------------------------------------------------------
 
     def _refresh_window_hints(self, admitted: list[QueueEntry]) -> None:
-        if self._prefix_hints is None:
+        if not self._hints_enabled:
             return
         for entry in admitted:
-            try:
-                value = self._prefix_hints.estimate_cached_tokens(entry.lifecycle)
-            except Exception:
-                # Ranking failure cannot compromise scheduler availability or be
-                # interpreted as physical ownership.
-                value = 0
-            entry.cache_hint_tokens = max(0, int(value))
+            entry.cache_hint_tokens = max(0, self._hint_value(entry.lifecycle))
+
+    def _refresh_candidate_hints(self, eligible: list[QueueEntry]) -> None:
+        """Re-estimate ranking hints at candidate selection, not only at admission.
+
+        A hint measured once when the request entered the window can go stale
+        while it waits (eviction, publication by a peer). Revalidation stays in
+        acquire; this only keeps affinity ranking honest.
+        """
+        if not self._hints_enabled:
+            return
+        for entry in eligible:
+            entry.cache_hint_tokens = max(0, self._hint_value(entry.lifecycle))
+
+    def _hint_value(self, lifecycle: RequestLifecycle) -> int:
+        hints = self._prefix_hints
+        if hints is None:
+            return 0
+        try:
+            value = hints.estimate_cached_tokens(lifecycle)
+        except Exception:
+            # Ranking failure cannot compromise scheduler availability or be
+            # interpreted as physical ownership.
+            return 0
+        return max(0, int(value))
+
+    @property
+    def _hints_enabled(self) -> bool:
+        """LPM/affinity is the only consumer of hint tokens; skip otherwise.
+
+        A borrowed radix lookup per candidate is paid only when the policy
+        actually ranks on the hint.
+        """
+        return self._prefix_hints is not None and (
+            self._plan.scheduling_policy is SchedulingPolicy.LONGEST_PREFIX_MATCH
+        )
 
     def _mark_bypass(self, entry: QueueEntry) -> None:
         entry.bypass_count += 1

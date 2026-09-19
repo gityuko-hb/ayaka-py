@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ayaka.kvcache.resize import CacheRebuildRejected, ResizeRejectionReason
+
 
 class ServingError(RuntimeError):
     """Base error crossing the engine/serving boundary"""
@@ -8,10 +10,17 @@ class ServingError(RuntimeError):
     status_code = 500
     retryable = False
 
-    def __init__(self, message: str, *, param: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        param: str | None = None,
+        detail: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.param = param
+        self.detail = detail
 
 
 class InvalidRequestError(ServingError):
@@ -64,3 +73,37 @@ class OverloadedError(ServingError):
 class AuthenticationError(ServingError):
     code = "authentication_error"
     status_code = 401
+
+
+class CacheResizeRejectedError(ServingError):
+    """The requested cache capacity does not fit the device budget."""
+
+    code = "cache_resize_rejected"
+    status_code = 422
+
+
+class CacheResizeBusyError(ServingError):
+    """The engine is serving requests; retry the resize when idle."""
+
+    code = "cache_resize_busy"
+    status_code = 409
+    retryable = True
+
+
+def cache_resize_error(exc: CacheRebuildRejected) -> ServingError:
+    """Map a core resize rejection onto the HTTP-facing error taxonomy."""
+    message = str(exc)
+    detail = {
+        "reason": exc.reason.value,
+        "requested_pages": exc.requested_pages,
+        "need_bytes": exc.need_bytes,
+        "available_bytes": exc.available_bytes,
+        "old_bytes": exc.old_bytes,
+    }
+    if exc.reason is ResizeRejectionReason.BUSY:
+        return CacheResizeBusyError(message, detail=detail)
+    if exc.reason is ResizeRejectionReason.INVALID_PAGES:
+        return InvalidRequestError(message, detail=detail)
+    if exc.reason is ResizeRejectionReason.UNSUPPORTED:
+        return UnsupportedFeatureError(message, detail=detail)
+    return CacheResizeRejectedError(message, detail=detail)
