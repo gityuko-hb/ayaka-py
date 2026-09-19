@@ -15,6 +15,8 @@ when Triton/CUDA is unavailable.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 import triton
 import triton.language as tl
@@ -71,6 +73,76 @@ def _row_logsumexp_kernel(
     lse = m + tl.log(tl.maximum(s, 1e-30))
     # Row inactive: s = 0 gives lse = nan (inf - inf) — where buries NaN, stores 0.
     tl.store(out_ptr + row, tl.where(gate, lse, 0.0))
+
+
+@triton.jit
+def _row_logsumexp_split_kernel(
+    logits_ptr,
+    gate_ptr,
+    partial_max_ptr,
+    partial_sum_ptr,
+    vocab_size,
+    stride_row,
+    chunk_size,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    split_id = tl.program_id(1).to(tl.int64)
+    num_splits = tl.num_programs(1)
+
+    gate = tl.load(gate_ptr + row) > 0
+    if not gate:
+        tl.store(partial_max_ptr + row * num_splits + split_id, float("-inf"))
+        tl.store(partial_sum_ptr + row * num_splits + split_id, 0.0)
+        return
+
+    split_start = split_id * chunk_size
+    split_end = tl.minimum(split_start + chunk_size, vocab_size)
+
+    m = float("-inf")
+    s = 0.0
+    for start in range(split_start, split_end, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        inb = cols < split_end
+        x = tl.load(
+            logits_ptr + row * stride_row + cols,
+            mask=inb,
+            other=float("-inf"),
+        ).to(tl.float32)
+        m_new = tl.maximum(m, tl.max(x, axis=0))
+        s = s * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new), axis=0)
+        m = m_new
+
+    tl.store(partial_max_ptr + row * num_splits + split_id, m)
+    tl.store(partial_sum_ptr + row * num_splits + split_id, s)
+
+
+@triton.jit
+def _row_logsumexp_reduce_kernel(
+    partial_max_ptr,
+    partial_sum_ptr,
+    out_ptr,
+    gate_ptr,
+    num_splits: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    gate = tl.load(gate_ptr + row) > 0
+    if not gate:
+        tl.store(out_ptr + row, 0.0)
+        return
+
+    lanes = tl.arange(0, BLOCK)
+    mask = lanes < num_splits
+    m_vals = tl.load(partial_max_ptr + row * num_splits + lanes, mask=mask, other=float("-inf"))
+    s_vals = tl.load(partial_sum_ptr + row * num_splits + lanes, mask=mask, other=0.0)
+
+    m_global = tl.max(m_vals, axis=0)
+    scaled_sums = s_vals * tl.exp(m_vals - m_global)
+    s_global = tl.sum(tl.where(mask, scaled_sums, 0.0), axis=0)
+
+    lse = m_global + tl.log(tl.maximum(s_global, 1e-30))
+    tl.store(out_ptr + row, lse)
 
 
 def _row_logsumexp_ref(logits: torch.Tensor, row_gate: torch.Tensor | None) -> torch.Tensor:
@@ -138,6 +210,44 @@ def row_logsumexp_gpu(logits: torch.Tensor, row_gate: torch.Tensor | None) -> to
     if gate.dtype == torch.bool:
         gate = gate.to(torch.float32)
     out = torch.empty(n, dtype=torch.float32, device=logits.device)
-    block = triton.next_power_of_2(min(v, 4096))
-    _row_logsumexp_kernel[(n,)](logits, gate, out, v, logits.stride(0), BLOCK=block)
+
+    # When batch is small (e.g. n < 8) and vocab is large, split vocab across 16 SMs for parallelism
+    if n < 8 and v >= 16384:
+        num_splits = 16
+        chunk_size = triton.cdiv(v, num_splits)
+        partial_max = torch.empty((n, num_splits), dtype=torch.float32, device=logits.device)
+        partial_sum = torch.empty((n, num_splits), dtype=torch.float32, device=logits.device)
+        block = min(4096, triton.next_power_of_2(chunk_size))
+        with torch.cuda.device(logits.device):
+            cast(
+                Any,
+                _row_logsumexp_split_kernel[(n, num_splits)](
+                    logits,
+                    gate,
+                    partial_max,
+                    partial_sum,
+                    v,
+                    logits.stride(0),
+                    chunk_size,
+                    BLOCK=block,  # type: ignore[reportArgumentType]
+                ),
+            )
+            cast(
+                Any,
+                _row_logsumexp_reduce_kernel[(n,)](
+                    partial_max,
+                    partial_sum,
+                    out,
+                    gate,
+                    num_splits=num_splits,  # type: ignore[reportArgumentType]
+                    BLOCK=num_splits,  # type: ignore[reportArgumentType]
+                ),
+            )
+    else:
+        block = triton.next_power_of_2(min(v, 4096))
+        with torch.cuda.device(logits.device):
+            cast(
+                Any,
+                _row_logsumexp_kernel[(n,)](logits, gate, out, v, logits.stride(0), BLOCK=block),  # type: ignore[reportArgumentType]
+            )
     return out

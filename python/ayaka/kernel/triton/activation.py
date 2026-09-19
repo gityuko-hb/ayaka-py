@@ -17,8 +17,8 @@ tanh: Any = _tanh
 _ACT_SILU = 0
 _ACT_GELU = 1
 _ACT_GELU_TANH = 2
-_NUM_WARPS = 4
-_BLOCK_SIZE = 256
+_NUM_WARPS = 8
+_BLOCK_SIZE = 1024
 _SUPPORTED_DTYPES = compute_torch_dtypes()
 
 

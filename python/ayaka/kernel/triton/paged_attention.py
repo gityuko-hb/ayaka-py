@@ -528,7 +528,7 @@ def _paged_attention_split_kv_kernel(
             other=0.0,
         )
 
-        for relative_kv_start in tl.range(partition_start, partition_end, BLOCK_KV):
+        for relative_kv_start in tl.range(partition_start, partition_end, BLOCK_KV):  # type: ignore
             relative_kv_offsets = relative_kv_start + tl.arange(0, BLOCK_KV)
             kv_mask = relative_kv_offsets < partition_end
             logical_kv_offsets = effective_kv_start + relative_kv_offsets
@@ -654,7 +654,7 @@ def _paged_attention_reduce_partitions_kernel(
         + query_head_index * partial_logsumexp_head_stride
     )
 
-    for split_index in tl.range(0, MAX_KV_SPLITS, num_stages=2):
+    for split_index in tl.range(0, MAX_KV_SPLITS, num_stages=2):  # type: ignore
         partition_start = KV_PARTITION_SIZE * split_index
         partition_end = tl.minimum(partition_start + KV_PARTITION_SIZE, effective_kv_length)
 

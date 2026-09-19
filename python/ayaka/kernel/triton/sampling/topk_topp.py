@@ -546,37 +546,29 @@ def _top_p_sampling_kernel(
     tl.store(valid_ptr + row_idx, True)
 
 
-# Kernel: Fused top-k + top-p + min-p sampling FROM LOGITS (no sort, no
-# softmax materialization — FlashInfer's joint path lacks min_p; this kernel
-# covers ALL THREE filters in a single launch).
+# Shared bisection + CDF core: used by the from-logits fallback kernel and by
+# the radix sampler's overflow branch. All three filters reduce to value
+# thresholds on logits, so one register-resident pass chain covers them.
 @triton.jit
-def _fused_topk_topp_minp_kernel(
+def _bisect_filtered_sample(
     logits_ptr,
-    output_ptr,
-    valid_ptr,
-    top_k_ptr,
-    top_p_ptr,
-    min_p_ptr,
-    seed_ptr,
-    offset_ptr,
+    row_offset,
     vocab_size,
-    logits_stride_b,
+    top_k,
+    top_p,
+    min_p,
+    seed,
+    offset,
     HAS_TOP_K: tl.constexpr,
     HAS_TOP_P: tl.constexpr,
     HAS_MIN_P: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Sample one row from logits with fused top-k, top-p, and min-p.
-
-    Follows HF filter order ``top-k -> renorm -> top-p -> min-p``. All
-    three filters reduce to value thresholds on logits.
+    """Sample one logits row through bisection thresholds plus a CDF scan.
 
     # ======================================================================
-    # FUSED TOP-K(16) + TOP-P(12) + MIN-P (BLOCK_SIZE<=4096, num_warps=4,
-    # grid=(B,))
+    # FUSED TOP-K(16) + TOP-P(12) + MIN-P BISECTION (BLOCK_SIZE<=4096)
     #
-    # Programs:
-    #   1 program/row — row = tl.program_id(0); rows never communicate.
     # Tiles:
     #   vocab chunked by BLOCK_SIZE; OOB logits read as -inf so they add
     #   neither counts (mid can be negative) nor mass (exp gives 0).
@@ -594,42 +586,32 @@ def _fused_topk_topp_minp_kernel(
     # RNG:
     #   u = philox_u01_f32(seed, flat), flat = offset (batch-invariant).
     # Memory:
-    #   logits re-read per pass (1 + 16 + 12 + 1 + 1 sweeps); one int32 +
-    #   one bool stored per row. No sort, no softmax materialization.
+    #   logits re-read per pass (1 + 16 + 12 + 1 + 1 sweeps); no sort, no
+    #   softmax materialization.
     # Precision/fallback:
     #   fp32 accumulation; with no match, vocab_size-1.
     # ======================================================================
 
     Args:
         logits_ptr: Pointer to ``[batch, vocab]`` logits.
-        output_ptr: Pointer to ``[batch]`` int32 sampled indices.
-        valid_ptr: Pointer to ``[batch]`` bool validity flags.
-        top_k_ptr: Pointer to ``[batch]`` int32 top-k limits.
-        top_p_ptr: Pointer to ``[batch]`` float32 nucleus targets.
-        min_p_ptr: Pointer to ``[batch]`` float32 relative thresholds.
-        seed_ptr: Pointer to ``[batch]`` Philox seeds.
-        offset_ptr: Pointer to ``[batch]`` Philox offsets.
+        row_offset: Element offset of the row inside ``logits_ptr``.
         vocab_size: Number of vocabulary columns.
-        logits_stride_b: Row stride (in elements) of ``logits_ptr``.
-        HAS_TOP_K: Whether the top-k filter is active for any row.
-        HAS_TOP_P: Whether the top-p filter is active for any row.
-        HAS_MIN_P: Whether the min-p filter is active for any row.
+        top_k: Per-row top-k limit (``<= 0`` or ``>= vocab_size`` disables).
+        top_p: Per-row nucleus mass target (``>= 1`` disables).
+        min_p: Per-row relative threshold (``<= 0`` disables).
+        seed: Philox key for the row.
+        offset: Philox flat stream address for the row.
+        HAS_TOP_K: Compile-time gate for the top-k bisection pass.
+        HAS_TOP_P: Compile-time gate for the top-p bisection pass.
+        HAS_MIN_P: Compile-time gate for the min-p threshold pass.
         BLOCK_SIZE: Tile width along the vocabulary dimension.
-    """
-    row_idx = tl.program_id(0).to(tl.int64)
-    row_offset = row_idx * logits_stride_b
 
-    top_k = tl.load(top_k_ptr + row_idx).to(tl.int32)
-    top_p = tl.load(top_p_ptr + row_idx).to(tl.float32)
-    min_p = tl.load(min_p_ptr + row_idx).to(tl.float32)
-    seed = tl.load(seed_ptr + row_idx).to(tl.uint64)
-    offset = tl.load(offset_ptr + row_idx).to(tl.uint64)
+    Returns:
+        Int32 sampled token index (``vocab_size - 1`` when no lane matched).
+    """
     u = philox_u01_f32(seed, offset.to(tl.int64))
 
-    # Pass A: max + min (bisection domain for top-k). OOB loads are -inf so
-    # they are NOT miscounted in count-bisection (mid can be negative) and
-    # exp() maps them to 0; x_min spans finite values only (the bisection
-    # domain must stay finite).
+    # Pass A: max + min (bisection domain for top-k).
     x_max = float("-inf")
     x_min = float("inf")
     for v_offset in range(0, vocab_size, BLOCK_SIZE):
@@ -730,8 +712,605 @@ def _fused_topk_topp_minp_kernel(
     if sampled_idx < 0:
         sampled_idx = vocab_size - 1
 
+    return sampled_idx
+
+
+# Kernel: Fused top-k + top-p + min-p sampling FROM LOGITS (no sort, no
+# softmax materialization — FlashInfer's joint path lacks min_p; this kernel
+# covers ALL THREE filters in a single launch).
+@triton.jit
+def _fused_topk_topp_minp_kernel(
+    logits_ptr,
+    output_ptr,
+    valid_ptr,
+    top_k_ptr,
+    top_p_ptr,
+    min_p_ptr,
+    seed_ptr,
+    offset_ptr,
+    vocab_size,
+    logits_stride_b,
+    HAS_TOP_K: tl.constexpr,
+    HAS_TOP_P: tl.constexpr,
+    HAS_MIN_P: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Sample one row from logits with fused top-k, top-p, and min-p.
+
+    Follows HF filter order ``top-k -> renorm -> top-p -> min-p``. All
+    three filters reduce to value thresholds on logits.
+
+    # ======================================================================
+    # FUSED TOP-K(16) + TOP-P(12) + MIN-P (BLOCK_SIZE<=4096, num_warps=4,
+    # grid=(B,))
+    #
+    # Programs:
+    #   1 program/row — row = tl.program_id(0); rows never communicate.
+    # Tiles:
+    #   vocab chunked by BLOCK_SIZE; OOB logits read as -inf so they add
+    #   neither counts (mid can be negative) nor mass (exp gives 0).
+    # Passes:
+    #   A. x_max + x_min (x_min over finite values only: the bisection
+    #      domain must stay finite).
+    #   B. top-k: 16 count-bisection iterations for count(x >= mid) >= k.
+    #   C. min-p: x >= x_max + log(min_p), renorm-invariant since p_i and
+    #      p_max share the scale.
+    #   D. top-p: S_k = sum exp(x - x_max) over the top-k set, then 12
+    #      bisection iterations for the largest t with
+    #      sum_{x >= t} exp(x - x_max) >= top_p * S_k.
+    #   E. s_keep over x >= max(t_k, t_p, t_minp), then CDF scan on
+    #      exp(x - x_max) restricted to lanes with w > 0.
+    # RNG:
+    #   u = philox_u01_f32(seed, flat), flat = offset (batch-invariant).
+    # Memory:
+    #   logits re-read per pass (1 + 16 + 12 + 1 + 1 sweeps); one int32 +
+    #   one bool stored per row. No sort, no softmax materialization.
+    # Precision/fallback:
+    #   fp32 accumulation; with no match, vocab_size-1.
+    # ======================================================================
+
+    Args:
+        logits_ptr: Pointer to ``[batch, vocab]`` logits.
+        output_ptr: Pointer to ``[batch]`` int32 sampled indices.
+        valid_ptr: Pointer to ``[batch]`` bool validity flags.
+        top_k_ptr: Pointer to ``[batch]`` int32 top-k limits.
+        top_p_ptr: Pointer to ``[batch]`` float32 nucleus targets.
+        min_p_ptr: Pointer to ``[batch]`` float32 relative thresholds.
+        seed_ptr: Pointer to ``[batch]`` Philox seeds.
+        offset_ptr: Pointer to ``[batch]`` Philox offsets.
+        vocab_size: Number of vocabulary columns.
+        logits_stride_b: Row stride (in elements) of ``logits_ptr``.
+        HAS_TOP_K: Whether the top-k filter is active for any row.
+        HAS_TOP_P: Whether the top-p filter is active for any row.
+        HAS_MIN_P: Whether the min-p filter is active for any row.
+        BLOCK_SIZE: Tile width along the vocabulary dimension.
+    """
+    row_idx = tl.program_id(0).to(tl.int64)
+    row_offset = row_idx * logits_stride_b
+
+    top_k = tl.load(top_k_ptr + row_idx).to(tl.int32)
+    top_p = tl.load(top_p_ptr + row_idx).to(tl.float32)
+    min_p = tl.load(min_p_ptr + row_idx).to(tl.float32)
+    seed = tl.load(seed_ptr + row_idx).to(tl.uint64)
+    offset = tl.load(offset_ptr + row_idx).to(tl.uint64)
+
+    sampled_idx = _bisect_filtered_sample(
+        logits_ptr,
+        row_offset,
+        vocab_size,
+        top_k,
+        top_p,
+        min_p,
+        seed,
+        offset,
+        HAS_TOP_K,
+        HAS_TOP_P,
+        HAS_MIN_P,
+        BLOCK_SIZE,
+    )
+
     tl.store(output_ptr + row_idx, sampled_idx)
     tl.store(valid_ptr + row_idx, True)
+
+
+# ===========================================================================
+# Radix-select fused sampling (no torch.topk, no host sync)
+#
+# The previous fast path spent ~97% of its GPU time inside PyTorch's
+# multi-block radix select and paid four host synchronizations per call
+# (``.item()``, ``.cpu()``, ``.any()``), which dominate on Windows/WDDM.
+# This pipeline replaces both with a 4-launch, fully device-side sequence:
+#
+#   K1  histogram the top 8 bits of the monotonic key + chunk maxima
+#   K2  per-row reduce: x_max, boundary bin b* holding the k-th largest value
+#   K3  collect every value with bin >= b* (bounded by CAP) + token ids
+#   K4  sort the candidates in registers, apply top-k/top-p/min-p, Philox CDF
+#
+# The dispatch decision needs only ``dtype``/``shape``, so the op never reads
+# a device scalar back to the host.
+#
+# Correctness: candidates contain every element of bins >= b*, and the k-th
+# largest value always lives in b*, so the top-k set is exactly the first
+# ``k`` sorted candidates. Every survivor of the later filters (top-p cuts
+# strictly less mass than top-k, min-p is a value threshold) therefore sits in
+# the candidate buffer, and the in-register sort makes the result exact. Rows
+# whose candidate count exceeds ``CAP`` — and rows with top-k disabled, whose
+# survivor set is unbounded — rerun the bisection core inside K4.
+# ===========================================================================
+
+_RADIX_BINS = 256
+_RADIX_SPLIT = 16
+_RADIX_CAP = 1024
+_RADIX_MIN_VOCAB = 4096
+_RADIX_BLOCK = 2048
+
+_RADIX_BUFFERS: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+
+
+@triton.jit
+def _radix_key16(bits):
+    """Map a 16-bit fp16/bf16 bit pattern to a monotonic unsigned sort key.
+
+    Positive patterns get their sign bit set, negative patterns are bitwise
+    inverted, so unsigned key order equals float order (``-inf`` lowest,
+    ``+inf`` highest). ``-0.0`` must be normalized to ``+0.0`` before the
+    bitcast, otherwise it would map above every positive value.
+
+    Args:
+        bits: Int32 lanes holding the raw 16-bit pattern.
+
+    Returns:
+        Int32 lanes in ``[0, 65535]`` ordered like the source floats.
+    """
+    sign = bits >> 15
+    return tl.where(sign == 1, 0xFFFF - bits, bits + 0x8000)
+
+
+@triton.jit
+def _radix_bins(logits_ptr, mask, other):
+    """Load a tile and return ``(float32 values, 8-bit bin ids)``.
+
+    Values are binned through their float16 rounding: rounding is monotonic,
+    so bin order equals value order for every input dtype, and the bin is
+    ~19% wide in value near the top of the vocabulary — narrow enough that
+    the bin holding the k-th largest value usually holds few candidates.
+    Exact ordering inside a bin is recovered later from the untouched
+    float32 values, so binning never changes the sampled distribution.
+
+    Args:
+        logits_ptr: Pointer block to the tile.
+        mask: In-vocabulary lane mask.
+        other: Fill value for masked lanes.
+
+    Returns:
+        Tuple ``(x, bins)`` where ``x`` is float32 and ``bins`` is the top
+        8 bits of the monotonic key (0 = most negative, 255 = largest).
+    """
+    xn = tl.load(logits_ptr, mask=mask, other=other)
+    x = xn.to(tl.float32)
+    bits = x.to(tl.float16).to(tl.uint16, bitcast=True).to(tl.int32)
+    bits = tl.where(x == 0.0, 0, bits)
+    return x, _radix_key16(bits) >> 8
+
+
+@triton.jit
+def _radix_hist_kernel(
+    logits_ptr,
+    hist_ptr,
+    chunk_max_ptr,
+    vocab_size,
+    logits_stride_b,
+    chunk_size,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    NUM_BUCKETS: tl.constexpr,
+):
+    """Pass 1: per-chunk count histogram + maximum.
+
+    # ======================================================================
+    # RADIX HISTOGRAM (BLOCK_SIZE<=2048, grid=(B, NUM_BUCKETS))
+    #
+    # Each program owns a contiguous vocabulary chunk, so the histogram is
+    # written without atomics (deterministic) and reduced by the threshold
+    # kernel in a fixed order. A chunk past the vocabulary stores zeros.
+    # ======================================================================
+
+    Args:
+        logits_ptr: Pointer to ``[batch, vocab]`` logits.
+        hist_ptr: Pointer to ``[batch, NUM_BUCKETS, NUM_BINS]`` int32 counts.
+        chunk_max_ptr: Pointer to ``[batch, NUM_BUCKETS]`` float32 maxima.
+        vocab_size: Number of vocabulary columns.
+        logits_stride_b: Row stride (in elements) of ``logits_ptr``.
+        chunk_size: Elements per bucket.
+        BLOCK_SIZE: Tile width along the vocabulary dimension.
+        NUM_BINS: Histogram bins (256).
+        NUM_BUCKETS: Vocabulary chunks per row.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    bucket = tl.program_id(1)
+    start = bucket * chunk_size
+    limit = tl.minimum(vocab_size, start + chunk_size)
+    row_offset = row * logits_stride_b
+
+    hist = tl.zeros([NUM_BINS], dtype=tl.int32)
+    local_max = float("-inf")
+    for off in range(0, chunk_size, BLOCK_SIZE):
+        cols = start + off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < limit
+        x, bins = _radix_bins(logits_ptr + row_offset + cols, mask, float("-inf"))
+        local_max = tl.maximum(local_max, tl.max(x, axis=0))
+        hist += tl.histogram(bins, NUM_BINS, mask=mask)
+
+    tl.store(hist_ptr + (row * NUM_BUCKETS + bucket) * NUM_BINS + tl.arange(0, NUM_BINS), hist)
+    tl.store(chunk_max_ptr + row * NUM_BUCKETS + bucket, local_max)
+
+
+@triton.jit
+def _radix_threshold_kernel(
+    hist_ptr,
+    chunk_max_ptr,
+    top_k_ptr,
+    x_max_ptr,
+    b_star_ptr,
+    counter_ptr,
+    NUM_BUCKETS: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+):
+    """Pass 2: reduce histograms, pick the boundary bin, reset the counter.
+
+    # ======================================================================
+    # RADIX THRESHOLD (grid=(B,), one program per row)
+    #
+    # ``b*`` is the smallest bin whose count of strictly larger values is
+    # below ``k``: the k-th largest value is guaranteed to live there. The
+    # candidate counter is reset here so the collect pass needs no extra
+    # memset launch.
+    # ======================================================================
+
+    Args:
+        hist_ptr: Pointer to ``[batch, NUM_BUCKETS, NUM_BINS]`` int32 counts.
+        chunk_max_ptr: Pointer to ``[batch, NUM_BUCKETS]`` float32 maxima.
+        top_k_ptr: Pointer to ``[batch]`` int32 top-k limits.
+        x_max_ptr: Pointer to ``[batch]`` float32 row maxima (output).
+        b_star_ptr: Pointer to ``[batch]`` int32 boundary bins (output).
+        counter_ptr: Pointer to ``[batch]`` int32 candidate counters (reset).
+        NUM_BUCKETS: Vocabulary chunks per row.
+        NUM_BINS: Histogram bins (256).
+    """
+    row = tl.program_id(0).to(tl.int64)
+    bins = tl.arange(0, NUM_BINS)
+    counts = tl.zeros([NUM_BINS], dtype=tl.int32)
+    x_max = float("-inf")
+    for bucket in range(NUM_BUCKETS):
+        counts += tl.load(hist_ptr + (row * NUM_BUCKETS + bucket) * NUM_BINS + bins)
+        x_max = tl.maximum(x_max, tl.load(chunk_max_ptr + row * NUM_BUCKETS + bucket))
+
+    total = tl.sum(counts, axis=0)
+    above = total - tl.cumsum(counts, axis=0)
+    k = tl.load(top_k_ptr + row).to(tl.int32)
+    k_eff = tl.where((k > 0) & (k < total), k, total)
+    ok = above < k_eff
+    b_star = tl.min(tl.where(ok, bins, NUM_BINS), axis=0)
+    b_star = tl.minimum(b_star, NUM_BINS - 1)
+
+    tl.store(x_max_ptr + row, x_max)
+    tl.store(b_star_ptr + row, b_star)
+    tl.store(counter_ptr + row, 0)
+
+
+@triton.jit
+def _radix_collect_kernel(
+    logits_ptr,
+    cand_val_ptr,
+    cand_idx_ptr,
+    counter_ptr,
+    b_star_ptr,
+    vocab_size,
+    logits_stride_b,
+    chunk_size,
+    BLOCK_SIZE: tl.constexpr,
+    CAP: tl.constexpr,
+):
+    """Pass 3: append every value with ``bin >= b*`` to the row's buffer.
+
+    # ======================================================================
+    # RADIX COLLECT (BLOCK_SIZE<=2048, grid=(B, NUM_BUCKETS))
+    #
+    # One atomic reservation per tile (not per element) plus a register
+    # prefix sum keeps the append cheap; lanes past ``CAP`` are dropped and
+    # detected by the sampling pass. Candidate order is unspecified on
+    # purpose: the sampler sorts by value with a token-id tie-break, so the
+    # result does not depend on the atomic schedule.
+    # ======================================================================
+
+    Args:
+        logits_ptr: Pointer to ``[batch, vocab]`` logits.
+        cand_val_ptr: Pointer to ``[batch, CAP]`` float32 candidate values.
+        cand_idx_ptr: Pointer to ``[batch, CAP]`` int32 candidate token ids.
+        counter_ptr: Pointer to ``[batch]`` int32 candidate counters.
+        b_star_ptr: Pointer to ``[batch]`` int32 boundary bins.
+        vocab_size: Number of vocabulary columns.
+        logits_stride_b: Row stride (in elements) of ``logits_ptr``.
+        chunk_size: Elements per bucket.
+        BLOCK_SIZE: Tile width along the vocabulary dimension.
+        CAP: Candidate buffer capacity per row.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    bucket = tl.program_id(1)
+    b_star = tl.load(b_star_ptr + row)
+    start = bucket * chunk_size
+    limit = tl.minimum(vocab_size, start + chunk_size)
+    row_offset = row * logits_stride_b
+
+    for off in range(0, chunk_size, BLOCK_SIZE):
+        cols = start + off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < limit
+        x, bins = _radix_bins(logits_ptr + row_offset + cols, mask, float("-inf"))
+        take = mask & (bins >= b_star)
+        n = tl.sum(take.to(tl.int32), axis=0)
+        base = tl.atomic_add(counter_ptr + row, n)
+        pos = base + tl.cumsum(take.to(tl.int32), axis=0) - 1
+        keep = take & (pos < CAP)
+        tl.store(cand_val_ptr + row * CAP + pos, x, mask=keep)
+        tl.store(cand_idx_ptr + row * CAP + pos, cols, mask=keep)
+
+
+@triton.jit
+def _radix_sample_kernel(
+    logits_ptr,
+    cand_val_ptr,
+    cand_idx_ptr,
+    counter_ptr,
+    x_max_ptr,
+    output_ptr,
+    valid_ptr,
+    top_k_ptr,
+    top_p_ptr,
+    min_p_ptr,
+    seed_ptr,
+    offset_ptr,
+    vocab_size,
+    logits_stride_b,
+    CAP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Pass 4: exact filter + Philox CDF draw over the candidate set.
+
+    # ======================================================================
+    # RADIX SAMPLE (grid=(B,), one program per row)
+    #
+    # Candidates are sorted in registers by ``(value, token id)`` descending,
+    # which reconstructs the exact global order for every element at or above
+    # ``b*``. Top-k keeps the first ``k`` candidates; top-p then cuts the
+    # prefix whose leading mass is still below ``top_p``; min-p drops
+    # candidates below ``min_p * p_max``. A row whose candidate count exceeds
+    # ``CAP`` (or whose top-k is disabled) reruns the bisection core.
+    # ======================================================================
+
+    Args:
+        logits_ptr: Pointer to ``[batch, vocab]`` logits.
+        cand_val_ptr: Pointer to ``[batch, CAP]`` float32 candidate values.
+        cand_idx_ptr: Pointer to ``[batch, CAP]`` int32 candidate token ids.
+        counter_ptr: Pointer to ``[batch]`` int32 candidate counters.
+        x_max_ptr: Pointer to ``[batch]`` float32 row maxima.
+        output_ptr: Pointer to ``[batch]`` int32 sampled indices.
+        valid_ptr: Pointer to ``[batch]`` bool validity flags.
+        top_k_ptr: Pointer to ``[batch]`` int32 top-k limits.
+        top_p_ptr: Pointer to ``[batch]`` float32 nucleus targets.
+        min_p_ptr: Pointer to ``[batch]`` float32 relative thresholds.
+        seed_ptr: Pointer to ``[batch]`` Philox seeds.
+        offset_ptr: Pointer to ``[batch]`` Philox offsets.
+        vocab_size: Number of vocabulary columns.
+        logits_stride_b: Row stride (in elements) of ``logits_ptr``.
+        CAP: Candidate buffer capacity per row.
+        BLOCK_SIZE: Tile width used by the bisection fallback.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    top_k = tl.load(top_k_ptr + row).to(tl.int32)
+    top_p = tl.load(top_p_ptr + row).to(tl.float32)
+    min_p = tl.load(min_p_ptr + row).to(tl.float32)
+    seed = tl.load(seed_ptr + row).to(tl.uint64)
+    offset = tl.load(offset_ptr + row).to(tl.uint64)
+    count = tl.load(counter_ptr + row)
+
+    if count > CAP:
+        token = _bisect_filtered_sample(
+            logits_ptr,
+            row * logits_stride_b,
+            vocab_size,
+            top_k,
+            top_p,
+            min_p,
+            seed,
+            offset,
+            tl.constexpr(True),
+            tl.constexpr(True),
+            tl.constexpr(True),
+            BLOCK_SIZE,
+        )
+        tl.store(output_ptr + row, token)
+    else:
+        lanes = tl.arange(0, CAP)
+        lane_ok = lanes < count
+        v = tl.load(cand_val_ptr + row * CAP + lanes, mask=lane_ok, other=0.0)
+        idx = tl.load(cand_idx_ptr + row * CAP + lanes, mask=lane_ok, other=0)
+
+        # Sort key: monotonic fp32 key (high 32 bits) | token id (low 32).
+        vz = tl.where(v == 0.0, 0.0, v)
+        vb = vz.to(tl.uint32, bitcast=True).to(tl.int64)
+        sign = vb >> 31
+        key = tl.where(sign == 1, 0xFFFFFFFF - vb, vb + 0x80000000)
+        # ``key - 0x80000000`` maps the unsigned 32-bit key into the signed
+        # range, so the packed 64-bit key orders like the float. Equal values
+        # break ties on the LOWER token id, matching the stable descending
+        # sort of the torch oracle. Lanes past ``count`` collapse to the
+        # minimum int64 and sort to the tail.
+        key64 = ((key - 0x80000000) << 32) | (0x7FFFFFFF - idx.to(tl.int64))
+        key64 = tl.where(lane_ok, key64, -9223372036854775808)
+        ordered = tl.sort(key64, descending=tl.constexpr(True))
+
+        rank_ok = lanes < count
+        skey = (ordered >> 32) + 0x80000000
+        sidx = 0x7FFFFFFF - (ordered & 0xFFFFFFFF)
+        sbits = tl.where(skey >= 0x80000000, skey - 0x80000000, 0xFFFFFFFF - skey)
+        vals = sbits.to(tl.int32).to(tl.float32, bitcast=True)
+
+        x_max = tl.load(x_max_ptr + row)
+        k_eff = tl.where((top_k > 0) & (top_k < vocab_size), top_k, vocab_size)
+        e = tl.where(rank_ok & (lanes < k_eff), tl.exp(vals - x_max), 0.0)
+        s_k = tl.sum(e, axis=0).to(tl.float32)
+        probs = tl.where(s_k > 0.0, e / s_k, 0.0)
+
+        prev = tl.where(s_k > 0.0, (tl.cumsum(e, axis=0) - e) / s_k, 0.0)
+        keep_top_p = (lanes == 0) | (top_p >= 1.0) | (prev <= top_p)
+        probs = tl.where(keep_top_p, probs, 0.0)
+
+        p_max = tl.sum(tl.where(lanes == 0, probs, 0.0), axis=0)
+        keep_min_p = (min_p <= 0.0) | (probs >= min_p * p_max)
+        probs = tl.where(keep_min_p, probs, 0.0)
+
+        total_p = tl.sum(probs, axis=0)
+        u = philox_u01_f32(seed, offset.to(tl.int64))
+        target = u * total_p
+        filtered_cum = tl.cumsum(probs, axis=0)
+        matched = rank_ok & (probs > 0.0) & (filtered_cum >= target)
+        matched_idx = tl.min(tl.where(matched, lanes, CAP), axis=0)
+        final_idx = tl.where(matched_idx < CAP, matched_idx, 0)
+        token = tl.sum(tl.where(lanes == final_idx, sidx, 0), axis=0).to(tl.int32)
+        tl.store(output_ptr + row, token)
+
+    tl.store(valid_ptr + row, True)
+
+
+def _radix_buffers(batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
+    """Return the reusable intermediate buffers for one ``(batch, device)``.
+
+    Intermediates are scratch only: every element the sampler reads is
+    written by the current launch, so reuse is safe on a single stream and
+    keeps the op free of per-step allocations (and CUDA-graph friendly).
+
+    Args:
+        batch_size: Leading logits dimension.
+        device: CUDA device of the logits.
+
+    Returns:
+        Mapping with ``hist``, ``chunk_max``, ``x_max``, ``b_star``,
+        ``counter``, ``cand_val`` and ``cand_idx`` tensors.
+    """
+    key = (batch_size, device.index or 0)
+    cached = _RADIX_BUFFERS.get(key)
+    if cached is None:
+        cached = {
+            "hist": torch.empty(
+                (batch_size, _RADIX_SPLIT, _RADIX_BINS), dtype=torch.int32, device=device
+            ),
+            "chunk_max": torch.empty(
+                (batch_size, _RADIX_SPLIT), dtype=torch.float32, device=device
+            ),
+            "x_max": torch.empty((batch_size,), dtype=torch.float32, device=device),
+            "b_star": torch.empty((batch_size,), dtype=torch.int32, device=device),
+            "counter": torch.empty((batch_size,), dtype=torch.int32, device=device),
+            "cand_val": torch.empty((batch_size, _RADIX_CAP), dtype=torch.float32, device=device),
+            "cand_idx": torch.empty((batch_size, _RADIX_CAP), dtype=torch.int32, device=device),
+        }
+        if len(_RADIX_BUFFERS) >= 8:
+            _RADIX_BUFFERS.clear()
+        _RADIX_BUFFERS[key] = cached
+    return cached
+
+
+def _radix_sampling_from_logits(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the 4-launch radix-select sampler over ``[B, V]`` logits.
+
+    Caller contract: ``logits`` is a CUDA ``[B, V]`` float tensor with
+    ``V >= _RADIX_MIN_VOCAB``; every filter parameter is read per row on the
+    device, so any mix of active/inactive top-k, top-p and min-p is legal.
+    No host synchronization is performed.
+
+    Args:
+        logits: ``[B, V]`` float logits.
+        top_k: ``[B]`` int32 top-k limits.
+        top_p: ``[B]`` float32 nucleus targets.
+        min_p: ``[B]`` float32 relative thresholds.
+        seed: ``[B]`` int64 Philox seeds.
+        offset: ``[B]`` int64 Philox offsets.
+
+    Returns:
+        Tuple ``(token_ids, valid)`` with int32 ``[B]`` ids and bool ``[B]``
+        flags.
+    """
+    batch_size, vocab_size = logits.shape
+    device = logits.device
+    buffers = _radix_buffers(batch_size, device)
+    output = torch.empty((batch_size,), dtype=torch.int32, device=device)
+    valid = torch.empty((batch_size,), dtype=torch.bool, device=device)
+    chunk_size = triton.cdiv(vocab_size, _RADIX_SPLIT)
+    block = min(_RADIX_BLOCK, triton.next_power_of_2(chunk_size))
+
+    grid = (batch_size, _RADIX_SPLIT)
+    cast(Any, _radix_hist_kernel)[grid](
+        logits,
+        buffers["hist"],
+        buffers["chunk_max"],
+        vocab_size=vocab_size,
+        logits_stride_b=logits.stride(0),
+        chunk_size=chunk_size,
+        BLOCK_SIZE=block,
+        NUM_BINS=_RADIX_BINS,
+        NUM_BUCKETS=_RADIX_SPLIT,
+        num_warps=4,
+    )
+    cast(Any, _radix_threshold_kernel)[(batch_size,)](
+        buffers["hist"],
+        buffers["chunk_max"],
+        top_k,
+        buffers["x_max"],
+        buffers["b_star"],
+        buffers["counter"],
+        NUM_BUCKETS=_RADIX_SPLIT,
+        NUM_BINS=_RADIX_BINS,
+        num_warps=4,
+    )
+    cast(Any, _radix_collect_kernel)[grid](
+        logits,
+        buffers["cand_val"],
+        buffers["cand_idx"],
+        buffers["counter"],
+        buffers["b_star"],
+        vocab_size=vocab_size,
+        logits_stride_b=logits.stride(0),
+        chunk_size=chunk_size,
+        BLOCK_SIZE=block,
+        CAP=_RADIX_CAP,
+        num_warps=4,
+    )
+    cast(Any, _radix_sample_kernel)[(batch_size,)](
+        logits,
+        buffers["cand_val"],
+        buffers["cand_idx"],
+        buffers["counter"],
+        buffers["x_max"],
+        output,
+        valid,
+        top_k,
+        top_p,
+        min_p,
+        seed,
+        offset,
+        vocab_size=vocab_size,
+        logits_stride_b=logits.stride(0),
+        CAP=_RADIX_CAP,
+        BLOCK_SIZE=min(4096, triton.next_power_of_2(vocab_size)),
+        num_warps=4,
+    )
+    return output, valid
 
 
 def _fused_sampling_ref(
@@ -862,8 +1441,11 @@ def fused_topk_topp_minp_sampling_from_logits(
     Note:
         Pure function: inputs are never mutated and both outputs are freshly
         allocated. Deterministic in ``(seed, offset)`` with no generator
-        state, hence CUDA-graph safe. Uses ``BLOCK_SIZE`` of
-        ``min(4096, next_power_of_2(V))``, ``grid=(B,)``, and ``num_warps=4``.
+        state, hence CUDA-graph safe. ``V >= 4096`` dispatches the 4-launch
+        radix pipeline (device-side histogram, boundary-bin selection,
+        candidate collection, in-register filter + Philox draw); smaller
+        vocabularies use the single-launch bisection kernel. Neither path
+        reads a device value back to the host, so no step synchronizes.
         Reference: torch top-k/top-p/min-p filtering plus a CDF draw, usable
         with ``verify_against_reference``.
     """
@@ -888,11 +1470,20 @@ def fused_topk_topp_minp_sampling_from_logits(
         raise TypeError(f"seed must have dtype torch.int64; got {seed.dtype}")
     if offset.dtype != torch.int64:
         raise TypeError(f"offset must have dtype torch.int64; got {offset.dtype}")
+
+    # Radix path for production vocabularies: no torch.topk, no host sync,
+    # every filter decision taken per row on the device. Smaller vocabularies
+    # keep the single-launch bisection kernel, whose fixed 30-sweep cost is
+    # cheaper than four launches at that size.
+    if vocab_size >= _RADIX_MIN_VOCAB:
+        return _radix_sampling_from_logits(logits, top_k, top_p, min_p, seed, offset)
+
     output = torch.empty((batch_size,), dtype=torch.int32, device=logits.device)
     valid = torch.empty((batch_size,), dtype=torch.bool, device=logits.device)
 
     grid = (batch_size,)
     block_size = min(4096, triton.next_power_of_2(vocab_size))
+    num_warps = 8 if vocab_size >= 32768 else 4
 
     cast(Any, _fused_topk_topp_minp_kernel)[grid](
         logits,
@@ -905,11 +1496,11 @@ def fused_topk_topp_minp_sampling_from_logits(
         offset,
         vocab_size=vocab_size,
         logits_stride_b=logits.stride(0),
-        HAS_TOP_K=bool(((top_k > 0) & (top_k < vocab_size)).any()),
-        HAS_TOP_P=bool((top_p < 1.0).any()),
-        HAS_MIN_P=bool((min_p > 0.0).any()),
+        HAS_TOP_K=True,
+        HAS_TOP_P=True,
+        HAS_MIN_P=True,
         BLOCK_SIZE=block_size,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return output, valid
 
@@ -1009,6 +1600,7 @@ def sampling_from_probs(
 
     grid = (batch_size,)
     block_size = min(4096, triton.next_power_of_2(vocab_size))
+    num_warps = 8 if vocab_size >= 32768 else 4
 
     cast(Any, _sampling_from_probs_kernel)[grid](
         probs,
@@ -1023,7 +1615,7 @@ def sampling_from_probs(
         HAS_SEED_TENSOR=seed_arr is not None,
         HAS_OFFSET_TENSOR=offset_arr is not None,
         BLOCK_SIZE=block_size,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return output, valid
 
@@ -1146,6 +1738,7 @@ def _min_p_sampling_op(
 
     grid = (batch_size,)
     block_size = min(4096, triton.next_power_of_2(vocab_size))
+    num_warps = 8 if vocab_size >= 32768 else 4
 
     cast(Any, _min_p_sampling_kernel)[grid](
         probs,
@@ -1163,7 +1756,7 @@ def _min_p_sampling_op(
         HAS_SEED_TENSOR=seed_arr is not None,
         HAS_OFFSET_TENSOR=offset_arr is not None,
         BLOCK_SIZE=block_size,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return output, valid
 

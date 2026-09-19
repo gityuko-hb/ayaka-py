@@ -16,6 +16,17 @@ _NUM_WARPS = 8
 _FP8_E4M3 = getattr(torch, "float8_e4m3fn", None)
 
 
+def _norm_block_and_warps(d: int) -> tuple[int, int]:
+    block_size = min(8192, triton.next_power_of_2(d))
+    if block_size >= 4096:
+        warps = 16
+    elif block_size >= 1024:
+        warps = 8
+    else:
+        warps = 4
+    return block_size, warps
+
+
 @triton.jit
 def _rms_norm_kernel(
     input_ptr,
@@ -30,24 +41,37 @@ def _rms_norm_kernel(
 ):
     row = tl.program_id(axis=0).to(tl.int64)
     lanes = tl.arange(0, BLOCK_SIZE)
-    sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(tl.float32)
-        sum_sq_lanes += x * x
-
-    sum_sq = tl.sum(sum_sq_lanes, axis=0)
-    rms_rcp = tl.rsqrt(sum_sq / d + eps)
-
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(tl.float32)
-        weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    if d <= BLOCK_SIZE:
+        mask = lanes < d
+        x = tl.load(input_ptr + row * stride_input + lanes, mask=mask, other=0.0).to(tl.float32)
+        sum_sq = tl.sum(tl.where(mask, x * x, 0.0), axis=0)
+        rms_rcp = tl.rsqrt(sum_sq / d + eps)
+        weight = tl.load(weight_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
         output = x * rms_rcp * (weight + WEIGHT_BIAS)
-        tl.store(output_ptr + row * stride_output + offsets, output, mask=mask)
+        tl.store(output_ptr + row * stride_output + lanes, output, mask=mask)
+    else:
+        sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            sum_sq_lanes += x * x
+
+        sum_sq = tl.sum(sum_sq_lanes, axis=0)
+        rms_rcp = tl.rsqrt(sum_sq / d + eps)
+
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            output = x * rms_rcp * (weight + WEIGHT_BIAS)
+            tl.store(output_ptr + row * stride_output + offsets, output, mask=mask)
 
 
 @triton.jit
@@ -65,26 +89,43 @@ def _rms_norm_quant_kernel(
 ):
     row = tl.program_id(axis=0).to(tl.int64)
     lanes = tl.arange(0, BLOCK_SIZE)
-    sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(tl.float32)
-        sum_sq_lanes += x * x
-
-    sum_sq = tl.sum(sum_sq_lanes, axis=0)
-    rms_rcp = tl.rsqrt(sum_sq / d + eps)
-    scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
-
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(tl.float32)
-        weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    if d <= BLOCK_SIZE:
+        mask = lanes < d
+        x = tl.load(input_ptr + row * stride_input + lanes, mask=mask, other=0.0).to(tl.float32)
+        sum_sq = tl.sum(tl.where(mask, x * x, 0.0), axis=0)
+        rms_rcp = tl.rsqrt(sum_sq / d + eps)
+        scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
+        weight = tl.load(weight_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
         output = x * rms_rcp * (weight + WEIGHT_BIAS) * scale_inv
         output = tl.maximum(-448.0, tl.minimum(output, 448.0))
-        tl.store(output_ptr + row * stride_output + offsets, output.to(tl.float8e4nv), mask=mask)
+        tl.store(output_ptr + row * stride_output + lanes, output.to(tl.float8e4nv), mask=mask)
+    else:
+        sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            sum_sq_lanes += x * x
+
+        sum_sq = tl.sum(sum_sq_lanes, axis=0)
+        rms_rcp = tl.rsqrt(sum_sq / d + eps)
+        scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
+
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            output = x * rms_rcp * (weight + WEIGHT_BIAS) * scale_inv
+            output = tl.maximum(-448.0, tl.minimum(output, 448.0))
+            tl.store(
+                output_ptr + row * stride_output + offsets, output.to(tl.float8e4nv), mask=mask
+            )
 
 
 @triton.jit
@@ -107,90 +148,114 @@ def _qk_rms_norm_kernel(
     input_base = batch_idx * stride_input_n + head_idx * stride_input_h
     output_base = batch_idx * stride_output_n + head_idx * stride_output_h
     lanes = tl.arange(0, BLOCK_SIZE)
-    sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + input_base + offsets, mask=mask, other=0.0).to(tl.float32)
-        sum_sq_lanes += x * x
+    if d <= BLOCK_SIZE:
+        mask = lanes < d
+        x = tl.load(input_ptr + input_base + lanes, mask=mask, other=0.0).to(tl.float32)
+        sum_sq = tl.sum(tl.where(mask, x * x, 0.0), axis=0)
+        rms_rcp = tl.rsqrt(sum_sq / d + eps)
+        weight = tl.load(weight_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
+        tl.store(output_ptr + output_base + lanes, x * rms_rcp * weight, mask=mask)
+    else:
+        sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + input_base + offsets, mask=mask, other=0.0).to(tl.float32)
+            sum_sq_lanes += x * x
 
-    sum_sq = tl.sum(sum_sq_lanes, axis=0)
-    rms_rcp = tl.rsqrt(sum_sq / d + eps)
+        sum_sq = tl.sum(sum_sq_lanes, axis=0)
+        rms_rcp = tl.rsqrt(sum_sq / d + eps)
 
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + input_base + offsets, mask=mask, other=0.0).to(tl.float32)
-        weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        tl.store(output_ptr + output_base + offsets, x * rms_rcp * weight, mask=mask)
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + input_base + offsets, mask=mask, other=0.0).to(tl.float32)
+            weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            tl.store(output_ptr + output_base + offsets, x * rms_rcp * weight, mask=mask)
 
 
 @triton.jit
-def _fused_add_prepare_kernel(
+def _fused_add_rms_norm_kernel(
     input_ptr,
     residual_ptr,
-    scratch_ptr,
-    rstd_ptr,
-    d,
-    stride_input,
-    stride_residual,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(axis=0).to(tl.int64)
-    lanes = tl.arange(0, BLOCK_SIZE)
-    sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        input_value = tl.load(
-            input_ptr + row * stride_input + offsets,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        residual_value = tl.load(
-            residual_ptr + row * stride_residual + offsets,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        x = input_value + residual_value
-        sum_sq_lanes += x * x
-        # residual receives scalar_t rounding, scratch preserves the FP32 x.
-        tl.store(residual_ptr + row * stride_residual + offsets, x, mask=mask)
-        tl.store(scratch_ptr + row * d + offsets, x, mask=mask)
-
-    sum_sq = tl.sum(sum_sq_lanes, axis=0)
-    tl.store(rstd_ptr + row, tl.rsqrt(sum_sq / d + eps))
-
-
-@triton.jit
-def _fused_add_apply_kernel(
-    scratch_ptr,
-    rstd_ptr,
     weight_ptr,
     output_ptr,
     scale_ptr,
     d,
+    stride_input,
+    stride_residual,
     stride_output,
+    eps,
     WEIGHT_BIAS: tl.constexpr,
     QUANTIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(axis=0).to(tl.int64)
-    tile = tl.program_id(axis=1).to(tl.int64)
-    offsets = tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < d
-    x = tl.load(scratch_ptr + row * d + offsets, mask=mask, other=0.0)
-    rstd = tl.load(rstd_ptr + row)
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    output = x * rstd * (weight + WEIGHT_BIAS)
-    if QUANTIZE:
-        scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
-        output *= scale_inv
-        output = tl.maximum(-448.0, tl.minimum(output, 448.0))
-    tl.store(output_ptr + row * stride_output + offsets, output, mask=mask)
+    lanes = tl.arange(0, BLOCK_SIZE)
+
+    if d <= BLOCK_SIZE:
+        mask = lanes < d
+        in_val = tl.load(input_ptr + row * stride_input + lanes, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        res_val = tl.load(residual_ptr + row * stride_residual + lanes, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        x = in_val + res_val
+        tl.store(residual_ptr + row * stride_residual + lanes, x, mask=mask)
+
+        sum_sq = tl.sum(tl.where(mask, x * x, 0.0), axis=0)
+        rms_rcp = tl.rsqrt(sum_sq / d + eps)
+        weight = tl.load(weight_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
+        normed = x * rms_rcp * (weight + WEIGHT_BIAS)
+
+        if QUANTIZE:
+            scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
+            normed *= scale_inv
+            normed = tl.maximum(-448.0, tl.minimum(normed, 448.0))
+            tl.store(output_ptr + row * stride_output + lanes, normed.to(tl.float8e4nv), mask=mask)
+        else:
+            tl.store(output_ptr + row * stride_output + lanes, normed, mask=mask)
+    else:
+        sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            in_val = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            res_val = tl.load(
+                residual_ptr + row * stride_residual + offsets, mask=mask, other=0.0
+            ).to(tl.float32)
+            x = in_val + res_val
+            sum_sq_lanes += x * x
+            tl.store(residual_ptr + row * stride_residual + offsets, x, mask=mask)
+
+        sum_sq = tl.sum(sum_sq_lanes, axis=0)
+        rms_rcp = tl.rsqrt(sum_sq / d + eps)
+
+        if QUANTIZE:
+            scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
+        else:
+            scale_inv = 1.0
+
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(residual_ptr + row * stride_residual + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            normed = x * rms_rcp * (weight + WEIGHT_BIAS)
+            if QUANTIZE:
+                normed *= scale_inv
+                normed = tl.maximum(-448.0, tl.minimum(normed, 448.0))
+                tl.store(
+                    output_ptr + row * stride_output + offsets, normed.to(tl.float8e4nv), mask=mask
+                )
+            else:
+                tl.store(output_ptr + row * stride_output + offsets, normed, mask=mask)
 
 
 @triton.jit
@@ -208,35 +273,55 @@ def _layer_norm_kernel(
 ):
     row = tl.program_id(axis=0).to(tl.int64)
     lanes = tl.arange(0, BLOCK_SIZE)
-    sum_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(tl.float32)
-        sum_lanes += x
-    mean = tl.sum(sum_lanes, axis=0) / d
-
-    var_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(tl.float32)
+    if d <= BLOCK_SIZE:
+        mask = lanes < d
+        x = tl.load(input_ptr + row * stride_input + lanes, mask=mask, other=0.0).to(tl.float32)
+        mean = tl.sum(tl.where(mask, x, 0.0), axis=0) / d
         diff = tl.where(mask, x - mean, 0.0)
-        var_lanes += diff * diff
-    variance = tl.sum(var_lanes, axis=0) / d
-    rstd = tl.rsqrt(variance + eps)
-
-    for start in tl.range(0, d, BLOCK_SIZE):
-        offsets = start + lanes
-        mask = offsets < d
-        x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(tl.float32)
-        weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        output = (x - mean) * rstd * weight
+        var = tl.sum(diff * diff, axis=0) / d
+        rstd = tl.rsqrt(var + eps)
+        weight = tl.load(weight_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
+        output = diff * rstd * weight
         if HAS_BETA:
-            beta = tl.load(beta_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            beta = tl.load(beta_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
             output += beta
-        tl.store(output_ptr + row * stride_output + offsets, output, mask=mask)
+        tl.store(output_ptr + row * stride_output + lanes, output, mask=mask)
+    else:
+        sum_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            sum_lanes += x
+        mean = tl.sum(sum_lanes, axis=0) / d
+
+        var_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            diff = tl.where(mask, x - mean, 0.0)
+            var_lanes += diff * diff
+        variance = tl.sum(var_lanes, axis=0) / d
+        rstd = tl.rsqrt(variance + eps)
+
+        for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
+            offsets = start + lanes
+            mask = offsets < d
+            x = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            output = (x - mean) * rstd * weight
+            if HAS_BETA:
+                beta = tl.load(beta_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+                output += beta
+            tl.store(output_ptr + row * stride_output + offsets, output, mask=mask)
 
 
 def _validate_input_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -350,6 +435,7 @@ def _launch_rms_norm(
     output, stride_output = _prepare_output_like(input, out)
     if rows == 0:
         return output
+    block_size, num_warps = _norm_block_and_warps(d)
     with torch.cuda.device(input.device):
         cast(Any, _rms_norm_kernel)[(rows,)](
             input,
@@ -360,8 +446,8 @@ def _launch_rms_norm(
             stride_output,
             float(eps),
             WEIGHT_BIAS=float(weight_bias),
-            BLOCK_SIZE=_BLOCK_SIZE,
-            num_warps=_NUM_WARPS,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
         )
     return output
 
@@ -449,6 +535,7 @@ def rms_norm_quant(
     output, stride_output = _quant_output(input, out)
     if rows == 0:
         return output
+    block_size, num_warps = _norm_block_and_warps(d)
     with torch.cuda.device(input.device):
         cast(Any, _rms_norm_quant_kernel)[(rows,)](
             input,
@@ -460,8 +547,8 @@ def rms_norm_quant(
             stride_output,
             float(eps),
             WEIGHT_BIAS=0.0,
-            BLOCK_SIZE=_BLOCK_SIZE,
-            num_warps=_NUM_WARPS,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
         )
     return output
 
@@ -507,6 +594,7 @@ def qk_rms_norm(
     if batch_size == 0 or num_heads == 0:
         return output
 
+    block_size, num_warps = _norm_block_and_warps(d)
     with torch.cuda.device(input.device):
         cast(Any, _qk_rms_norm_kernel)[(batch_size * num_heads,)](
             input,
@@ -519,8 +607,8 @@ def qk_rms_norm(
             output.stride(0),
             output.stride(1),
             float(eps),
-            BLOCK_SIZE=_BLOCK_SIZE,
-            num_warps=_NUM_WARPS,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
         )
     return output
 
@@ -569,37 +657,25 @@ def _fused_add_impl(
     if rows == 0:
         return output if quantize else None
 
-    # Exact semantic bridge for CUDA shared-memory x_vec.
-    scratch = torch.empty((rows, d), device=input.device, dtype=torch.float32)
-    rstd = torch.empty((rows,), device=input.device, dtype=torch.float32)
-    scale_ptr = quant_scale if quant_scale is not None else rstd
+    block_size, num_warps = _norm_block_and_warps(d)
+    scale_ptr = quant_scale if quant_scale is not None else input
 
     with torch.cuda.device(input.device):
-        cast(Any, _fused_add_prepare_kernel)[(rows,)](
+        cast(Any, _fused_add_rms_norm_kernel)[(rows,)](
             input,
             residual,
-            scratch,
-            rstd,
-            d,
-            stride_input,
-            stride_residual,
-            float(eps),
-            BLOCK_SIZE=_BLOCK_SIZE,
-            num_warps=_NUM_WARPS,
-        )
-        grid = (rows, triton.cdiv(d, _BLOCK_SIZE))
-        cast(Any, _fused_add_apply_kernel)[grid](
-            scratch,
-            rstd,
             weight,
             output,
             scale_ptr,
             d,
+            stride_input,
+            stride_residual,
             stride_output,
+            float(eps),
             WEIGHT_BIAS=float(weight_bias),
             QUANTIZE=quantize,
-            BLOCK_SIZE=_BLOCK_SIZE,
-            num_warps=4,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
         )
     return output if quantize else None
 
@@ -773,6 +849,7 @@ def layer_norm(
         return output
     beta_ptr = beta if beta is not None else weight
 
+    block_size, num_warps = _norm_block_and_warps(d)
     with torch.cuda.device(input.device):
         cast(Any, _layer_norm_kernel)[(rows,)](
             input,
@@ -784,7 +861,7 @@ def layer_norm(
             stride_output,
             float(eps),
             HAS_BETA=beta is not None,
-            BLOCK_SIZE=_BLOCK_SIZE,
-            num_warps=_NUM_WARPS,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
         )
     return output
