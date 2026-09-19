@@ -27,6 +27,7 @@ from ayaka.memory.views import SequenceExecutionView
 from ayaka.plan import GraphMode
 from ayaka.request.lifecycle import RequestLifecycle
 from ayaka.request.schema import Request
+from ayaka.runner.buffers import RunnerBuffers, StagedGroup
 from ayaka.runner.model_runner import ModelRunner
 from ayaka.runner.paged_inputs import PagedGroupBinding, validate_paged_inputs
 from ayaka.sampling.engine import SamplingCoordinator
@@ -161,12 +162,18 @@ class PagedModelRunner(ModelRunner):
         *,
         backend: str = "triton",
         force_reference: bool = False,
+        buffers: RunnerBuffers | None = None,
     ) -> None:
         super().__init__(coordinator, model, force_reference=force_reference)
         if backend not in ("triton", "reference", "flash_attention", "flashinfer"):
             raise ValueError("unknown paged attention backend")
         if set(groups) != set(kv.group_names):
             raise ValueError("attention groups must exactly match logical KV groups")
+        if buffers is not None:
+            configured = {name for name, _ in buffers.spec.group_columns}
+            if configured != set(groups):
+                raise ValueError("runner buffer groups must exactly match attention groups")
+        self.buffers = buffers
         parameter = next(model.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
@@ -337,6 +344,20 @@ class PagedModelRunner(ModelRunner):
                 slots.extend(slot.flat_slot for slot in selected.write_slots)
             tables.append(table)
 
+        lease = prepared.buffers
+        if lease is not None:
+            staged = lease.buffers.stage_group(
+                name,
+                starts=starts,
+                lengths=lengths,
+                computed=[s.query_start for s in step.slices],
+                tables=tables,
+                width=width,
+                slots=slots,
+                positions=step.positions,
+            )
+            return self._staged_metadata(step, staged, lengths)
+
         def host(values):
             return torch.tensor(values, dtype=torch.int32, pin_memory=self.device.type == "cuda")
 
@@ -360,6 +381,29 @@ class PagedModelRunner(ModelRunner):
             mode=step.forward_mode,
         )
 
+    @staticmethod
+    def _staged_metadata(step, staged: StagedGroup, lengths: list[int]) -> CommonAttentionMetadata:
+        """Metadata whose device tensors are persistent slot views, not copies.
+
+        The ragged R06 contract is preserved exactly: real ``num_tokens``, packed
+        request order and the live forward mode. Only the backing storage moved.
+        """
+        return CommonAttentionMetadata(
+            query_start_loc=staged.query_start_loc,
+            seq_lens=staged.seq_lens,
+            computed_lens=staged.computed_lens,
+            block_table=staged.block_table,
+            slot_mapping=staged.slot_mapping,
+            positions=staged.positions,
+            query_start_loc_cpu=staged.query_start_loc_cpu,
+            seq_lens_cpu=staged.seq_lens_cpu,
+            num_reqs=len(step.slices),
+            num_tokens=step.num_tokens,
+            max_query_len=max(s.query_count for s in step.slices),
+            max_seq_len=max(lengths),
+            mode=step.forward_mode,
+        )
+
     def _validate_prepared(self, prepared: PreparedStep) -> None:
         if self._closed:
             raise RuntimeError("paged runner is closed")
@@ -373,6 +417,14 @@ class PagedModelRunner(ModelRunner):
         step = prepared.step
         if step.graph.mode is not GraphMode.EAGER:
             raise ValueError("paged serving runner currently requires eager execution")
+        if self.buffers is not None:
+            lease = prepared.buffers
+            if lease is None:
+                raise ValueError("paged runner requires a runner buffer lease for this step")
+            if lease.generation != self.buffers.generation:
+                raise ValueError("runner buffer lease belongs to a replaced pool generation")
+        elif prepared.buffers is not None:
+            raise ValueError("prepared step carries a lease but the runner has no pool binding")
         if step.prompt_logprobs:
             raise ValueError("paged prompt logprobs require chunk-boundary hidden-state carry")
         validate_paged_inputs(prepared, self._bindings, self._model.config.max_position_embeddings)
@@ -388,8 +440,12 @@ class PagedModelRunner(ModelRunner):
             name, local = self.layers[layer]
             return self.backends[name].forward(local, query, key, value, metadata[name])
 
-        tokens = torch.tensor(step.token_ids, dtype=torch.long, device=self.device)
-        positions = torch.tensor(step.positions, dtype=torch.long, device=self.device)
+        lease = prepared.buffers
+        if lease is not None:
+            tokens, positions = lease.buffers.stage_tokens(step.token_ids, step.positions)
+        else:
+            tokens = torch.tensor(step.token_ids, dtype=torch.long, device=self.device)
+            positions = torch.tensor(step.positions, dtype=torch.long, device=self.device)
         with torch.inference_mode():
             embeddings = self._embeddings(step, tokens)
             if self.forward_observer is not None:
@@ -413,7 +469,10 @@ class PagedModelRunner(ModelRunner):
                 hidden = self._model.forward_hidden(
                     tokens, positions, attention, inputs_embeds=embeddings
                 )
-        rows = torch.tensor(step.sampling_rows, dtype=torch.long, device=self.device)
+        if lease is not None:
+            rows = lease.buffers.stage_sampling_rows(step.sampling_rows)
+        else:
+            rows = torch.tensor(step.sampling_rows, dtype=torch.long, device=self.device)
         return hidden.index_select(0, rows), len(step.sampling_rows), [], [], []
 
     def close(self) -> None:

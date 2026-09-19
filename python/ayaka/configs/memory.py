@@ -102,6 +102,9 @@ class MemoryProfile(ConfigMixin):
     runtime_bytes: int = 0
     allocator_fragmentation_bytes: int = 0
     measured: bool = False
+    #: Persistent per-flight runner metadata token input, attention
+    #: metadata and sampling-row buffers. Reserved exactly once at bootstrap.
+    runner_buffer_bytes: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -112,6 +115,7 @@ class MemoryProfile(ConfigMixin):
             "collective_bytes",
             "runtime_bytes",
             "allocator_fragmentation_bytes",
+            "runner_buffer_bytes",
         ):
             if getattr(self, name) < 0:
                 raise ConfigError(
@@ -129,6 +133,7 @@ class MemoryProfile(ConfigMixin):
                 self.collective_bytes,
                 self.runtime_bytes,
                 self.allocator_fragmentation_bytes,
+                self.runner_buffer_bytes,
             )
         )
 

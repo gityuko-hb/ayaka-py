@@ -26,6 +26,7 @@ from ayaka.prefix.identity import PrefixCacheContext
 from ayaka.request.lifecycle import RequestLifecycle
 from ayaka.request.schema import Request
 from ayaka.request.states import RequestState
+from ayaka.runner.buffers import RunnerBufferExhausted, RunnerBuffers
 from ayaka.sched.interfaces import StepPrepareError
 from ayaka.sched.plan import BatchStepPlan, PreparedStep
 
@@ -319,6 +320,7 @@ class KVExecutionResources:
         self.workspace = workspace
         self.workspace_lease: WorkspaceLease | None = None
         self.workspace_grew = False
+        self.buffer_lease = prepared.buffers
         self.generation: ResourceGeneration | None = self.kv.generation
         self.owner: TicketId | None = None
         self.submitted = False
@@ -333,6 +335,10 @@ class KVExecutionResources:
             raise ValueError("ticket is not registered with the owning executor")
         prepared.validate()
         self.kv.validate_view(prepared.memory_view)
+        if self.buffer_lease is not None:
+            # The slot is now ticket-owned: no other step may stage into it
+            # before this ticket's consumer-completion boundary.
+            self.buffer_lease.bind(ticket_id)
         self.owner = ticket_id
 
     def _check(self, ticket_id: TicketId) -> None:
@@ -418,12 +424,18 @@ class KVExecutionResources:
                 self.requests.forget(sequence)
         self.kv.reclaim_deferred()
         self._release_workspace()
+        self._release_buffers()
         self.retired = True
 
     def _release_workspace(self) -> None:
         if self.workspace_lease is not None:
             self.workspace_lease.close()
             self.workspace_lease = None
+
+    def _release_buffers(self) -> None:
+        if self.buffer_lease is not None:
+            self.buffer_lease.release()
+            self.buffer_lease = None
 
     def abort(self) -> None:
         """Roll back caller-owned preparation; never abort an adopted bundle."""
@@ -432,6 +444,7 @@ class KVExecutionResources:
         if not self.retired:
             self.kv.abort_prepared_step(self.prepared.memory_view.lease)
             self._release_workspace()
+            self._release_buffers()
             self.retired = True
 
 
@@ -447,6 +460,7 @@ class KVStepRuntime:
         requests: KVRequestPreparer | None = None,
         graph_planner=None,
         workspace: WorkspaceManager | None = None,
+        buffers: RunnerBuffers | None = None,
     ) -> None:
         self.execution = execution
         self.allocator = allocator
@@ -454,6 +468,7 @@ class KVStepRuntime:
         self.requests = requests
         self.graph_planner = graph_planner
         self.workspace = workspace
+        self.buffers = buffers
         self._pending: dict[int, KVExecutionResources] = {}
 
     def prepare(self, step: BatchStepPlan) -> PreparedStep:
@@ -498,8 +513,20 @@ class KVStepRuntime:
                         # even when eviction cannot free a request-owned page.
                         continue
                 raise self._capacity_error(exc) from exc
+        buffer_lease = None
+        if self.buffers is not None:
+            try:
+                buffer_lease = self.buffers.acquire(step_id=step.step_id)
+            except RunnerBufferExhausted as exc:
+                # Backpressure, not a failed step: roll the KV reservation back
+                # and let the scheduler retry once a flight retires.
+                kv.abort_prepared_step(view.lease)
+                raise StepPrepareError(str(exc), transient=True) from exc
+            except BaseException:
+                kv.abort_prepared_step(view.lease)
+                raise
         try:
-            prepared = PreparedStep(self.execution, step, view)
+            prepared = PreparedStep(self.execution, step, view, buffer_lease)
             prepared.validate()
             resources = KVExecutionResources(
                 prepared,
@@ -511,6 +538,8 @@ class KVStepRuntime:
             self._pending[step.step_id] = resources
             return prepared
         except BaseException:
+            if buffer_lease is not None:
+                buffer_lease.release()
             kv.abort_prepared_step(view.lease)
             raise
 

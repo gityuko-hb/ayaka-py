@@ -45,6 +45,7 @@ from ayaka.memory.workspace import WorkspaceManager
 from ayaka.plan import EMPTY_MEMORY_PLAN
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.schema import Request
+from ayaka.runner.buffers import RunnerBuffers
 from ayaka.runner.sampling_runner import SampleRunner
 from ayaka.runtime.engine import Engine
 from ayaka.runtime.kv import (
@@ -180,6 +181,7 @@ class ResidentKVEngine(Engine):
         sampling: SamplingCoordinator | None = None,
         prefix_context: PrefixContextProvider | None = None,
         workspace: WorkspaceManager | None = None,
+        buffers: RunnerBuffers | None = None,
     ) -> None:
         kind = kind.strip().lower().replace("-", "_")
         if (
@@ -215,6 +217,7 @@ class ResidentKVEngine(Engine):
             requests=self.preparer,
             graph_planner=getattr(runner, "graph_pool", None),
             workspace=workspace,
+            buffers=buffers,
         )
         output = output or OutputProcessor()
         scheduler = create_scheduler(

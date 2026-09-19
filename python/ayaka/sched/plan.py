@@ -8,8 +8,11 @@ interpreter runs with ``-O`` (``__debug__`` false); ``StepRuntime.prepare``
 remains the authoritative oracle in that mode.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from ayaka.handles import SequenceHandle
 from ayaka.memory.views import (
@@ -33,6 +36,9 @@ from ayaka.plan import (
 )
 from ayaka.types import ForwardMode
 from ayaka.utils.validation import require_frozen, require_int, require_text
+
+if TYPE_CHECKING:
+    from ayaka.runner.buffers import RunnerBufferLease
 
 __all__ = [
     "BatchMode",
@@ -525,6 +531,10 @@ class PreparedStep:
     execution: ExecutionPlan
     step: BatchStepPlan
     memory_view: ExecutionMemoryView | GroupedExecutionMemoryView
+    #: Per-flight runner buffer lease, acquired by the step runtime before
+    #: adoption and bound to the ticket at adoption. It keeps the step's
+    #: metadata slots out of the free list until quiescent retirement.
+    buffers: RunnerBufferLease | None = None
 
     def __post_init__(self) -> None:
         if _VALIDATE:
@@ -550,6 +560,8 @@ class PreparedStep:
             or self.memory_view.lease.step_id != self.step.step_id
         ):
             raise ValueError("KV lease and step identities disagree")
+        if self.buffers is not None and self.buffers.step_id != self.step.step_id:
+            raise ValueError("runner buffer lease belongs to another step")
         if tuple(view.sequence for view in self.memory_view.sequences) != tuple(
             value.sequence for value in self.step.inputs
         ):

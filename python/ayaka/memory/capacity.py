@@ -171,6 +171,9 @@ class CapacitySnapshot:
     weights_bytes: int
     owners: tuple[OwnerClaim, ...]
     ledger: LedgerSnapshot
+    #: Persistent per-flight runner buffer footprint charged to the
+    #: WORKSPACE/DEVICE claim in addition to the growable workspace ceiling.
+    runner_buffer_bytes: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.generation, ResourceGeneration):
@@ -195,6 +198,7 @@ class CapacitySnapshot:
             "budget_bytes",
             "kv_budget_bytes",
             "weights_bytes",
+            "runner_buffer_bytes",
         ):
             require_int(getattr(self, name), name)
         if type(self.group_pages) is not tuple or not self.group_pages:
@@ -300,12 +304,14 @@ def build_capacity_snapshot(
     weights_bytes: int,
     ledger: MemoryLedger,
     staging_pinned: bool = True,
+    runner_buffer_bytes: int = 0,
 ) -> CapacitySnapshot:
     """Freeze one generation's owner table from the resolved budgets.
 
     The owner table maps every budget to the physical tier it must be charged
     against on ``lane`` (see :func:`claim_tier`). ``staging_bytes`` is a
-    WORKSPACE-owned HOST_PINNED claim and may be zero.
+    WORKSPACE-owned HOST_PINNED claim and may be zero. ``runner_buffer_bytes``
+    widens the WORKSPACE claim by the persistent per-flight metadata footprint.
     """
     owners = [
         OwnerClaim(MemoryOwner.WEIGHT, claim_tier(MemoryOwner.WEIGHT, lane=lane), weights_bytes),
@@ -318,7 +324,7 @@ def build_capacity_snapshot(
         OwnerClaim(
             MemoryOwner.WORKSPACE,
             claim_tier(MemoryOwner.WORKSPACE, lane=lane),
-            workspace_ceiling_bytes,
+            workspace_ceiling_bytes + runner_buffer_bytes,
         ),
         OwnerClaim(MemoryOwner.COMPILE, claim_tier(MemoryOwner.COMPILE, lane=lane), graph_bytes),
     ]
@@ -359,6 +365,7 @@ def build_capacity_snapshot(
             for (owner, tier), budget in sorted(merged.items(), key=lambda item: item[0])
         ),
         ledger=ledger.snapshot(),
+        runner_buffer_bytes=runner_buffer_bytes,
     )
 
 

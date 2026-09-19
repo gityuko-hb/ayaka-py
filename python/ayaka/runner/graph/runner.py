@@ -142,6 +142,13 @@ class DecodeGraphRunner:
     backend: a plain zero-arg callable for FULL, a zero-arg callable
     returning `breakable_backend.Spans` for BREAKABLE. Called once per
     bucket during capture() and again on every execute().
+
+    The runner is bound to one resource generation: ``bind_generation``
+    makes ``can_run`` refuse a bucket whose captured pointers belong to a
+    replaced owner, so a stale graph can never be replayed. The optional
+    ``prepare`` hook stages capture-time input into the captured backing
+    *outside* the captured region; replay-time staging is passed per call
+    so a request-dependent branch is never recorded into a graph.
     """
 
     def __init__(
@@ -153,6 +160,7 @@ class DecodeGraphRunner:
         build_forward_fn: Callable[[int], Any],
         backend_kind: GraphBackendKind = GraphBackendKind.FULL,
         barrier_fn: Callable[[], None] | None = None,
+        generation_provider: Callable[[], Any] | None = None,
     ) -> None:
         if not buckets or list(buckets) != sorted(buckets):
             raise ValueError("buckets must be a non-empty, ascending, deduped list")
@@ -161,12 +169,35 @@ class DecodeGraphRunner:
         self._arena = arena
         self._build_forward_fn = build_forward_fn
         self._backend = resolve_backend(backend_kind, device=device, barrier_fn=barrier_fn)
+        self._generation_provider = generation_provider
+        self._generation: Any = None
         self._captured = False
 
-    def capture(self) -> None:
+    def bind_generation(self, generation: Any) -> None:
+        """Pin the captured graph's owner; replay is refused for any other."""
+        self._generation = generation
+
+    @property
+    def generation(self) -> Any:
+        return self._generation
+
+    def _generation_current(self) -> bool:
+        if self._generation is None:
+            return True
+        if self._generation_provider is None:
+            return True
+        live = self._generation_provider()
+        return live is not None and live == self._generation
+
+    def capture(
+        self,
+        *,
+        prepare: Callable[[int], None] | None = None,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
         if self._captured:
             raise RuntimeError("capture() already ran for this runner instance")
-        stream = torch.cuda.Stream(device=self._device)
+        stream = stream if stream is not None else torch.cuda.Stream(device=self._device)
         with self._backend.capture_session(stream):
             # Largest bucket first: later (smaller) captures reuse address
             # space the pool freed from the larger one, so peak memory
@@ -175,12 +206,21 @@ class DecodeGraphRunner:
             for size in sorted(self._buckets, reverse=True):
                 shape_key = ShapeKey(size=size)
                 logger.info("capturing decode graph, size=%d", size)
+                if prepare is not None:
+                    # Stage the capture-placeholder input OUTSIDE the captured
+                    # region: the recorded graph must only contain device work.
+                    prepare(size)
                 self._backend.capture_one(shape_key, self._build_forward_fn(size))
         self._captured = True
 
     def can_run(self, raw_bs: int) -> bool:
         if not self._captured or raw_bs > self._buckets[-1]:
             return False
+        if not self._generation_current():
+            raise GraphCapabilityError(
+                "decode graphs were captured under a replaced runtime generation; "
+                "recapture before replaying"
+            )
         bucket = pad_to_bucket(raw_bs, self._buckets)
         result = self._backend.can_run(ShapeKey(size=bucket))
         if result is CanRun.CAPABILITY_MISMATCH:
@@ -194,14 +234,17 @@ class DecodeGraphRunner:
             )
         return result is CanRun.RUNNABLE
 
-    def execute(self, raw_bs: int) -> Any:
+    def execute(self, raw_bs: int, *, forward_fn: Callable[[], Any] | None = None) -> Any:
         if not self.can_run(raw_bs):
             raise RuntimeError("execute() called without a prior successful can_run()")
         bucket = pad_to_bucket(raw_bs, self._buckets)
         shape_key = ShapeKey(size=bucket)
         with self._backend.replay_session():
-            forward_fn = self._build_forward_fn(bucket)
-            raw_output = self._backend.replay(shape_key, forward_fn=forward_fn)
+            # A per-call forward_fn restages the live step into the captured
+            # backing before replay; a full-graph backend ignores it at replay,
+            # a breakable backend runs its eager spans for real.
+            stage = forward_fn if forward_fn is not None else self._build_forward_fn(bucket)
+            raw_output = self._backend.replay(shape_key, forward_fn=stage)
         return slice_rows(raw_output, raw_bs)
 
     def cleanup(self) -> None:
