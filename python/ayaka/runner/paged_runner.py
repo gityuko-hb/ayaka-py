@@ -322,6 +322,12 @@ class PagedModelRunner(ModelRunner):
             raise ValueError("decode graphs require the persistent runner buffer pool")
         if self.device.type != "cuda":
             raise ValueError("decode graphs require a CUDA device")
+        head = getattr(self._model, "lm_head", None)
+        if getattr(head, "requires_gather", False):
+            raise ValueError(
+                "decode graphs do not support a vocabulary-parallel LM head, which "
+                "all-gathers logits across the TP group"
+            )
         if len(self.backends) != 1:
             raise ValueError("decode graphs currently support exactly one attention group")
         builder = next(iter(self.builders.values()))

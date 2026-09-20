@@ -21,8 +21,10 @@ from typing import Any, ClassVar
 import torch
 from torch import nn
 
+from ayaka.distributed.parallel import ParallelContext
 from ayaka.layers._common import LayerBackend
 from ayaka.layers.activation import get_act_fn
+from ayaka.layers.embedding import VocabParallelEmbedding
 from ayaka.layers.linear.attention import QKVParallelLinear
 from ayaka.layers.linear.core import ColumnParallelLinear, RowParallelLinear
 from ayaka.layers.norm import LayerNorm
@@ -462,10 +464,24 @@ class _PhiBlock(nn.Module):
 
 
 class _PhiModel(nn.Module):
-    def __init__(self, config: PhiConfig, *, device, dtype, backend: LayerBackend) -> None:
+    def __init__(
+        self,
+        config: PhiConfig,
+        *,
+        device,
+        dtype,
+        backend: LayerBackend,
+        parallel_context: ParallelContext | None = None,
+    ) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, device=device, dtype=dtype
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            params_dtype=dtype,
+            device=device,
+            backend=backend,
+            parallel_context=parallel_context,
+            prefix="model.embed_tokens",
         )
         self.layers = nn.ModuleList(
             [
@@ -483,7 +499,7 @@ class _PhiModel(nn.Module):
         )
 
     @property
-    def wte(self) -> nn.Embedding:
+    def wte(self) -> VocabParallelEmbedding:
         """Alias for runtimes that embed tokens through ``transformer.wte``."""
         return self.embed_tokens
 
@@ -554,14 +570,22 @@ class PhiForCausalLM(CausalLM[PhiConfig]):
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.bfloat16,
         backend: LayerBackend = "triton",
+        parallel_context: ParallelContext | None = None,
     ) -> None:
         super().__init__()
         self._attach_decoder(
             config,
-            _PhiModel(config, device=device, dtype=dtype, backend=backend),
+            _PhiModel(
+                config,
+                device=device,
+                dtype=dtype,
+                backend=backend,
+                parallel_context=parallel_context,
+            ),
             lm_head_bias=True,
             device=device,
             dtype=dtype,
+            parallel_context=parallel_context,
         )
 
     @property

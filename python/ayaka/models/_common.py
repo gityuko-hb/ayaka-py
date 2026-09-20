@@ -20,6 +20,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from ayaka.configs.model_source import ModelSourceConfig
+from ayaka.distributed.parallel import ParallelContext
+from ayaka.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 from ayaka.model_loader.manifest import build_manifest_from_source
 from ayaka.model_loader.mapping import ExternMapping
 from ayaka.model_loader.module import (
@@ -166,10 +168,15 @@ def resolve_layer_range(num_layers: int, layer_start: int, layer_end: int | None
 
 
 class DecoderModule(Protocol):
-    """The inner decoder contract consumed by :class:`CausalLM`."""
+    """The inner decoder contract consumed by :class:`CausalLM`.
+
+    ``wte`` may be a plain :class:`torch.nn.Embedding` or a vocabulary-parallel
+    embedding; both accept token ids and expose a ``weight`` parameter that a
+    tied LM head can share.
+    """
 
     @property
-    def wte(self) -> nn.Embedding: ...
+    def wte(self) -> nn.Module: ...
 
     def forward_hidden(
         self,
@@ -194,7 +201,7 @@ class CausalLM[ConfigT: ModelConfigMixin](nn.Module):
     """
 
     config: ConfigT
-    lm_head: nn.Linear
+    lm_head: nn.Module
 
     _decoder_name: ClassVar[str] = "model"
 
@@ -206,19 +213,26 @@ class CausalLM[ConfigT: ModelConfigMixin](nn.Module):
         lm_head_bias: bool,
         device: torch.device | str | None,
         dtype: torch.dtype,
+        parallel_context: ParallelContext | None = None,
     ) -> None:
-        """Register the decoder, the LM head and the tied/grad-free conventions."""
+        """Register the decoder, the LM head and the tied/grad-free conventions.
+
+        The head is vocabulary-parallel; with a single-rank context it is a
+        dense projection whose output is already the full vocabulary.
+        """
         self.config = config
         setattr(self, self._decoder_name, decoder)
-        self.lm_head = nn.Linear(
-            config.hidden_size,
+        self.lm_head = ParallelLMHead(
             config.vocab_size,
+            config.hidden_size,
             bias=lm_head_bias,
+            params_dtype=dtype,
             device=device,
-            dtype=dtype,
+            parallel_context=parallel_context,
+            prefix="lm_head",
         )
         if config.tie_word_embeddings:
-            self.lm_head.weight = decoder.wte.weight
+            self.lm_head.tie_weights(cast(VocabParallelEmbedding, decoder.wte))
         for parameter in self.parameters():
             parameter.requires_grad_(False)
 
@@ -226,7 +240,9 @@ class CausalLM[ConfigT: ModelConfigMixin](nn.Module):
         return cast(DecoderModule, getattr(self, self._decoder_name))
 
     def logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        logits = self.lm_head(hidden)
+        """Full-vocabulary logits, gathering shards when the head is sharded."""
+        compute = getattr(self.lm_head, "logits", None)
+        logits = compute(hidden) if callable(compute) else self.lm_head(hidden)
         assert isinstance(logits, torch.Tensor)
         return logits
 

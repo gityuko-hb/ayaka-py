@@ -16,6 +16,7 @@ from typing import ClassVar
 
 import torch
 
+from ayaka.distributed.parallel import ParallelContext
 from ayaka.layers.linear.methods import LinearMethodBase
 from ayaka.layers.quantization.base import BaseQuantization
 from ayaka.model_loader.mapping import ExternMapping
@@ -314,6 +315,7 @@ class Qwen2ForCausalLM(LlamaForCausalLM):
         dtype: torch.dtype = torch.bfloat16,
         backend: str = "triton",
         quant_config: QuantConfig = None,
+        parallel_context: ParallelContext | None = None,
     ) -> None:
         super().__init__(
             config,
@@ -321,6 +323,7 @@ class Qwen2ForCausalLM(LlamaForCausalLM):
             dtype=dtype,
             backend=backend,  # type: ignore[arg-type]
             quant_config=quant_config,
+            parallel_context=parallel_context,
         )
 
     @property

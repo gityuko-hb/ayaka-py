@@ -18,8 +18,10 @@ from typing import Any, ClassVar
 import torch
 from torch import nn
 
+from ayaka.distributed.parallel import ParallelContext
 from ayaka.layers._common import LayerBackend
 from ayaka.layers.activation import SiluAndMul
+from ayaka.layers.embedding import VocabParallelEmbedding
 from ayaka.layers.linear.attention import QKVParallelLinear
 from ayaka.layers.linear.core import FusedGateUpLinear, RowParallelLinear
 from ayaka.layers.norm import RMSNorm
@@ -411,9 +413,25 @@ class _QwenBlock(nn.Module):
 
 
 class _QwenModel(nn.Module):
-    def __init__(self, config: QwenConfig, *, device, dtype, backend: LayerBackend) -> None:
+    def __init__(
+        self,
+        config: QwenConfig,
+        *,
+        device,
+        dtype,
+        backend: LayerBackend,
+        parallel_context: ParallelContext | None = None,
+    ) -> None:
         super().__init__()
-        self.wte = nn.Embedding(config.vocab_size, config.hidden_size, device=device, dtype=dtype)
+        self.wte = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            params_dtype=dtype,
+            device=device,
+            backend=backend,
+            parallel_context=parallel_context,
+            prefix="transformer.wte",
+        )
         self.h = nn.ModuleList(
             [
                 _QwenBlock(config, device=device, dtype=dtype, backend=backend)
@@ -496,14 +514,22 @@ class QwenForCausalLM(CausalLM[QwenConfig]):
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.bfloat16,
         backend: LayerBackend = "triton",
+        parallel_context: ParallelContext | None = None,
     ) -> None:
         super().__init__()
         self._attach_decoder(
             config,
-            _QwenModel(config, device=device, dtype=dtype, backend=backend),
+            _QwenModel(
+                config,
+                device=device,
+                dtype=dtype,
+                backend=backend,
+                parallel_context=parallel_context,
+            ),
             lm_head_bias=False,
             device=device,
             dtype=dtype,
+            parallel_context=parallel_context,
         )
 
     @property

@@ -23,8 +23,10 @@ Deferred M3 items, with reasons pinned here so they are not rediscovered:
   * CUDA Graph capture — the dense recompute path has dynamic stream lengths
     per slice; capture needs the paged runner's static shapes (the sampling
     side is already graph-ready via ``coords_padded``).
-  * tensor-parallel sharded vocabulary — no TP runtime is wired in this tree;
-    ``LogitsProcessor`` already documents the seam.
+  * tensor-parallel sharded vocabulary — the vocabulary-parallel LM head
+    gathers and reorders its shards inside ``logits_from_hidden``, so this
+    runner and the sampler always see the full vocabulary; multi-rank serving
+    itself is still gated by the scheduler's single-process policy.
 
 Responsibility boundary (see ``runtime/logits.py``): the scheduler decided
 which positions get scored (``BatchStepPlan.prompt_logprobs``); this runner

@@ -15,9 +15,9 @@ private weight matmul here.
 Model-owned normalization (logit scale, final softcap) belongs to this
 processor because it is part of "what the model's logits are": the raw
 logprob semantics are defined AFTER these transforms and BEFORE any sampling
-transform. Accumulation stays FP32. Tensor-parallel sharded vocabulary is out
-of scope for M1 (single device); the output is the full vocabulary for every
-projection row.
+transform. Accumulation stays FP32. A vocabulary-parallel LM head gathers and
+reorders its shards inside ``logits_from_hidden``; the output here is always
+the full, token-id-ordered vocabulary for every projection row.
 """
 
 from __future__ import annotations
