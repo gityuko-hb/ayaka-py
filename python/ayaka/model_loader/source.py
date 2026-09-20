@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ayaka.configs.model_source import ModelSourceConfig, RequestedFormat
 from ayaka.exceptions import CheckpointSecurityError, ModelLoadError
+from ayaka.utils.import_utils import import_module
+from ayaka.utils.logging import DisabledTqdm
 from ayaka.weights.plan import CheckpointFormat
 
 CONFIG_FILENAME = "config.json"
+GENERATION_CONFIG_FILENAME = "generation_config.json"
 INDEX_FILENAME = "model.safetensors.index.json"
 SINGLE_FILENAME = "model.safetensors"
 
@@ -49,6 +54,7 @@ class ResolvedSource:
     weight_files: tuple[str, ...] = ()  # absolute, sorted, all inside `root`
     index_path: str = ""
     revision: str = ""
+    generation_config_path: str = ""
 
     @property
     def is_sharded(self) -> bool:
@@ -211,8 +217,7 @@ def resolve_source(
         if snapshot is None or not usable:
             if source.offline:
                 raise SourceNotFoundError(
-                    f"offline mode and no local snapshot for {source.model!r} "
-                    f"(looked in {cache})"
+                    f"offline mode and no local snapshot for {source.model!r} (looked in {cache})"
                 )
             if fetch_snapshot is None:
                 raise SourceNotFoundError(
@@ -247,6 +252,9 @@ def resolve_source(
         for name in weight_files:
             safe_join(root, Path(name).name)  # symlink escape check, per file
 
+    gen_config = root / GENERATION_CONFIG_FILENAME
+    generation_config_path = str(gen_config) if gen_config.is_file() else ""
+
     return ResolvedSource(
         root=str(root),
         format=fmt,
@@ -254,4 +262,166 @@ def resolve_source(
         weight_files=weight_files,
         index_path=str(index) if index else "",
         revision=revision,
+        generation_config_path=generation_config_path,
     )
+
+
+def optional_hf_file(
+    model_path: str | Path,
+    filename: str,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> str | None:
+    """Local path of ``filename`` in a checkpoint dir or Hub repo; None when unavailable.
+
+    Checks:
+    1. Local filesystem path if ``model_path`` is an existing directory.
+    2. Local Hugging Face Hub cache directory.
+    3. Hub download via ``huggingface_hub.hf_hub_download`` using ``DisabledTqdm``.
+    """
+    path_obj = Path(model_path).expanduser()
+    if path_obj.is_dir():
+        file_path = path_obj / filename
+        return str(file_path) if file_path.is_file() else None
+
+    # Try looking into the local HF cache before hitting the network
+    cache = hub_cache_dir(str(model_path), cache_dir=cache_dir or "")
+    snapshot = _latest_snapshot(cache, revision or "")
+    if snapshot is not None:
+        file_path = snapshot / filename
+        if file_path.is_file():
+            return str(file_path)
+
+    # Optional network download via huggingface_hub
+    try:
+        hf_hub = import_module("huggingface_hub")
+        return hf_hub.hf_hub_download(
+            repo_id=str(model_path),
+            filename=filename,
+            revision=revision or None,
+            cache_dir=cache_dir or None,
+            tqdm_class=DisabledTqdm,
+        )
+    except Exception:
+        return None
+
+
+def load_generation_config(
+    source: str | Path | ResolvedSource | ModelSourceConfig,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> dict[str, Any]:
+    """Load and parse ``generation_config.json`` into a dictionary.
+
+    Returns an empty dictionary if the configuration is not present or cannot be parsed.
+    """
+    if isinstance(source, ResolvedSource):
+        if source.generation_config_path and os.path.isfile(source.generation_config_path):
+            try:
+                with open(source.generation_config_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                return {}
+        return {}
+
+    if isinstance(source, ModelSourceConfig):
+        model_str = source.model
+        rev = revision or source.revision or None
+        cache = cache_dir or source.cache_dir or None
+    else:
+        model_str = str(source)
+        rev = revision
+        cache = cache_dir
+
+    path = Path(model_str).expanduser()
+    if path.is_file() and path.name == GENERATION_CONFIG_FILENAME:
+        target_path: str | None = str(path)
+    elif path.is_dir():
+        candidate = path / GENERATION_CONFIG_FILENAME
+        target_path = str(candidate) if candidate.is_file() else None
+    else:
+        target_path = optional_hf_file(
+            model_str, GENERATION_CONFIG_FILENAME, revision=rev, cache_dir=cache
+        )
+
+    if target_path is None or not os.path.isfile(target_path):
+        return {}
+
+    try:
+        with open(target_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def parse_eos_token_ids(
+    gen_config: Mapping[str, Any],
+    extra_eos_token_ids: int | Sequence[int] | None = None,
+) -> frozenset[int]:
+    """Extract stop/EOS token IDs from a generation config dictionary and union with extra IDs.
+
+    Many models (e.g. Gemma, Qwen) specify multiple stop token IDs in ``generation_config.json``
+    (e.g. ``<end_of_turn>`` or ``<|im_end|>``). This extracts all integer IDs safely.
+    """
+    ids: set[int] = set()
+    if extra_eos_token_ids is not None:
+        if isinstance(extra_eos_token_ids, int):
+            ids.add(int(extra_eos_token_ids))
+        else:
+            ids.update(int(x) for x in extra_eos_token_ids if x is not None)
+
+    gen_eos = gen_config.get("eos_token_id")
+    if isinstance(gen_eos, int):
+        ids.add(int(gen_eos))
+    elif isinstance(gen_eos, (list, tuple, set)):
+        ids.update(int(x) for x in gen_eos if x is not None)
+
+    return frozenset(ids)
+
+
+def load_eos_token_ids(
+    source: str | Path | ResolvedSource | ModelSourceConfig,
+    extra_eos_token_ids: int | Sequence[int] | None = None,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> frozenset[int]:
+    """Read all EOS token IDs for a model source."""
+    cfg = load_generation_config(source, revision=revision, cache_dir=cache_dir)
+    return parse_eos_token_ids(cfg, extra_eos_token_ids)
+
+
+def parse_generation_sampling(gen_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract recommended generation sampling defaults from ``generation_config.json``.
+
+    If ``do_sample`` is False, returns greedy sampling (``{"temperature": 0.0}``).
+    Otherwise extracts ``temperature``, ``top_k``, and ``top_p`` when present.
+    """
+    if gen_config.get("do_sample") is False:
+        return {"temperature": 0.0}
+
+    out: dict[str, Any] = {}
+    for key in ("temperature", "top_k", "top_p"):
+        if (val := gen_config.get(key)) is not None:
+            if key in ("temperature", "top_p"):
+                out[key] = float(val)
+            elif key == "top_k":
+                out[key] = int(val)
+            else:
+                out[key] = val
+    return out
+
+
+def load_generation_sampling(
+    source: str | Path | ResolvedSource | ModelSourceConfig,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+) -> dict[str, Any]:
+    """Read recommended sampling defaults from ``generation_config.json``."""
+    cfg = load_generation_config(source, revision=revision, cache_dir=cache_dir)
+    return parse_generation_sampling(cfg)

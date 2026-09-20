@@ -21,7 +21,16 @@ from ayaka.model_loader.reader import (
     ReaderCancelled,
     ReadResult,
 )
-from ayaka.model_loader.source import ResolvedSource, resolve_source
+from ayaka.model_loader.source import (
+    ResolvedSource,
+    load_eos_token_ids,
+    load_generation_config,
+    load_generation_sampling,
+    optional_hf_file,
+    parse_eos_token_ids,
+    parse_generation_sampling,
+    resolve_source,
+)
 from ayaka.model_loader.st import parse_safetensors_header, read_safetensors_header
 
 __all__ = [
@@ -36,8 +45,14 @@ __all__ = [
     "WeightBinding",
     "build_manifest_from_source",
     "iter_checkpoint_tensors",
+    "load_eos_token_ids",
+    "load_generation_config",
+    "load_generation_sampling",
     "load_module_weights",
     "materialize_module_weights",
+    "optional_hf_file",
+    "parse_eos_token_ids",
+    "parse_generation_sampling",
     "parse_safetensors_header",
     "read_safetensors_header",
     "read_weight_map",

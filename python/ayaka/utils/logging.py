@@ -13,6 +13,7 @@ from ayaka.distributed.env import describe, is_distributed, is_master, rank
 __all__ = [
     "AyakaLogger",
     "ColorFormatter",
+    "DisabledTqdm",
     "JSONFormatter",
     "TextFormatter",
     "init_logger",
@@ -74,6 +75,22 @@ def quiet_http_loggers() -> None:
         client_logger = logging.getLogger(name)
         if client_logger.level == logging.NOTSET:
             client_logger.setLevel(logging.WARNING)
+
+
+from tqdm.auto import tqdm as _BaseTqdm
+
+
+class DisabledTqdm(_BaseTqdm):
+    """A tqdm subclass with progress output permanently disabled.
+
+    Used when fetching lightweight files (e.g. metadata JSONs) or running in
+    headless/server mode so progress updates do not spam the console or server logs.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.pop("name", None)
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
 class _OnceFilter:

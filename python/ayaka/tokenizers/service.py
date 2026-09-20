@@ -127,7 +127,12 @@ class TokenizerService:
     @property
     def eos_token_ids(self) -> tuple[int, ...]:
         """EOS ids for pre-sample masking; empty when the tokenizer is disabled."""
-        if self.tokenizer is None or self.tokenizer.eos_token_id is None:
+        if self.tokenizer is None:
+            return ()
+        tok_ids = getattr(self.tokenizer, "eos_token_ids", None)
+        if tok_ids:
+            return tuple(sorted(tok_ids))
+        if self.tokenizer.eos_token_id is None:
             return ()
         return (int(self.tokenizer.eos_token_id),)
 

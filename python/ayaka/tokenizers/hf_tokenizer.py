@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -211,6 +212,8 @@ class HfTokenizer:
         "_trunc_side",
         "_byte_table",
         "byte_path_verified",
+        "_eos_token_ids",
+        "_sampling_defaults",
     )
 
     @classmethod
@@ -243,14 +246,66 @@ class HfTokenizer:
             cache_dir=config.download_dir,
             use_fast=config.mode != "slow",
         )
-        result = cls(tok, truncation_side=config.truncation_side)
+
+        # 1. Fallback for models (e.g. Mistral) storing chat_template
+        # in a separate chat_template.json
+        if not getattr(tok, "chat_template", None):
+            from ayaka.model_loader.source import optional_hf_file
+
+            template_path = optional_hf_file(
+                config.tokenizer,
+                "chat_template.json",
+                revision=config.revision,
+                cache_dir=config.download_dir,
+            )
+            if template_path and os.path.isfile(template_path):
+                try:
+                    with open(template_path, encoding="utf-8") as f:
+                        template_data = json.load(f)
+                    if isinstance(template_data, dict) and "chat_template" in template_data:
+                        tok.chat_template = template_data["chat_template"]
+                    elif isinstance(template_data, str):
+                        tok.chat_template = template_data
+                except Exception:
+                    pass
+
+        # 2. Extract multi-EOS and sampling defaults from generation_config.json if present
+        from ayaka.model_loader.source import (
+            load_generation_config,
+            parse_eos_token_ids,
+            parse_generation_sampling,
+        )
+
+        gen_cfg = load_generation_config(
+            config.tokenizer,
+            revision=config.revision,
+            cache_dir=config.download_dir,
+        )
+        eos_ids = parse_eos_token_ids(
+            gen_cfg, extra_eos_token_ids=getattr(tok, "eos_token_id", None)
+        )
+        sampling = parse_generation_sampling(gen_cfg)
+
+        result = cls(
+            tok,
+            truncation_side=config.truncation_side,
+            eos_token_ids=eos_ids,
+            sampling_defaults=sampling,
+        )
         if config.mode == "hf" and not result.is_fast:
             raise ValueError("mode='hf' requires a fast tokenizer")
         if config.mode == "slow" and result.is_fast:
             raise ValueError("mode='slow' requires a slow tokenizer")
         return result
 
-    def __init__(self, tok, *, truncation_side: str = "left") -> None:
+    def __init__(
+        self,
+        tok,
+        *,
+        truncation_side: str = "left",
+        eos_token_ids: frozenset[int] | Sequence[int] | None = None,
+        sampling_defaults: Mapping[str, Any] | None = None,
+    ) -> None:
         """Wrap an existing HuggingFace tokenizer.
 
         Captures a snapshot of the vocabulary, computes the fingerprint,
@@ -262,6 +317,8 @@ class HfTokenizer:
             truncation_side: Which end to truncate on overflow.  ``"left"``
                 (default) keeps the most recent context; ``"right"`` keeps the
                 prompt start.
+            eos_token_ids: Optional collection of extra/multi stop token IDs.
+            sampling_defaults: Optional recommended sampling parameter mapping.
         """
         if truncation_side not in ("left", "right"):
             raise ValueError("truncation_side must be left or right")
@@ -300,6 +357,17 @@ class HfTokenizer:
         self._special_ids = frozenset(
             i for i in (getattr(tok, "all_special_ids", ()) or ()) if i is not None
         )
+
+        all_eos: set[int] = set()
+        if self._eos is not None:
+            all_eos.add(int(self._eos))
+        if eos_token_ids is not None:
+            if isinstance(eos_token_ids, int):
+                all_eos.add(int(eos_token_ids))
+            else:
+                all_eos.update(int(x) for x in eos_token_ids if x is not None)
+        self._eos_token_ids = frozenset(all_eos)
+        self._sampling_defaults = dict(sampling_defaults or {})
 
         self._chunkable = self._detect_bytelevel()
         self._decoded_vocab: list[bytes] | None = None
@@ -403,6 +471,21 @@ class HfTokenizer:
     def eos_token_id(self) -> int | None:
         """End-of-sequence token ID, or ``None`` if unset."""
         return self._eos
+
+    @property
+    def eos_token_ids(self) -> frozenset[int]:
+        """All end-of-sequence / stop-token IDs (including generation_config multi-EOS)."""
+        return self._eos_token_ids
+
+    @property
+    def sampling_defaults(self) -> dict[str, Any]:
+        """Recommended sampling defaults from generation_config (e.g. temperature, top_k, top_p)."""
+        return dict(self._sampling_defaults)
+
+    @property
+    def chat_template(self) -> str | None:
+        """The chat template string assigned to the underlying tokenizer, or None."""
+        return getattr(self._tok, "chat_template", None)
 
     @property
     def bos_token_id(self) -> int | None:
