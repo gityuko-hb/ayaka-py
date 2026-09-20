@@ -445,9 +445,12 @@ class VocabParallelEmbedding(BaseLayer):
         return self.weight_loader
 
     def _select_fused_op(self) -> None:
-        if self.backend != "triton" or self.tp_size == 1 or self.quant_config is not None:
+        if self.backend != "triton" or self.quant_config is not None:
             return
-        self._fused_op = load_kernel(self.backend, "embedding", "vocab_parallel_embedding")
+        if self.tp_size == 1 and self.num_added_embeddings == 0:
+            self._fused_op = load_kernel(self.backend, "embedding", "embedding_lookup")
+        else:
+            self._fused_op = load_kernel(self.backend, "embedding", "vocab_parallel_embedding")
 
     def _fused_available(self, input_: torch.Tensor) -> bool:
         return (
@@ -587,26 +590,28 @@ class VocabParallelEmbedding(BaseLayer):
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         self._validate_input(input_)
-        if self.tp_size == 1:
-            return self._embedding(input_)
-
         indices = self.shard_indices
         if self._fused_available(input_):
             flat = input_.reshape(-1)
             assert self._fused_op is not None
-            output = self.run_kernel(
-                self._fused_op,
-                flat,
-                self.weight,
-                indices.org_vocab_start_index,
-                indices.org_vocab_end_index,
-                indices.num_org_vocab_padding,
-                indices.added_vocab_start_index,
-                indices.added_vocab_end_index,
-            )
+            if self.tp_size == 1 and self.num_added_embeddings == 0:
+                output = self.run_kernel(self._fused_op, flat, self.weight)
+            else:
+                output = self.run_kernel(
+                    self._fused_op,
+                    flat,
+                    self.weight,
+                    indices.org_vocab_start_index,
+                    indices.org_vocab_end_index,
+                    indices.num_org_vocab_padding,
+                    indices.added_vocab_start_index,
+                    indices.added_vocab_end_index,
+                )
             if input_.ndim != 1:
                 output = output.view(*input_.shape, self.embedding_dim)
         else:
+            if self.tp_size == 1:
+                return self._embedding(input_)
             masked_input, invalid_mask = masked_vocab_input(
                 input_,
                 org_vocab_start_index=indices.org_vocab_start_index,
@@ -617,7 +622,9 @@ class VocabParallelEmbedding(BaseLayer):
             )
             output = self._embedding(masked_input)
             output.masked_fill_(invalid_mask.unsqueeze(-1), 0)
-        return self.parallel_context.all_reduce(output)
+        if self.tp_size > 1:
+            output = self.parallel_context.all_reduce(output)
+        return output
 
     def extra_repr(self) -> str:
         return (

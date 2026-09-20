@@ -175,3 +175,69 @@ def vocab_parallel_embedding(
             num_warps=_NUM_WARPS,
         )
     return output
+
+
+@triton.jit
+def _simple_embedding_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    hidden,
+    BLOCK_D: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    token_id = tl.load(input_ptr + token).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    col_mask = cols < hidden
+    row = tl.load(weight_ptr + token_id * hidden + cols, mask=col_mask)
+    tl.store(output_ptr + token * hidden + cols, row, mask=col_mask)
+
+
+def _simple_reference(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.embedding(input_.long(), weight)
+
+
+def _simple_fake(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.empty((input_.numel(), weight.shape[1]), dtype=weight.dtype, device=weight.device)
+
+
+def _simple_validate(input_: torch.Tensor, weight: torch.Tensor) -> None:
+    if not isinstance(input_, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        raise TypeError("input and weight must be torch.Tensors")
+    if input_.dtype not in (torch.int32, torch.int64):
+        raise TypeError("input ids must be int32 or int64")
+    if input_.ndim != 1 or not input_.is_contiguous():
+        raise ValueError("input ids must be a contiguous 1-D tensor")
+    if weight.ndim != 2 or weight.dtype not in _SUPPORTED_DTYPES or weight.stride(1) != 1:
+        raise ValueError("weight must be a row-contiguous 2-D floating tensor")
+    if input_.device != weight.device:
+        raise ValueError("input and weight must share a device")
+
+
+@custom_op(
+    namespace="ayaka",
+    name="embedding_lookup",
+    fake_impl=_simple_fake,
+    reference=_simple_reference,
+    dispatch_key="CUDA",
+    caps=Cap.CUDAGRAPH_SAFE,
+)
+def embedding_lookup(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Gather token rows directly without sharding or padding logic."""
+    _simple_validate(input_, weight)
+    num_tokens, hidden = input_.numel(), weight.shape[1]
+    output = torch.empty((num_tokens, hidden), dtype=weight.dtype, device=weight.device)
+    if num_tokens == 0:
+        return output
+    block_d = min(_MAX_BLOCK_D, triton.next_power_of_2(hidden))
+    grid = (num_tokens, triton.cdiv(hidden, block_d))
+    with torch.cuda.device(weight.device):
+        cast(Any, _simple_embedding_kernel)[grid](
+            input_,
+            weight,
+            output,
+            hidden,
+            BLOCK_D=block_d,
+            num_warps=_NUM_WARPS,
+        )
+    return output
