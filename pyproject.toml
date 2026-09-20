@@ -112,6 +112,7 @@ ignore = ["F405", "F403"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["python", "."]
 timeout = 30
 markers = [
     "slow: spawns a real OS process; keep to cases a thread cannot prove",

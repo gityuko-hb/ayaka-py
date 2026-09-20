@@ -82,9 +82,19 @@ def safe_join(root: Path, relative: str) -> Path:
     try:
         resolved.relative_to(resolved_root)
     except ValueError as exc:
-        raise CheckpointSecurityError(
-            f"{relative!r} resolves to {resolved} which is outside the snapshot {resolved_root}"
-        ) from exc
+        # Allow Hugging Face Hub blob symlinks within the hub cache directory
+        in_hub_blobs = False
+        try:
+            if resolved_root.parent.name == "snapshots":
+                hub_dir = resolved_root.parent.parent.parent
+                if (hub_dir / "blobs").is_dir() and resolved.is_relative_to(hub_dir):
+                    in_hub_blobs = True
+        except (ValueError, AttributeError):
+            pass
+        if not in_hub_blobs:
+            raise CheckpointSecurityError(
+                f"{relative!r} resolves to {resolved} which is outside the snapshot {resolved_root}"
+            ) from exc
     return resolved
 
 
