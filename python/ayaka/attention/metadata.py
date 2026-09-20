@@ -112,8 +112,11 @@ class BaseAttentionMetadataBuilder[M: BaseAttentionMetadata](ABC):
     #: instance copies it and may lower the effective support after inspecting its group.
     cudagraph_support: AttentionCudaGraphSupport = AttentionCudaGraphSupport.NEVER
 
-    #: Whether ``build`` needs host-side sequence lengths (blocks overlap scheduling on the
-    #: H2D copy issued by PinnedStaging). FlashInfer needs them; Triton and FA do not.
+    #: Whether ``build`` needs host-side sequence lengths, so a future pinned-staging
+    #: overlap scheduler can block the H2D copy until they are ready. FlashInfer's
+    #: ``plan()`` reads host indptr; Triton validates host mirrors in ``build``. Neither
+    #: backend reads them on the graph replay path -- ``build_for_replay`` is copy-only
+    #: by contract, and the replay kernels take every bound from device tensors.
     reads_host_lens: ClassVar[bool] = False
 
     def __init__(
@@ -130,6 +133,7 @@ class BaseAttentionMetadataBuilder[M: BaseAttentionMetadata](ABC):
         self.max_graph_batch_size: int | None = None
         self.max_graph_seq_len: int | None = None
         self.max_graph_query_len: int | None = None
+        self.graph_padding_slot: int | None = None
         # Instance copy so a builder can LOWER its declared support after inspecting the
         # group (e.g. a spec-decode-capable kernel serving a group that never verifies).
         # Raising it above the class value is never correct -- the registry advertised the
@@ -147,17 +151,23 @@ class BaseAttentionMetadataBuilder[M: BaseAttentionMetadata](ABC):
         max_seq_len: int,
         capture_sizes: list[int],
         max_query_len: int = 1,
+        padding_slot: int | None = None,
     ) -> None:
         """Allocate every persistent buffer this builder will hand to a capture.
 
         ``max_seq_len`` is the engine's live ceiling -- ``min(model max positions, KV token
         budget)`` -- not the longest sequence seen so far. Capture width is a promise about
         every future replay, so it must come from admission control, not from history.
+
+        ``padding_slot`` is the reserved padding page's flat slot, for backends whose
+        captured addressing must name a safe address for dummy decode lanes. Backends that
+        never materialize such a lane may ignore it.
         """
         self.capture_sizes = sorted(capture_sizes)
         self.max_graph_batch_size = max_batch_size
         self.max_graph_seq_len = max_seq_len
         self.max_graph_query_len = max_query_len
+        self.graph_padding_slot = None if padding_slot is None else int(padding_slot)
 
     def build_for_capture(self, common: CommonAttentionMetadata, padded_batch_size: int) -> M:
         """Metadata bound to the persistent buffers, for the capture pass."""
@@ -181,3 +191,4 @@ class BaseAttentionMetadataBuilder[M: BaseAttentionMetadata](ABC):
         self.max_graph_batch_size = None
         self.max_graph_seq_len = None
         self.max_graph_query_len = None
+        self.graph_padding_slot = None

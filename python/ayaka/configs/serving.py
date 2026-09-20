@@ -16,6 +16,8 @@ class ServingConfig:
     tool_parser: Literal["none", "hermes"] = "none"
     structured_outputs: bool = True
     expose_metrics: bool = True
+    decode_graph: bool = False
+    graph_buckets: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.model or any(not key for key in self.api_keys):
@@ -29,3 +31,12 @@ class ServingConfig:
             raise ValueError("unknown reasoning parser")
         if self.tool_parser not in ("none", "hermes"):
             raise ValueError("unknown tool parser")
+        if self.graph_buckets is not None:
+            buckets = tuple(self.graph_buckets)
+            if not buckets or any(
+                not isinstance(bucket, int) or isinstance(bucket, bool) or bucket < 1
+                for bucket in buckets
+            ):
+                raise ValueError("graph_buckets must contain positive integers")
+            if tuple(sorted(set(buckets))) != buckets:
+                raise ValueError("graph_buckets must be ascending and deduplicated")

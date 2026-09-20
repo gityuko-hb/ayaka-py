@@ -266,12 +266,14 @@ class FlashInferMetadataBuilder(BaseAttentionMetadataBuilder):
         max_seq_len: int,
         capture_sizes: list[int],
         max_query_len: int = 1,
+        padding_slot: int | None = None,
     ) -> None:
         super().init_graph_state(
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             capture_sizes=capture_sizes,
             max_query_len=max_query_len,
+            padding_slot=padding_slot,
         )
         if max_query_len != 1:
             raise GraphStateError(

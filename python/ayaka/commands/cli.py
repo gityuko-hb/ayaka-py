@@ -32,6 +32,22 @@ def main(argv=None) -> None:
     serve.add_argument("--reasoning-parser", choices=("none", "think"), default="none")
     serve.add_argument("--tool-parser", choices=("none", "hermes"), default="none")
     serve.add_argument("--disable-structured-outputs", action="store_true")
+    serve.add_argument(
+        "--decode-graph",
+        action="store_true",
+        help="capture pure-decode CUDA graphs at bootstrap (CUDA + triton backend only)",
+    )
+    serve.add_argument(
+        "--graph-buckets",
+        default=None,
+        help="comma-separated padded decode batch sizes; defaults to a power-of-two ladder",
+    )
+    serve.add_argument(
+        "--graph-pool-bytes",
+        type=int,
+        default=0,
+        help="explicit graph-private reserve; 0 auto-sizes it on the triton backend",
+    )
     args = parser.parse_args(argv)
     import torch
     import uvicorn
@@ -81,6 +97,14 @@ def main(argv=None) -> None:
         )
     model.eval()
     keys = args.api_key if args.api_key is not None else os.getenv("AYAKA_API_KEY", "")
+    graph_buckets = None
+    if args.graph_buckets:
+        try:
+            graph_buckets = tuple(sorted({int(part) for part in args.graph_buckets.split(",")}))
+        except ValueError:
+            parser.error("--graph-buckets must be a comma-separated list of positive integers")
+        if not graph_buckets or graph_buckets[0] < 1:
+            parser.error("--graph-buckets must contain positive integers")
     runtime = ServingRuntime(
         model,
         args.tokenizer or args.model_path,
@@ -91,6 +115,8 @@ def main(argv=None) -> None:
             reasoning_parser=args.reasoning_parser,
             tool_parser=args.tool_parser,
             structured_outputs=not args.disable_structured_outputs,
+            decode_graph=args.decode_graph,
+            graph_buckets=graph_buckets,
         ),
         pages=args.kv_pages,
         page_size=args.page_size,
@@ -98,6 +124,7 @@ def main(argv=None) -> None:
         batch_tokens=args.batch_tokens,
         prefill_chunk=args.prefill_chunk,
         backend=args.backend,
+        graph_pool_bytes=args.graph_pool_bytes,
     )
     try:
         uvicorn.run(runtime.app(), host=args.host, port=args.port, workers=1)

@@ -468,11 +468,11 @@ class ResolvedSchedulerPlan(SchedulerConfig):
                 "MULTI_RANK_UNAVAILABLE",
                 "only a single-rank plan or a declared in-process pipeline is wired",
             )
-        if self.capabilities.graph_mode is not GraphMode.EAGER:
+        if self.capabilities.graph_mode not in (GraphMode.EAGER, GraphMode.REPLAY):
             raise ConfigError(
                 "capabilities.graph_mode",
-                "GRAPH_MODE_EAGER_ONLY",
-                "eager execution is the only wired graph mode",
+                "GRAPH_MODE_UNSUPPORTED",
+                "eager and replay are the wired graph modes; capture is internal to the runner",
             )
         if compute.num_micro_batches > self.max_inflight:
             raise ConfigError(

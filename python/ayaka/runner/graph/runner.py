@@ -121,14 +121,19 @@ def resolve_backend(
     *,
     device: torch.device,
     barrier_fn: Callable[[], None] | None = None,
+    enable_gc_freeze: bool = True,
 ) -> GraphBackend:
     """The one place a new backend kind gets wired in — nothing in
     DecodeGraphRunner needs to change to add one, per the Strategy +
     Factory split this whole module follows."""
     if kind is GraphBackendKind.FULL:
-        return FullGraphBackend(device=device, barrier_fn=barrier_fn)
+        return FullGraphBackend(
+            device=device, barrier_fn=barrier_fn, enable_gc_freeze=enable_gc_freeze
+        )
     if kind is GraphBackendKind.BREAKABLE:
-        return BreakableGraphBackend(device=device, barrier_fn=barrier_fn)
+        return BreakableGraphBackend(
+            device=device, barrier_fn=barrier_fn, enable_gc_freeze=enable_gc_freeze
+        )
     raise ValueError(f"unknown GraphBackendKind: {kind}")
 
 
@@ -161,6 +166,7 @@ class DecodeGraphRunner:
         backend_kind: GraphBackendKind = GraphBackendKind.FULL,
         barrier_fn: Callable[[], None] | None = None,
         generation_provider: Callable[[], Any] | None = None,
+        enable_gc_freeze: bool = True,
     ) -> None:
         if not buckets or list(buckets) != sorted(buckets):
             raise ValueError("buckets must be a non-empty, ascending, deduped list")
@@ -168,7 +174,13 @@ class DecodeGraphRunner:
         self._device = device
         self._arena = arena
         self._build_forward_fn = build_forward_fn
-        self._backend = resolve_backend(backend_kind, device=device, barrier_fn=barrier_fn)
+        self._backend_kind = backend_kind
+        self._backend = resolve_backend(
+            backend_kind,
+            device=device,
+            barrier_fn=barrier_fn,
+            enable_gc_freeze=enable_gc_freeze,
+        )
         self._generation_provider = generation_provider
         self._generation: Any = None
         self._captured = False
@@ -241,10 +253,16 @@ class DecodeGraphRunner:
         shape_key = ShapeKey(size=bucket)
         with self._backend.replay_session():
             # A per-call forward_fn restages the live step into the captured
-            # backing before replay; a full-graph backend ignores it at replay,
-            # a breakable backend runs its eager spans for real.
+            # backing before replay. A full-graph backend ignores it during
+            # replay, so the staging is invoked here explicitly — outside the
+            # recorded region, on the engine stream. A breakable backend runs
+            # its eager spans for real from inside replay().
             stage = forward_fn if forward_fn is not None else self._build_forward_fn(bucket)
-            raw_output = self._backend.replay(shape_key, forward_fn=stage)
+            if self._backend_kind is GraphBackendKind.BREAKABLE:
+                raw_output = self._backend.replay(shape_key, forward_fn=stage)
+            else:
+                stage()
+                raw_output = self._backend.replay(shape_key)
         return slice_rows(raw_output, raw_bs)
 
     def cleanup(self) -> None:

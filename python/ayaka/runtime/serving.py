@@ -47,7 +47,7 @@ from ayaka.memory.ledger import MemoryLedger, Reservation
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.source import TorchDeviceSource, TorchHostByteSource
 from ayaka.memory.workspace import WorkspaceManager
-from ayaka.plan import ComputePlan, ExecutionPlan, MemoryPlan
+from ayaka.plan import ComputePlan, ExecutionPlan, GraphMode, MemoryPlan
 from ayaka.prefix.identity import build_prefix_context
 from ayaka.runner.buffers import RunnerBuffers, RunnerBufferSpec
 from ayaka.runner.paged_runner import PagedModelRunner
@@ -153,9 +153,21 @@ class ServingRuntime:
                 the persistent runner-buffer staging requirement when smaller.
             device_total_bytes: Device size for the policy budget; queried from
                 CUDA when omitted.
+
+        Decode-graph policy comes from ``config.decode_graph`` /
+        ``config.graph_buckets``; ``graph_pool_bytes`` overrides the auto-sized
+        reserve. Capture failures fail initialization instead of serving a
+        half-captured graph path.
         """
         self.config = config or ServingConfig()
         self._closed = False
+        self._decode_graph = bool(self.config.decode_graph)
+        configured_buckets = self.config.graph_buckets
+        if self._decode_graph and configured_buckets is not None:
+            resolved_buckets = tuple(int(bucket) for bucket in configured_buckets)
+        else:
+            resolved_buckets = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+        self._graph_buckets = resolved_buckets
         parameter = next(model.parameters())
         device, dtype, model_config = parameter.device, parameter.dtype, model.config
         max_seq = model_config.max_position_embeddings
@@ -165,6 +177,8 @@ class ServingRuntime:
             raise ValueError("KV slab must fit at least one full model context plus padding page")
         if device.type == "cpu" and backend != "reference":
             raise ValueError("CPU serving requires the explicit reference attention backend")
+        if device.type == "cpu" and self._decode_graph:
+            raise ValueError("decode CUDA graphs require a CUDA device")
         if resize_safety_bytes < 0:
             raise ValueError("resize_safety_bytes must be non-negative")
 
@@ -230,6 +244,8 @@ class ServingRuntime:
             ),
             page_size,
         )
+        if self._decode_graph and self._graph_bytes == 0:
+            self._graph_bytes = self._estimate_graph_bytes()
         self._execution = ExecutionPlan(
             "serving",
             self.config.model,
@@ -255,6 +271,7 @@ class ServingRuntime:
             chunked_prefill=True,
             prefix_cache=True,
             recompute_preemption=True,
+            graph_mode=GraphMode.REPLAY if self._decode_graph else GraphMode.EAGER,
         )
         # R07: persistent per-flight metadata buffers. The device footprint is
         # reserved through the frozen capacity plan; pinned staging mirrors the
@@ -676,7 +693,11 @@ class ServingRuntime:
         runner = None
         try:
             runner = self._build_runner(kv, buffers)
+            if self._decode_graph:
+                runner.enable_graph(self._decode_graph_config(kv))
             engine = self._build_engine(kv, runner, ledger, workspace, buffers)
+            if self._decode_graph and runner.graph_pool is not None:
+                runner.graph_pool.attach_metrics(engine.executor.metrics)
         except BaseException:
             if runner is not None:
                 runner.close()
@@ -698,6 +719,52 @@ class ServingRuntime:
             runner=runner,
             engine=engine,
         )
+
+    def _decode_graph_config(self, kv: LogicalKVManager):
+        """Bootstrap capture config: buckets, ceilings, padding address, budget."""
+        from ayaka.runner.graph.pool import DecodeGraphConfig
+
+        return DecodeGraphConfig(
+            buckets=self._graph_buckets,
+            max_model_len=self._max_seq,
+            padding_page=kv.padding_page,
+            padding_slot=kv.padding_slot,
+            reserve_bytes=self._graph_bytes,
+        )
+
+    def _estimate_graph_bytes(self) -> int:
+        """Reserve for the persistent graph state plus the capture memory pool.
+
+        The Triton builder prices its persistent buffers without a device; the
+        measured activation peak is the upper bound for what capture records
+        into the graph pool. Any other backend must state ``graph_pool_bytes``
+        explicitly — guessing another backend's footprint would under-reserve
+        silently.
+        """
+        if self._backend_name != "triton":
+            raise ValueError("graph_pool_bytes must be set explicitly for non-Triton decode graphs")
+        ceiling = min(self._max_requests, self._batch_tokens)
+        largest = max((bucket for bucket in self._graph_buckets if bucket <= ceiling), default=0)
+        if largest < 1:
+            raise ValueError("no decode graph bucket fits the scheduler ceilings")
+        from ayaka.attention.backend.triton_backend import (
+            DEFAULT_KV_PARTITION_SIZE,
+            TritonAttentionMetadataBuilder,
+        )
+
+        spec = self._group.spec
+        persistent = TritonAttentionMetadataBuilder.estimate_graph_state_bytes(
+            max_batch_size=largest,
+            max_seq_len=self._max_seq,
+            page_size=self._page_size,
+            num_qo_heads=spec.num_qo_heads,
+            head_dim_qk=spec.head_dim_qk,
+            head_dim_vo=spec.head_dim_vo,
+            kv_partition_size=DEFAULT_KV_PARTITION_SIZE,
+            output_dtype=self._dtype,
+            sliding_window=spec.sliding_window,
+        )
+        return persistent + self._activation_bytes
 
     def _bind_tail(self, tail: _KVTail) -> None:
         """Point every public attribute at the new owner set."""

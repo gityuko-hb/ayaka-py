@@ -115,6 +115,26 @@ class LogicalKVManager:
         """Frozen resource generation, or None while capacity is unbound."""
         return None if self.capacity is None else self.capacity.generation
 
+    @property
+    def padding_page(self) -> int:
+        """Reserved padding page dummy decode lanes write to (homogeneous KV).
+
+        Grouped backends keep one padding page per group; a single graph slot
+        has no meaning there, so callers get a loud error instead of a guess.
+        """
+        self._require_open()
+        if not isinstance(self.backend, RuntimeMemoryManager):
+            raise RuntimeError("grouped KV has no single padding page")
+        return self.backend.padding_physical_page
+
+    @property
+    def padding_slot(self) -> int:
+        """Flat slot address of the reserved padding page's first position."""
+        self._require_open()
+        if not isinstance(self.backend, RuntimeMemoryManager):
+            raise RuntimeError("grouped KV has no single padding slot")
+        return self.backend.padding_slot
+
     def bind_capacity(self, snapshot: CapacitySnapshot) -> None:
         """Freeze one capacity snapshot for this slab set, exactly once."""
         self._require_open()

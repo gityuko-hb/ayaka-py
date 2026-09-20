@@ -127,6 +127,7 @@ class DecodeGraphPlanner:
         self._metrics = metrics
         self._captured_generation: ResourceGeneration | None = None
         self._invalidated = False
+        self._invalidation_reason: GraphFallbackReason = GraphFallbackReason.INVALIDATED
         self._hits = 0
         self._misses = 0
         self._captures = 0
@@ -147,12 +148,15 @@ class DecodeGraphPlanner:
         if buckets:
             for bucket in buckets:
                 if bucket not in self._buckets:
-                    raise ValueError(f"captured bucket {bucket} is not in the planner's bucket list")
+                    raise ValueError(
+                        f"captured bucket {bucket} is not in the planner's bucket list"
+                    )
                 if bucket < 1:
                     raise ValueError("captured buckets must be positive")
         self._captured_generation = self._generation()
         self._captures += 1
         self._invalidated = False
+        self._invalidation_reason = GraphFallbackReason.INVALIDATED
         self._bump("graph_capture")
 
     @property
@@ -191,7 +195,7 @@ class DecodeGraphPlanner:
         if self._support < AttentionCudaGraphSupport.PURE_DECODE:
             return self._fallback(GraphFallbackReason.BACKEND_UNSUPPORTED)
         if self._invalidated:
-            return self._fallback(GraphFallbackReason.INVALIDATED)
+            return self._fallback(self._invalidation_reason)
         if not self._generation_current():
             self.invalidate(GraphFallbackReason.GENERATION_MISMATCH)
             return self._fallback(GraphFallbackReason.GENERATION_MISMATCH)
@@ -234,9 +238,7 @@ class DecodeGraphPlanner:
                 f"size {step.padded_num_tokens} -> {bucket}"
             )
         if step.graph.bucket not in self._captured():
-            raise GraphCapabilityError(
-                f"graph bucket {step.graph.bucket} has no captured instance"
-            )
+            raise GraphCapabilityError(f"graph bucket {step.graph.bucket} has no captured instance")
         expected = self.graph_key(step.graph.bucket)
         if step.graph.graph_key != expected:
             raise GraphCapabilityError(
@@ -255,7 +257,7 @@ class DecodeGraphPlanner:
         if not self._enabled:
             return self._refuse_execution(GraphFallbackReason.DISABLED)
         if self._invalidated:
-            return self._refuse_execution(GraphFallbackReason.INVALIDATED)
+            return self._refuse_execution(self._invalidation_reason)
         if not self._generation_current():
             self.invalidate(GraphFallbackReason.GENERATION_MISMATCH)
             return self._refuse_execution(GraphFallbackReason.GENERATION_MISMATCH)
@@ -268,7 +270,6 @@ class DecodeGraphPlanner:
         if bucket not in self._buckets:
             raise ValueError(f"replayed bucket {bucket} is not a configured bucket")
         self._hits += 1
-        self._last_reason = ""
         self._bump("graph_hit")
 
     # ── invalidation ──────────────────────────────────────────────────────
@@ -279,6 +280,9 @@ class DecodeGraphPlanner:
         if self._invalidated and self._last_reason == label:
             return
         self._invalidated = True
+        self._invalidation_reason = (
+            reason if isinstance(reason, GraphFallbackReason) else GraphFallbackReason.INVALIDATED
+        )
         self._last_reason = label
         self._invalidations += 1
         self._bump("graph_invalidation")

@@ -113,6 +113,12 @@ class ResidentKVExecutor(Executor):
         context = nullcontext() if self.stream is None else torch.cuda.stream(self.stream)
         with context, torch.inference_mode():
             self._apply_cow(ticket)
+            note_growth = getattr(self.runner, "on_workspace_growth", None)
+            if note_growth is not None and getattr(ticket._resources, "workspace_grew", False):
+                # The step grew the shared workspace; any captured graph that
+                # bound the old addresses must not replay. The runner falls back
+                # to eager for this step and recaptures before the next replay.
+                note_growth()
             samples = self.runner(ticket.prepared)
             if samples.token_ids.device != self.device:
                 raise ValueError("runner samples must reside on the KV device")

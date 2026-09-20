@@ -41,6 +41,7 @@ Flow:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -97,6 +98,22 @@ class _GenerationReport:
     ids_raw_count: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _ForwardResult:
+    """Logits for one step plus the reporting metadata that produced them.
+
+    ``logits`` rows follow the packed order: sampling rows first, then
+    prompt-scored rows. A graph runner returns logits whose projection already
+    happened inside the captured graph, so the base class must not re-project.
+    """
+
+    logits: torch.Tensor
+    sampling_count: int
+    prompt_descriptors: tuple[PromptLogprobSliceReport, ...] = ()
+    prompt_targets: tuple[int, ...] = ()
+    prompt_ks: tuple[int, ...] = ()
+
+
 class ModelRunner:
     """Run one real model forward + LogitsProcessor + Sampler per prepared step."""
 
@@ -141,23 +158,19 @@ class ModelRunner:
         self._coordinator.flush()
 
         report = self._generation_report(step)
-        (
-            hidden_packed,
-            sampling_count,
-            prompt_descriptors,
-            prompt_targets,
-            prompt_ks,
-        ) = self._forward_prepared(prepared)
+        forward = self._forward_tail(prepared)
+        logits = forward.logits
+        sampling_count = forward.sampling_count
+        prompt_descriptors = forward.prompt_descriptors
+        prompt_targets = forward.prompt_targets
+        prompt_ks = forward.prompt_ks
 
         if sampling_count != plan.num_rows:
             raise RuntimeError(
                 f"model runner projected {sampling_count} sampling rows but the "
                 f"sampling plan declares {plan.num_rows}"
             )
-        total_rows = hidden_packed.size(0)
-        logits_plan = LogitsPlan(
-            projection_rows=tuple(range(total_rows)), sampling_row_count=sampling_count
-        )
+        total_rows = logits.size(0)
 
         token_ids: torch.Tensor
         gen_logprobs = None
@@ -165,8 +178,6 @@ class ModelRunner:
         prompt_logprobs = None
         support = None
         if total_rows > 0:
-            logits = self._logits(hidden_packed, logits_plan)
-
             # RAW-mode rows (and all prompt rows) need the pre-mutation
             # snapshot; SAMPLING-mode rows are scored from the post-mutation
             # logits after the draw, so they never enter the snapshot.
@@ -198,7 +209,7 @@ class ModelRunner:
                     prompt_ks,
                 )
         else:
-            token_ids = torch.empty(0, dtype=torch.long, device=hidden_packed.device)
+            token_ids = torch.empty(0, dtype=torch.long, device=logits.device)
             ids_logprobs, ids_rows, ids_counts = None, (), ()
 
         return SampleOutputs(
@@ -255,6 +266,37 @@ class ModelRunner:
     def _validate_prepared(self, prepared: PreparedStep) -> None:
         """Validate host contracts before even flushing sampling device updates."""
         prepared.validate()
+
+    def _forward_tail(self, prepared: PreparedStep) -> _ForwardResult:
+        """Produce logits for this step's packed sampling/report rows.
+
+        The default path forwards hidden rows and then runs the model's LM head
+        through ``LogitsPlan``. A runner whose model forward is captured inside
+        a CUDA graph overrides this to return the captured logits, so the LM
+        head never runs twice and the sampler stays outside the graph.
+        """
+        (
+            hidden_packed,
+            sampling_count,
+            prompt_descriptors,
+            prompt_targets,
+            prompt_ks,
+        ) = self._forward_prepared(prepared)
+        total_rows = hidden_packed.size(0)
+        if total_rows:
+            logits_plan = LogitsPlan(
+                projection_rows=tuple(range(total_rows)), sampling_row_count=sampling_count
+            )
+            logits = self._logits(hidden_packed, logits_plan)
+        else:
+            logits = torch.empty((0, 0), dtype=torch.float32, device=hidden_packed.device)
+        return _ForwardResult(
+            logits=logits,
+            sampling_count=sampling_count,
+            prompt_descriptors=tuple(prompt_descriptors),
+            prompt_targets=tuple(prompt_targets),
+            prompt_ks=tuple(prompt_ks),
+        )
 
     def _forward_prepared(self, prepared: PreparedStep):
         """Forward hook for runners consuming execution-lease KV addresses."""
@@ -328,7 +370,7 @@ class ModelRunner:
         logits: torch.Tensor,
         report: _GenerationReport,
         sampling_count: int,
-        prompt_descriptors: list[PromptLogprobSliceReport],
+        prompt_descriptors: Sequence[PromptLogprobSliceReport],
     ):
         """FP32 copy of the RAW-mode report rows' logits, before any transform.
 

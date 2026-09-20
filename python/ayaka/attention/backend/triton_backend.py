@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +10,7 @@ from ayaka.attention.errors import (
     AttentionErrorCode,
     AttentionMetadataError,
     BackendCapabilityError,
+    GraphStateError,
 )
 from ayaka.attention.metadata import (
     BaseAttentionMetadata,
@@ -31,13 +33,14 @@ from ayaka.types import (
 )
 
 __all__ = [
+    "DEFAULT_KV_PARTITION_SIZE",
     "TritonAttentionBackend",
     "TritonAttentionMetadata",
     "TritonAttentionMetadataBuilder",
 ]
 
 _MAX_HEAD_DIM = 256
-_DEFAULT_KV_PARTITION_SIZE = 512
+DEFAULT_KV_PARTITION_SIZE = 512
 
 
 def _check_group_supported(
@@ -165,13 +168,21 @@ class TritonAttentionMetadata(BaseAttentionMetadata):
 class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentionMetadata]):
     """Build exact ragged slot lists for the Triton kernels.
 
-    The output width of the CSR gather is ``sum(seq_lens)``. That value comes from the
-    scheduler-maintained CPU mirror, while all page-table indexing stays on the CUDA device.
-    Because eager construction allocates tensors with that dynamic width, this first backend
-    integration deliberately makes no CUDA-graph promise.
+    The eager ``build`` path gathers a CSR list whose width is ``sum(seq_lens)``; that
+    value comes from the scheduler-maintained CPU mirror, while all page-table indexing
+    stays on the CUDA device. Eager construction allocates tensors with that dynamic width,
+    so it is not capture-safe by itself.
+
+    Graph state (R08) serves ``PURE_DECODE`` only. The capture path lays each request's
+    flat KV slots out in a fixed-width row (``indptr[r] = r * max_slots``), so every
+    address the decode kernels see is static and every staging step is a copy into
+    persistent buffers — no shape-dependent allocation and no host read on replay. Padded
+    rows keep ``seq_lens == 0`` and their whole row points at the reserved padding page;
+    the decode kernels bound their KV loop by ``min(indptr_span, position + 1)``, so a
+    dummy decode lane reads and writes nothing live.
     """
 
-    cudagraph_support = AttentionCudaGraphSupport.NEVER
+    cudagraph_support = AttentionCudaGraphSupport.PURE_DECODE
     reads_host_lens = True
 
     def __init__(
@@ -180,7 +191,7 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
         kv_cache: PagedKVCache,
         device: torch.device,
         *,
-        kv_partition_size: int = _DEFAULT_KV_PARTITION_SIZE,
+        kv_partition_size: int = DEFAULT_KV_PARTITION_SIZE,
     ) -> None:
         super().__init__(group, kv_cache, device)
         if (
@@ -191,6 +202,23 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
         ):
             raise ValueError("kv_partition_size must be a positive multiple of 32")
         self.kv_partition_size = kv_partition_size
+        self._graph_max_batch_size = 0
+        self._graph_max_seq_len = 0
+        self._graph_max_columns = 0
+        self._graph_max_slots = 0
+        self._graph_padding_slot = 0
+        self._graph_indptr: torch.Tensor | None = None
+        self._graph_query_to_request: torch.Tensor | None = None
+        self._graph_attn_logits: torch.Tensor | None = None
+        self._graph_attn_lse: torch.Tensor | None = None
+        self._graph_output: torch.Tensor | None = None
+        self._graph_token_positions: torch.Tensor | None = None
+        self._graph_page_columns: torch.Tensor | None = None
+        self._graph_page_offsets: torch.Tensor | None = None
+        self._graph_request_offsets: torch.Tensor | None = None
+        self._graph_slots_scratch: torch.Tensor | None = None
+        self._graph_invalid_scratch: torch.Tensor | None = None
+        self._graph_bytes = 0
 
     def _validate_common(self, common: CommonAttentionMetadata) -> tuple[int, int]:
         group_id = self.group.group_id
@@ -340,6 +368,279 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
             output_size=common.num_tokens,
         )
 
+    # ----- cuda graph (R08, PURE_DECODE) ---------------------------------------------------
+
+    @staticmethod
+    def graph_state_layout(
+        *,
+        max_batch_size: int,
+        max_seq_len: int,
+        page_size: int,
+        num_qo_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        kv_partition_size: int,
+        output_dtype: torch.dtype,
+        sliding_window: int | None = None,
+    ) -> tuple[tuple[str, tuple[int, ...], torch.dtype], ...]:
+        """Shape and dtype of every persistent decode-graph buffer, in one place.
+
+        ``init_graph_state`` allocates exactly this layout and
+        :meth:`estimate_graph_state_bytes` prices it without a device, so the
+        reserve admitted before capture cannot drift from the real allocation.
+        """
+        columns = (max_seq_len + page_size - 1) // page_size
+        max_slots = columns * page_size
+        partitions = compute_max_num_partitions(
+            max(1, max_seq_len),
+            kv_partition_size,
+            sliding_window,
+        )
+        return (
+            ("indptr", (max_batch_size + 1,), torch.int32),
+            ("query_to_request", (max_batch_size,), torch.int32),
+            (
+                "attn_logits",
+                (max_batch_size, num_qo_heads, partitions, head_dim_vo),
+                torch.float32,
+            ),
+            ("attn_lse", (max_batch_size, num_qo_heads, partitions), torch.float32),
+            ("output", (max_batch_size, num_qo_heads, head_dim_qk), output_dtype),
+            ("token_positions", (max_slots,), torch.int32),
+            ("page_columns", (max_slots,), torch.int64),
+            ("page_offsets", (max_slots,), torch.int32),
+            ("request_offsets", (max_batch_size,), torch.int32),
+            ("slots_scratch", (max_batch_size, max_slots), torch.int32),
+            ("invalid_scratch", (max_batch_size, max_slots), torch.bool),
+        )
+
+    @classmethod
+    def estimate_graph_state_bytes(
+        cls,
+        *,
+        max_batch_size: int,
+        max_seq_len: int,
+        page_size: int,
+        num_qo_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        kv_partition_size: int,
+        output_dtype: torch.dtype,
+        sliding_window: int | None = None,
+    ) -> int:
+        """Bytes ``init_graph_state`` will allocate, with no device needed."""
+        return sum(
+            math.prod(shape) * dtype.itemsize
+            for _, shape, dtype in cls.graph_state_layout(
+                max_batch_size=max_batch_size,
+                max_seq_len=max_seq_len,
+                page_size=page_size,
+                num_qo_heads=num_qo_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                kv_partition_size=kv_partition_size,
+                output_dtype=output_dtype,
+                sliding_window=sliding_window,
+            )
+        )
+
+    def init_graph_state(
+        self,
+        *,
+        max_batch_size: int,
+        max_seq_len: int,
+        capture_sizes: list[int],
+        max_query_len: int = 1,
+        padding_slot: int | None = None,
+    ) -> None:
+        """Allocate every persistent buffer a decode capture will bind.
+
+        ``padding_slot`` is the reserved padding page's flat slot; padded rows point
+        there so a dummy decode lane never touches a live page. ``max_seq_len`` is the
+        engine's token ceiling, not the longest sequence seen.
+        """
+        super().init_graph_state(
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            capture_sizes=capture_sizes,
+            max_query_len=max_query_len,
+        )
+        if max_query_len != 1:
+            raise GraphStateError(
+                AttentionErrorCode.GRAPH_MODE_UNSUPPORTED,
+                "Triton captures pure decode only; a uniform multi-token query batch "
+                "needs the ragged prefill path",
+                max_query_len=max_query_len,
+            )
+        page = self.group.page_size
+        columns = (max_seq_len + page - 1) // page
+        max_slots = columns * page
+        spec = self.spec
+        device = self.device
+        self._graph_max_batch_size = max_batch_size
+        self._graph_max_seq_len = max(1, max_seq_len)
+        self._graph_max_columns = columns
+        self._graph_max_slots = max_slots
+        self._graph_padding_slot = 0 if padding_slot is None else int(padding_slot)
+        if self._graph_padding_slot < 0:
+            raise GraphStateError(
+                AttentionErrorCode.GRAPH_STAGING_WIDTH_EXCEEDED,
+                "the padding slot must be a non-negative flat slot address",
+                padding_slot=self._graph_padding_slot,
+            )
+        buffers = {
+            name: torch.zeros(shape, dtype=dtype, device=device)
+            for name, shape, dtype in self.graph_state_layout(
+                max_batch_size=max_batch_size,
+                max_seq_len=max_seq_len,
+                page_size=page,
+                num_qo_heads=spec.num_qo_heads,
+                head_dim_qk=spec.head_dim_qk,
+                head_dim_vo=spec.head_dim_vo,
+                kv_partition_size=self.kv_partition_size,
+                output_dtype=self.kv_cache.dtype,
+                sliding_window=spec.sliding_window,
+            )
+        }
+        buffers["token_positions"] = torch.arange(max_slots, dtype=torch.int32, device=device)
+        buffers["page_columns"] = (buffers["token_positions"] // page).to(torch.int64)
+        buffers["page_offsets"] = buffers["token_positions"] % page
+        buffers["request_offsets"] = torch.arange(
+            1, max_batch_size + 1, dtype=torch.int32, device=device
+        )
+        buffers["query_to_request"] = torch.arange(max_batch_size, dtype=torch.int32, device=device)
+        self._graph_indptr = buffers["indptr"]
+        self._graph_indptr[1:].copy_(buffers["request_offsets"])
+        self._graph_indptr[1:].mul_(max_slots)
+        self._graph_query_to_request = buffers["query_to_request"]
+        self._graph_attn_logits = buffers["attn_logits"]
+        self._graph_attn_lse = buffers["attn_lse"]
+        self._graph_output = buffers["output"]
+        self._graph_token_positions = buffers["token_positions"]
+        self._graph_page_columns = buffers["page_columns"]
+        self._graph_page_offsets = buffers["page_offsets"]
+        self._graph_request_offsets = buffers["request_offsets"]
+        self._graph_slots_scratch = buffers["slots_scratch"]
+        self._graph_invalid_scratch = buffers["invalid_scratch"]
+        self._graph_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in buffers.values()
+        )
+
+    @property
+    def graph_state_bytes(self) -> int:
+        """Persistent backend buffers a decode capture depends on, in bytes."""
+        return self._graph_bytes
+
+    def _stage_graph_decode(
+        self, common: CommonAttentionMetadata, padded_batch_size: int
+    ) -> TritonAttentionMetadata:
+        """Copy one padded batch's addressing into the persistent graph buffers.
+
+        Runs OUTSIDE the captured region on the engine stream, immediately before
+        ``graph.replay()``. Every op is a static-shape device write into memory the
+        capture already bound; the captured kernels read the buffers, so table values,
+        sequence lengths and prefix hits may change without invalidating the graph.
+
+        ``indptr`` and ``query_to_request`` are bucket constants written once by
+        ``init_graph_state``; only the slot list depends on this step's page table
+        and lengths. The slot list aliases ``slots_scratch`` (no second buffer, no
+        copy), and an invalid lane is masked to the reserved padding slot in place.
+        """
+        indptr = self._graph_indptr
+        query_to_request = self._graph_query_to_request
+        slots = self._graph_slots_scratch
+        invalid_scratch = self._graph_invalid_scratch
+        logits_scratch = self._graph_attn_logits
+        lse_scratch = self._graph_attn_lse
+        output = self._graph_output
+        if (
+            indptr is None
+            or query_to_request is None
+            or slots is None
+            or invalid_scratch is None
+            or logits_scratch is None
+            or lse_scratch is None
+            or output is None
+            or self._graph_token_positions is None
+            or self._graph_page_columns is None
+            or self._graph_page_offsets is None
+        ):
+            raise GraphStateError(
+                AttentionErrorCode.GRAPH_NOT_INITIALIZED,
+                "init_graph_state has not run for this group",
+                group_id=self.group.group_id,
+            )
+        bs = padded_batch_size
+        if bs < 1 or bs > self._graph_max_batch_size:
+            raise GraphStateError(
+                AttentionErrorCode.GRAPH_BATCH_SIZE_UNSUPPORTED,
+                "padded batch size exceeds the captured maximum",
+                padded_batch_size=bs,
+                max_batch_size=self._graph_max_batch_size,
+            )
+        table = common.block_table[:bs]
+        if table.shape[1] < self._graph_max_columns:
+            raise GraphStateError(
+                AttentionErrorCode.GRAPH_STAGING_WIDTH_EXCEEDED,
+                "the staged block table is narrower than the captured ceiling",
+                width=int(table.shape[1]),
+                max_columns=self._graph_max_columns,
+            )
+        max_slots = self._graph_max_slots
+        seq_lens = common.seq_lens[:bs]
+        indices = slots[:bs, :max_slots]
+        torch.index_select(table, 1, self._graph_page_columns, out=indices)
+        indices.mul_(self.group.page_size)
+        indices.add_(self._graph_page_offsets)
+        invalid = invalid_scratch[:bs, :max_slots]
+        torch.ge(self._graph_token_positions.unsqueeze(0), seq_lens.unsqueeze(1), out=invalid)
+        indices.masked_fill_(invalid, self._graph_padding_slot)
+        return TritonAttentionMetadata(
+            common=common,
+            indptr=indptr[: bs + 1],
+            indices=indices.reshape(-1),
+            query_to_request=query_to_request[:bs],
+            attn_logits=logits_scratch[:bs],
+            attn_lse=lse_scratch[:bs],
+            max_context_len_bucket=self._graph_max_seq_len,
+            decode=True,
+            output=output[:bs],
+        )
+
+    def build_for_capture(
+        self, common: CommonAttentionMetadata, padded_batch_size: int
+    ) -> TritonAttentionMetadata:
+        # Validation runs once per capture, outside the recorded region: it performs
+        # host reads that must never run on the replay path.
+        self._validate_common(common)
+        return self._stage_graph_decode(common, padded_batch_size)
+
+    def build_for_replay(
+        self, common: CommonAttentionMetadata, padded_batch_size: int
+    ) -> TritonAttentionMetadata:
+        # Copy-only staging: the planner and paged-input validation already rejected
+        # stale leases, so no host read or allocation is needed here.
+        return self._stage_graph_decode(common, padded_batch_size)
+
+    def reset_graph_state(self) -> None:
+        super().reset_graph_state()
+        self._graph_max_batch_size = 0
+        self._graph_max_seq_len = 0
+        self._graph_max_columns = 0
+        self._graph_max_slots = 0
+        self._graph_indptr = None
+        self._graph_query_to_request = None
+        self._graph_attn_logits = None
+        self._graph_attn_lse = None
+        self._graph_output = None
+        self._graph_token_positions = None
+        self._graph_page_columns = None
+        self._graph_page_offsets = None
+        self._graph_request_offsets = None
+        self._graph_slots_scratch = None
+        self._graph_invalid_scratch = None
+        self._graph_bytes = 0
+
     def build(self, common: CommonAttentionMetadata) -> TritonAttentionMetadata:
         total_kv_tokens, actual_max_seq_len = self._validate_common(common)
         indptr, indices = self._build_slot_csr(common, total_kv_tokens)
@@ -398,7 +699,7 @@ class TritonAttentionBackend(BaseAttentionBackend):
         kv_cache: PagedKVCache,
         device: torch.device,
         *,
-        kv_partition_size: int = _DEFAULT_KV_PARTITION_SIZE,
+        kv_partition_size: int = DEFAULT_KV_PARTITION_SIZE,
     ) -> None:
         resolved_device = torch.device(device)
         if resolved_device.type == "cuda" and resolved_device.index is None:
