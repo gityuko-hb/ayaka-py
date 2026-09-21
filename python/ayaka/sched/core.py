@@ -113,7 +113,12 @@ class SchedulerCore(BaseScheduler):
     # Base lifecycle operations
     # ------------------------------------------------------------------
 
-    def add_request(self, request: Request) -> RequestLifecycle:
+    def add_request(
+        self,
+        request: Request,
+        *,
+        defer_to_remote_kv: bool = False,
+    ) -> RequestLifecycle:
         """Validate, bind a sequence, and enqueue the request.
 
         n > 1 mở rộng tại admission thành n request con độc lập
@@ -121,7 +126,8 @@ class SchedulerCore(BaseScheduler):
         (nguyên tắc "expand at admission" thay vì fork động giữa chừng).
         Prompt KV bị NHÂN BẢN cho mỗi child — chưa có prefix sharing (paged
         runtime là backlog). Trả lifecycle của child đầu; caller thấy token
-        theo child id.
+        theo child id. ``defer_to_remote_kv`` dừng ở WAITING_REMOTE_KV; một
+        RemoteKVPending registry phải chủ động cho request đi tiếp.
         """
         if request.sampling.n > 1:
             first: RequestLifecycle | None = None
@@ -135,7 +141,7 @@ class SchedulerCore(BaseScheduler):
                     sampling=replace(request.sampling, n=1, seed=child_seed),
                     stop=request.stop,
                 )
-                lifecycle = self.add_request(child)
+                lifecycle = self.add_request(child, defer_to_remote_kv=defer_to_remote_kv)
                 first = first or lifecycle
             assert first is not None
             return first
@@ -164,7 +170,10 @@ class SchedulerCore(BaseScheduler):
             raise
         try:
             lifecycle = self._requests.create(request)
-            self._requests.advance_to_queue(lifecycle.request_id)
+            self._requests.advance_to_queue(
+                lifecycle.request_id,
+                defer_to_remote_kv=defer_to_remote_kv,
+            )
         except BaseException:
             self._allocator.release(sequence)
             if self._sampling is not None:

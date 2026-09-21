@@ -99,6 +99,7 @@ class ServingService:
         constraints=None,
         stats: ServingStats | None = None,
         controller=None,
+        router=None,
     ):
         self.engine, self.config = engine, config
         self.stats = stats or ServingStats()
@@ -113,6 +114,8 @@ class ServingService:
         self._drained = False
         #: Engine-thread owner of KV rebuilds; ``apply_resize`` is only safe here.
         self._controller = controller
+        #: Optional KV-aware placement decision before admission (route-only).
+        self._router = router
         runner = engine.executor.runner
         runner.set_request_source(engine.requests.get, constraints=constraints)
         self._thread = threading.Thread(target=self._run, name="ayaka-engine", daemon=True)
@@ -199,7 +202,13 @@ class ServingService:
             future.set_exception(EngineUnavailableError("engine is closing"))
             return
         try:
-            self.engine.submit(request)
+            decision = self._router.route(request) if self._router is not None else None
+            defer = bool(decision is not None and decision.local and decision.needs_remote_kv)
+            if decision is not None and not decision.local:
+                # Route-only milestone: a remote placement has no transport
+                # path yet, so the request stays on this node.
+                _LOG.debug("router picked remote node %s; served locally", decision.node_id)
+            self.engine.submit(request, defer_to_remote_kv=defer)
         except Exception as exc:
             from ayaka.sched.interfaces import OverloadedError as SchedulerOverloaded
 

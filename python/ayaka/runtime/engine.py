@@ -24,6 +24,7 @@ from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import SequenceAllocator
 from ayaka.sched.outcome import FinishReason
 from ayaka.sched.plan import BatchStepPlan
+from ayaka.serving.router import RemoteKVPending
 
 __all__ = ["Engine"]
 
@@ -40,6 +41,7 @@ class Engine:
         coordinator: CompletionCoordinator,
         output: OutputProcessor,
         allocator: SequenceAllocator,
+        remote_kv: RemoteKVPending | None = None,
     ) -> None:
         if not isinstance(plan, ResolvedSchedulerPlan):
             raise TypeError("plan must be ResolvedSchedulerPlan")
@@ -49,10 +51,16 @@ class Engine:
         self._coordinator = coordinator
         self._output = output
         self._allocator = allocator
+        self._remote_kv = remote_kv
         self._settled = 0
 
-    def submit(self, request: Request) -> RequestLifecycle:
-        """Register output state, then admit. Failures leave no output state."""
+    def submit(self, request: Request, *, defer_to_remote_kv: bool = False) -> RequestLifecycle:
+        """Register output state, then admit. Failures leave no output state.
+
+        ``defer_to_remote_kv`` parks the request in ``WAITING_REMOTE_KV``; a
+        :class:`RemoteKVPending` registry must be wired so the transport can
+        drive it out of the park.
+        """
         if request.sampling.n > 1:
             raise ConfigError(
                 "request.sampling.n",
@@ -60,12 +68,33 @@ class Engine:
                 "the output owner binds one request id; n>1 children are expanded "
                 "by the scheduler and cannot be registered here",
             )
+        if defer_to_remote_kv and self._remote_kv is None:
+            raise ConfigError(
+                "engine.remote_kv",
+                "REMOTE_KV_REGISTRY_REQUIRED",
+                "deferring a request to WAITING_REMOTE_KV requires a remote-KV pending registry",
+            )
         self._output.register(request)
         try:
-            return self._scheduler.add_request(request)
+            lifecycle = self._scheduler.add_request(request, defer_to_remote_kv=defer_to_remote_kv)
         except BaseException:
             self._output.forget(str(request.request_id))
             raise
+        if defer_to_remote_kv and self._remote_kv is not None:
+            self._remote_kv.park(str(request.request_id))
+        return lifecycle
+
+    def release_remote_kv(self, request_id: str, *, num_cached_tokens: int = 0) -> bool:
+        """Remote KV landed: unpark into the local queue with the acquired prefix."""
+        if self._remote_kv is None:
+            return False
+        return self._remote_kv.release(request_id, num_cached_tokens=num_cached_tokens)
+
+    def abandon_remote_kv(self, request_id: str) -> bool:
+        """Remote fetch failed: queue locally for a full prefill instead."""
+        if self._remote_kv is None:
+            return False
+        return self._remote_kv.abandon(request_id)
 
     def abort(self, request_id: str) -> bool:
         return self._scheduler.abort(request_id)

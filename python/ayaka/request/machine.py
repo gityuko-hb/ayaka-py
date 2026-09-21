@@ -194,6 +194,23 @@ class RequestStateMachine:
         self.num_cached_tokens = num_cached_tokens
         self.num_computed_tokens = num_cached_tokens
 
+    def on_remote_kv_wait(self) -> None:
+        """Park the request pending a remote KV fetch chosen by the router.
+
+        The router's global-index hit is routing information only; the local
+        cache re-lookup happens once the bytes land (or the fetch is
+        abandoned). Counters stay untouched here.
+        """
+        self.transition(RequestState.WAITING_REMOTE_KV)
+
+    def on_remote_kv_ready(self) -> None:
+        """Remote KV landed: re-enter CACHE_LOOKUP for the authoritative local match."""
+        self.transition(RequestState.CACHE_LOOKUP)
+
+    def on_remote_kv_abandoned(self) -> None:
+        """Give up the remote fetch and enter the local queue with no cache."""
+        self.transition(RequestState.WAITING)
+
     def on_admitted(self) -> None:
         self.transition(RequestState.ADMITTED)
 

@@ -412,15 +412,28 @@ class LifecycleManager:
         return len(self._finished)
 
     # admission side
-    def advance_to_queue(self, request_id: str, *, num_cached_tokens: int = 0) -> None:
-        """CREATED → … → WAITING.  The pre-scheduler pipeline is synchronous and
-        has no scheduler involvement, so it is driven directly rather than
-        through a report."""
+    def advance_to_queue(
+        self,
+        request_id: str,
+        *,
+        num_cached_tokens: int = 0,
+        defer_to_remote_kv: bool = False,
+    ) -> None:
+        """CREATED → … → WAITING (or WAITING_REMOTE_KV when deferred).
+
+        The pre-scheduler pipeline is synchronous and has no scheduler
+        involvement, so it is driven directly rather than through a report.
+        A deferred request stops in ``WAITING_REMOTE_KV`` and is re-entered
+        through :meth:`on_cache_looked_up` once its remote KV lands.
+        """
         m = self.get(request_id).machine
         m.on_validating()
         m.on_validated()
         m.on_tokenized(self.get(request_id).request.prompt_len)
-        m.on_cache_looked_up(num_cached_tokens=num_cached_tokens)
+        if defer_to_remote_kv:
+            m.on_remote_kv_wait()
+        else:
+            m.on_cache_looked_up(num_cached_tokens=num_cached_tokens)
 
     # the translation
     def apply(self, report: SchedulerReport) -> None:
