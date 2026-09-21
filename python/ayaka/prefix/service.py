@@ -12,8 +12,9 @@ from ayaka.exceptions import (
 from ayaka.handles import SequenceHandle
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.sequence import PageTableEntry
+from ayaka.prefix.global_index import PrefixIndexPublisher
 from ayaka.prefix.identity import PrefixCacheContext
-from ayaka.prefix.interface import ValidResume
+from ayaka.prefix.interface import CachedBlockInfo, ValidResume
 from ayaka.utils.validation import require_int
 
 if TYPE_CHECKING:
@@ -48,7 +49,12 @@ class PrefixService:
     complete execution identity and keep the final prompt query for logits.
     """
 
-    def __init__(self, kv: LogicalKVManager) -> None:
+    def __init__(
+        self,
+        kv: LogicalKVManager,
+        *,
+        index_publisher: PrefixIndexPublisher | None = None,
+    ) -> None:
         if not isinstance(kv.backend, RuntimeMemoryManager) or kv.backend.tiering_enabled:
             raise ValueError("canonical prefix resume requires homogeneous resident KV")
         self.kv = kv
@@ -57,6 +63,7 @@ class PrefixService:
         self.cache_id = self.store.cache_id
         self._max_entries: int | None = None
         self._transfers: set[PrefixTransfer] = set()
+        self._index_publisher = index_publisher
         self.closed = False
 
     @property
@@ -143,6 +150,10 @@ class PrefixService:
     ) -> ValidResume | None:
         self.require_open()
         result = self.backend.cache_resume(sequence, token_ids, context=context)
+        if result is not None and self._index_publisher is not None:
+            self._index_publisher.publish(
+                token_ids, context=context, page_size=self.backend.page_size
+            )
         if self.max_entries is not None:
             while self.store.snapshot().terminal_entries > self.max_entries:
                 self.evict()
@@ -154,7 +165,29 @@ class PrefixService:
 
     def evict(self, entry_id: int | None = None) -> bool:
         self.require_open()
-        return self.store.evict_entry(entry_id, safe_epoch=self.backend.current_epoch)
+        publisher = self._index_publisher
+        before = self.store.evictable_leaves() if publisher is not None else ()
+        evicted = self.store.evict_entry(entry_id, safe_epoch=self.backend.current_epoch)
+        if evicted and publisher is not None:
+            after = {info.handle.index for info in self.store.evictable_leaves()}
+            leaf = self._evicted_leaf(before, entry_id, remaining=after)
+            if leaf is not None:
+                publisher.withdraw_digest(leaf.identity.digest)
+        return evicted
+
+    @staticmethod
+    def _evicted_leaf(
+        before: tuple[CachedBlockInfo, ...],
+        entry_id: int | None,
+        *,
+        remaining: set[int],
+    ) -> CachedBlockInfo | None:
+        """Identify the leaf that disappeared from the evictable set."""
+        if entry_id is not None:
+            return next((info for info in before if info.handle.index == entry_id), None)
+        # Eviction without an explicit id pops the first evictable leaf;
+        # pruning cannot create a new terminal, so the set difference is it.
+        return next((info for info in before if info.handle.index not in remaining), None)
 
     def close(self) -> bool:
         """Drop cache ownership only after all transfers have retired."""
@@ -164,5 +197,7 @@ class PrefixService:
             return False
         self.backend.clear_prefix_cache()
         self.backend.reclaim_deferred()
+        if self._index_publisher is not None:
+            self._index_publisher.flush_once()
         self.closed = True
         return True

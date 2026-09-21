@@ -1,13 +1,21 @@
-"""Explicit spill/restore tickets with all-layer completion and last-use ownership.
+"""Explicit spill/restore tickets with per-layer completion and last-use ownership.
 
 These maintenance tickets use the same backend transaction/lease lifecycle as
 model steps. They never change a request's computed counter. A restored prefix
 becomes eligible for request attachment only after the entire copy succeeds.
+
+Ticket settlement stays all-or-nothing: ``poll`` only publishes (or releases
+buffer/page ownership) once every layer has resolved. Inside one ticket the
+copies are scheduled and resolved *per layer* — each layer records its own
+fence event, so a completed spill layer becomes readable
+(:meth:`PrefixTransfer.layer_view`) while later layers are still in flight and
+credits are handed back layer by layer instead of at ticket retirement.
 """
 
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 from itertools import count
 from typing import Any
 
@@ -33,7 +41,13 @@ class TransferCreditError(RuntimeError):
 
 
 class TransferCredits:
-    """Shared byte semaphore; reservations last until whole-ticket retirement."""
+    """Shared byte semaphore; reservations last until the claim retires.
+
+    A claim is acquired whole and may be handed back incrementally: a
+    per-layer transfer releases each retired layer's bytes and keeps the
+    remainder reserved until the ticket settles. A full ``release(owner)``
+    with no byte count is the retirement boundary.
+    """
 
     def __init__(self, limit: int):
         require_int(limit, "transfer limit")
@@ -52,18 +66,31 @@ class TransferCredits:
             raise TransferCreditError("transfer credits exhausted")
         self._claims[owner] = nbytes
 
-    def release(self, owner):
+    def release(self, owner, nbytes: int | None = None):
         if owner not in self._claims:
             raise ValueError("unknown transfer owner")
-        del self._claims[owner]
+        if nbytes is None:
+            del self._claims[owner]
+            return
+        require_int(nbytes, "transfer bytes")
+        remaining = self._claims[owner] - nbytes
+        if remaining < 0:
+            raise ValueError("release exceeds reserved credits")
+        if remaining:
+            self._claims[owner] = remaining
+        else:
+            del self._claims[owner]
 
 
 class HostPrefix:
     """Immutable completed host checkpoint with one shared-ledger buffer claim.
 
     Owned by the caller after a successful spill. Close explicitly after all
-    restore tickets retire. No host snapshot is readable/restorable while its
-    producer is pending, failed or cancelled. Contents are private; mutating a
+    restore tickets retire. No *ticket-level* snapshot is readable/restorable
+    while its producer is pending, failed or cancelled; a pending spill is
+    readable one layer at a time through the owning transfer's
+    :meth:`PrefixTransfer.layer_ready` / :meth:`PrefixTransfer.layer_view`
+    once that layer's fence has resolved. Contents are private; mutating a
     borrowed tensor invalidates the snapshot by version check before restore.
     """
 
@@ -94,6 +121,17 @@ class HostPrefix:
         self._tensor = None
         self._buffer.close()
         self.closed = True
+
+
+@dataclass(slots=True)
+class _LayerBatch:
+    """Copies and fence state of one layer inside a transfer ticket."""
+
+    index: int
+    copies: tuple[tuple[Any, Any], ...]
+    nbytes: int
+    event: Any | None = None
+    done: bool = False
 
 
 class PrefixTransfer:
@@ -144,6 +182,11 @@ class PrefixTransfer:
             * spec.head_dim
             * self.storage.torch_dtype.itemsize
         )
+        self.bytes_per_layer = (
+            n * 2 * spec.num_kv_heads_local * spec.head_dim * self.storage.torch_dtype.itemsize
+        )
+        self._layer_batches: tuple[_LayerBatch, ...] = ()
+        self._credit_released = 0
         self.host = host
         try:
             credits.acquire(self, self.nbytes)
@@ -226,12 +269,14 @@ class PrefixTransfer:
             if self.storage.device.type == "cuda":
                 self.stream = torch.cuda.Stream(device=self.storage.device)
             self.state = TicketState.SUBMITTED
+            self._layer_batches = self._plan_layers()
             with (
                 torch.cuda.stream(self.stream) if self.stream is not None else nullcontext(),
                 torch.no_grad(),
             ):
-                self._enqueue()
-                self._record_event()
+                for batch in self._layer_batches:
+                    self._enqueue_layer(batch)
+                    self._record_layer_event(batch)
         except BaseException as exc:
             self.error = str(exc)
             self._drain()
@@ -239,15 +284,17 @@ class PrefixTransfer:
                 raise
         return self
 
-    def _enqueue(self):
-        """All layers share one stream; override only for controlled fault injection."""
+    def _plan_layers(self) -> tuple[_LayerBatch, ...]:
+        """One copy list per layer; page truncation is per block, not per layer."""
         assert self.host is not None
         n = len(self.host.token_ids)
         if self.restoring:
             pages = self.view.sequences[0].block_table
         else:
             pages = tuple(self.backend.allocator.physical_id(e.page).value for e in self._pins)
+        batches: list[_LayerBatch] = []
         for layer in range(self.storage.spec.num_layers):
+            copies: list[tuple[Any, Any]] = []
             for index, kind in enumerate(("key", "value")):
                 plane = self.storage.plane(layer, kind)
                 for block, page in enumerate(pages):
@@ -256,14 +303,49 @@ class PrefixTransfer:
                     device = plane[page, :count]
                     host = self.host._tensor[layer, index, start : start + count]
                     destination, source = (device, host) if self.restoring else (host, device)
-                    destination.copy_(source, non_blocking=True)
+                    copies.append((destination, source))
+            batches.append(
+                _LayerBatch(index=layer, copies=tuple(copies), nbytes=self.bytes_per_layer)
+            )
+        return tuple(batches)
+
+    def _enqueue_layer(self, batch: _LayerBatch) -> None:
+        """Every layer shares one stream; override only for fault injection."""
+        for destination, source in batch.copies:
+            destination.copy_(source, non_blocking=True)
+
+    def _record_layer_event(self, batch: _LayerBatch) -> None:
+        if self.stream is not None:
+            torch = require_torch(capability="prefix layer fence")
+            event = torch.cuda.Event()
+            event.record(self.stream)
+            batch.event = event
 
     def _record_event(self):
+        """Whole-stream drain fence; failure paths and CPU runs use this."""
         if self.stream is not None:
             torch = require_torch(capability="prefix completion fence")
             event = torch.cuda.Event()
             event.record(self.stream)
             self.event = event
+
+    def _resolve_layers(self) -> None:
+        """Resolve every layer whose fence has landed; release its credits."""
+        for batch in self._layer_batches:
+            if batch.done:
+                continue
+            if batch.event is None or batch.event.query():
+                self._complete_layer(batch)
+
+    def _complete_layer(self, batch: _LayerBatch) -> None:
+        batch.done = True
+        batch.event = None
+        self.credits.release(self, batch.nbytes)
+        self._credit_released += batch.nbytes
+        if self._credit_released >= self.nbytes:
+            # Every layer retired: the whole claim is gone; cleanup must not
+            # attempt a second retirement of an exhausted claim.
+            self._claimed = False
 
     def _drain(self):
         self.state = TicketState.DRAINING
@@ -283,7 +365,12 @@ class PrefixTransfer:
             self._finish(False)
 
     def poll(self) -> bool:
-        """Return True only when retired; a False result retains all ownership."""
+        """Return True only when retired; a False result retains all ownership.
+
+        Layers resolve one by one: each resolved layer hands its bytes back to
+        the credit semaphore while the ticket stays live. Publication (and
+        every other settlement step) still waits for the final layer.
+        """
         if self.retired:
             return True
         if self._settlement_failed:
@@ -295,14 +382,55 @@ class PrefixTransfer:
             if self.state is TicketState.QUARANTINED:
                 return False
         try:
-            if self.event is not None and not self.event.query():
-                return False
+            self._resolve_layers()
         except Exception as exc:
-            self.error = str(exc)
+            self.error = self.error or str(exc)
             self._drain()
+            return False
+        if any(not batch.done for batch in self._layer_batches):
             return False
         self._finish(not self.error and not self.cancelled)
         return self.retired
+
+    # ------------------------------------------------------------------
+    # Per-layer visibility (spill side)
+    # ------------------------------------------------------------------
+
+    @property
+    def layers_total(self) -> int:
+        return self.storage.spec.num_layers
+
+    @property
+    def layers_done(self) -> int:
+        return sum(batch.done for batch in self._layer_batches)
+
+    def layer_ready(self, index: int) -> bool:
+        """True when layer ``index`` has settled and its bytes are stable.
+
+        A layer's host bytes are copied exactly once on one stream, so once
+        its fence resolves they cannot change again. Returns False while the
+        layer is in flight, for restore tickets (they publish at the ticket
+        boundary only), and after cancellation, failure or retirement.
+        """
+        if self.restoring or self.error or self.cancelled or self._settlement_failed:
+            return False
+        if self.retired or not self._layer_batches:
+            return False
+        return self._layer_batches[index].done
+
+    def layer_view(self, index: int) -> Any:
+        """Borrow the host tensor of one spilled layer, shape ``(2, n, h, d)``.
+
+        Valid only while the owning ticket is live and ``layer_ready(index)``
+        is True. Downstream consumers (for example a network stage) must stop
+        reading before the ticket retires.
+        """
+        if self.restoring:
+            raise ValueError("per-layer views are spill-only")
+        if not self.layer_ready(index):
+            raise ValueError("layer is not settled")
+        assert self.host is not None
+        return self.host._tensor[index]
 
     def _finish(self, succeeded):
         assert self.host is not None

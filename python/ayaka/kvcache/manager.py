@@ -28,6 +28,7 @@ from ayaka.memory.views import (
     LeakReport,
     MemorySnapshot,
 )
+from ayaka.prefix.global_index import PrefixIndexPublisher
 from ayaka.prefix.service import PrefixService
 from ayaka.sched.plan import BatchStepPlan
 
@@ -64,6 +65,8 @@ class LogicalKVManager:
         self,
         backend: RuntimeMemoryManager | KVCacheGroupManager,
         storages: Mapping[str, KVStorageLease],
+        *,
+        index_publisher: PrefixIndexPublisher | None = None,
     ) -> None:
         self.backend = backend
         self.storages = MappingProxyType(dict(storages))
@@ -71,6 +74,7 @@ class LogicalKVManager:
         self.closed = False
         self.capacity: CapacitySnapshot | None = None
         self._prefix_service: PrefixService | None = None
+        self._index_publisher = index_publisher
         self._validate_storage_bindings()
         ledgers = {id(lease.ledger) for lease in self.storages.values()}
         if len(ledgers) != 1:
@@ -88,7 +92,7 @@ class LogicalKVManager:
     def prefix_service(self) -> PrefixService:
         """Return the single canonical resident prefix policy for this KV owner."""
         if self._prefix_service is None:
-            self._prefix_service = PrefixService(self)
+            self._prefix_service = PrefixService(self, index_publisher=self._index_publisher)
         return self._prefix_service
 
     @property
