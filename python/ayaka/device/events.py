@@ -82,8 +82,9 @@ class EventPool:
         key = id(event)
         if key not in self._live:
             raise RuntimeError("release of an event this pool did not hand out")
-        self._live.discard(key)
-        if self._backend.query(event):
+        done = self._backend.query(event)
+        self._live.remove(key)
+        if done:
             self._free.append(event)
         else:
             self._pending.append(event)
@@ -103,10 +104,7 @@ class EventPool:
 
     @contextmanager
     def fence(
-        self,
-        src_stream: Any,
-        dst_stream: Any, *,
-        assert_async: bool = False
+        self, src_stream: Any, dst_stream: Any, *, assert_async: bool = False
     ) -> Generator[Any]:
         """Create a device-side dependency. If assert_async=True,
         enable no_device_sync to catch implicit synchronization errors."""
