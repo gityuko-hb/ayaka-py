@@ -299,7 +299,13 @@ class LogicalKVManager:
                 or state.release_requested
                 or state.busy
             ):
-                raise InvalidStateTransitionError("request snapshot disagrees with logical KV")
+                raise InvalidStateTransitionError(
+                    f"request snapshot disagrees with logical KV: request={value.request_id!r} "
+                    f"snapshot(version={value.state_version}, computed={value.computed_tokens}) "
+                    f"state(request={state.request_id!r}, version={state.version}, "
+                    f"committed={state.committed_tokens}, release={state.release_requested}, "
+                    f"busy={state.busy})"
+                )
         if isinstance(self.backend, KVCacheGroupManager):
             for scheduled in step.slices:
                 for group in self.backend.cache_groups:

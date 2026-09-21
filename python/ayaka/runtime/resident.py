@@ -1,24 +1,16 @@
 """Runnable scheduler/KV composition with an injected paged step runner.
 
-This is the resident, single-device, single-flight path. The runner writes every
-reserved KV slot and returns packed samples; dense model runners that ignore
-memory_view do not satisfy this contract. CUDA work must use the current stream,
-or join its side streams back to that stream before returning or raising.
+This is the resident, single-device path. The executor adapter owns tickets and
+completion state; an injected ``StepWorker`` owns the device context, streams,
+runner and fences, and must cover every producer/consumer it enqueues. Dense
+model runners that ignore memory_view do not satisfy the paged runner contract.
 """
 
 from __future__ import annotations
 
-from contextlib import nullcontext, suppress
-
-import torch
-
 from ayaka.configs.assembly import (
-    bind_resident_kv,
     build_execution_plan,
     build_parallel_plan,
-    materialize_resident_kv,
-    plan_resident_kv,
-    resident_ledger,
 )
 from ayaka.configs.cache import CacheConfig
 from ayaka.configs.memory import MemoryConfig, MemoryProfile
@@ -33,14 +25,8 @@ from ayaka.configs.scheduler import (
 )
 from ayaka.executor.base import Executor
 from ayaka.executor.completion import CompletionCoordinator, ShutdownResult
-from ayaka.executor.ticket import CompletionFence, ExecutionTicket, FenceResult, WorkState
+from ayaka.executor.ticket import CompletionFence, ExecutionTicket
 from ayaka.kvcache.manager import LogicalKVManager
-from ayaka.memory.capacity import (
-    MemoryLane,
-    build_capacity_snapshot,
-    mint_generation,
-    reconcile_actual_usage,
-)
 from ayaka.memory.workspace import WorkspaceManager
 from ayaka.plan import EMPTY_MEMORY_PLAN
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
@@ -58,122 +44,82 @@ from ayaka.runtime.output import OutputProcessor
 from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sched.factory import create_scheduler
 from ayaka.types import DType
-
-
-class _CPUFence:
-    def query(self) -> FenceResult:
-        return FenceResult(WorkState.SUCCEEDED, quiescent=True)
-
-
-class _CUDAFence:
-    def __init__(self, stream: torch.cuda.Stream) -> None:
-        self.event = torch.cuda.Event()
-        self.event.record(stream)
-
-    def query(self) -> FenceResult:
-        if self.event.query():
-            return FenceResult(WorkState.SUCCEEDED, quiescent=True)
-        return FenceResult(WorkState.PENDING)
+from ayaka.worker.base import StepWorker, WorkerStep
+from ayaka.worker.local import LocalWorker
+from ayaka.worker.resources import build_configured_resources
 
 
 class ResidentKVExecutor(Executor):
-    """Order COW before the runner and fence all compute, including partial failure.
+    """Thin ticket adapter over a device worker.
 
-    Storage and runner inputs must be initialized before construction, or explicitly
-    ordered onto this executor's stream. No global device synchronization occurs.
-    The CPU runner must complete synchronously and return CPU samples.
+    The executor owns tickets, submission state and retirement tracking; the
+    worker owns device context, streams, runner invocation, COW ordering and
+    fence creation. This class never imports a CUDA stream, an event or a
+    tensor layout. The read-only shims keep existing callers on the worker's
+    device objects without making the executor a device owner.
     """
 
-    def __init__(
-        self, kv: LogicalKVManager, runner: SampleRunner, *, max_inflight: int = 1
-    ) -> None:
+    def __init__(self, worker: StepWorker, *, max_inflight: int = 1) -> None:
         super().__init__(max_inflight=max_inflight)
-        self.kv = kv
-        self.runner = runner
-        devices = {
-            tensor.device
-            for lease in kv.storages.values()
-            for family in lease.storage.buffers()
-            for tensor in family
-        }
-        if len(devices) != 1:
-            raise ValueError("resident executor requires KV on exactly one device")
-        self.device = next(iter(devices))
-        if self.device.type not in ("cpu", "cuda"):
-            raise ValueError("resident executor supports only CPU or CUDA")
-        self.stream = None
-        self.kv_stream = None
-        self._transfer_event = None
-        if self.device.type == "cuda":
-            self.stream = torch.cuda.Stream(device=self.device)
-            self.kv_stream = torch.cuda.Stream(device=self.device)
-            self.stream.wait_stream(torch.cuda.current_stream(self.device))
+        self._worker = worker
+
+    @property
+    def worker(self) -> StepWorker:
+        return self._worker
+
+    @property
+    def device(self):
+        return self._worker.device
+
+    @property
+    def stream(self):
+        return getattr(self._worker, "stream", None)
+
+    @property
+    def kv_stream(self):
+        return getattr(self._worker, "kv_stream", None)
+
+    @property
+    def runner(self):
+        return getattr(self._worker, "runner", None)
+
+    @runner.setter
+    def runner(self, value) -> None:
+        self._worker.runner = value  # type: ignore[attr-defined]
+
+    def initialize(self) -> None:
+        self._worker.initialize()
+        super().initialize()
+
+    def has_submission_capacity(self) -> bool:
+        return super().has_submission_capacity() and self._worker.accepting
+
+    def shutdown(self) -> bool:
+        # Stop worker admission first: a later retry must never enqueue.
+        self._worker.request_closing()
+        return super().shutdown()
 
     def _enqueue(self, ticket: ExecutionTicket) -> None:
-        context = nullcontext() if self.stream is None else torch.cuda.stream(self.stream)
-        with context, torch.inference_mode():
-            self._apply_cow(ticket)
-            note_growth = getattr(self.runner, "on_workspace_growth", None)
-            if note_growth is not None and getattr(ticket._resources, "workspace_grew", False):
-                # The step grew the shared workspace; any captured graph that
-                # bound the old addresses must not replay. The runner falls back
-                # to eager for this step and recaptures before the next replay.
-                note_growth()
-            samples = self.runner(ticket.prepared)
-            if samples.token_ids.device != self.device:
-                raise ValueError("runner samples must reside on the KV device")
-            self.set_samples(ticket, samples)
-            self.track_fence(ticket, self._fence())
-
-    def _copy_pages(self, ticket: ExecutionTicket) -> None:
-        for copy in ticket.prepared.memory_view.copies:
-            source = self.kv.physical_page(copy.group_name, copy.source)
-            destination = self.kv.physical_page(copy.group_name, copy.destination)
-            storage = self.kv.storages[copy.group_name].storage
-            if not 0 < copy.valid_tokens <= storage.page_size:
-                raise ValueError("invalid COW copy length")
-            # Copy the physical representation bit-for-bit, including quantized planes.
-            for family in storage.buffers():
-                for tensor in family:
-                    tensor[destination, : copy.valid_tokens].copy_(
-                        tensor[source, : copy.valid_tokens]
-                    )
-
-    def _apply_cow(self, ticket: ExecutionTicket) -> None:
-        """Run lease-owned KV copies on the transfer stream at the batch boundary."""
-        if self.kv_stream is None or self.stream is None:
-            self._copy_pages(ticket)
-            return
-        self.kv_stream.wait_stream(self.stream)
-        try:
-            with torch.cuda.stream(self.kv_stream):
-                self._copy_pages(ticket)
-                self._transfer_event = torch.cuda.Event()
-                self._transfer_event.record(self.kv_stream)
-            self.stream.wait_event(self._transfer_event)
-        finally:
-            # Cover partial-copy failure too, before the compute drain fence.
-            self.stream.wait_stream(self.kv_stream)
-
-    def _fence(self) -> CompletionFence:
-        return _CPUFence() if self.stream is None else _CUDAFence(self.stream)
+        outcome = self._worker.execute(WorkerStep.from_ticket(ticket))
+        self.set_samples(ticket, outcome.samples)
+        self.track_fence(ticket, outcome.fence)
 
     def _begin_drain(self, ticket: ExecutionTicket) -> CompletionFence:
-        # Join any partial transfer before proving compute/transfer quiescence.
-        if self.stream is not None and self.kv_stream is not None:
-            self.stream.wait_stream(self.kv_stream)
-        return self._fence()
+        return self._worker.drain(WorkerStep.from_ticket(ticket))
 
     def _close(self) -> None:
-        self.runner.close()
+        if not self._worker.shutdown():
+            raise RuntimeError("worker still owns active flights at close")
+        self._worker.close()
 
 
 class ResidentKVEngine(Engine):
-    """Engine plus resident adapters; the caller retains ownership of KV slabs.
+    """Engine plus resident adapters with explicit borrowed or owned KV storage.
 
     close cancels all requests, settles tickets and aborts unadopted preparation.
     LogicalKVManager.close() drops prefix-cache ownership and its slab pins; the
-    caller then closes its storage leases.
+    caller then closes borrowed storage leases. ``from_configs`` and serving
+    inject a WorkerResources owner that closes its slabs and ledger itself.
     """
 
     def __init__(
@@ -188,6 +134,7 @@ class ResidentKVEngine(Engine):
         prefix_context: PrefixContextProvider | None = None,
         workspace: WorkspaceManager | None = None,
         buffers: RunnerBuffers | None = None,
+        worker: StepWorker | None = None,
     ) -> None:
         kind = kind.strip().lower().replace("-", "_")
         if (
@@ -214,7 +161,10 @@ class ResidentKVEngine(Engine):
         requests = LifecycleManager()
         allocator = KVSequenceAllocator(kv)
         self.preparer = KVRequestPreparer(allocator, prefix_context=prefix_context)
-        self.executor = ResidentKVExecutor(kv, runner, max_inflight=plan.max_inflight)
+        # The worker owns the device context, streams, runner and fences; the
+        # engine only composes it and the executor adapter drives tickets.
+        self.worker = worker or LocalWorker(kv, runner, max_inflight=plan.max_inflight)
+        self.executor = ResidentKVExecutor(self.worker, max_inflight=plan.max_inflight)
         self.coordinator = CompletionCoordinator(self.executor, requests)
         self.runtime = KVStepRuntime(
             plan.execution,
@@ -296,28 +246,31 @@ class ResidentKVEngine(Engine):
         """
         resolved_scheduler = scheduler_config or SchedulerConfig()
         parallel = parallel_config or ParallelConfig()
-        kv_plan = plan_resident_kv(
+        kv_plan, resources = build_configured_resources(
             architecture,
             cache_config,
+            scheduler=resolved_scheduler,
             device_total_bytes=device_total_bytes,
-            max_num_seqs=resolved_scheduler.max_num_seqs,
+            model_id=model_id,
+            model_revision=model_revision,
+            weights_revision=weights_revision,
             memory_config=memory_config,
             profile=profile,
             parallel=parallel,
             max_model_len=max_model_len,
-        )
-        ledger = resident_ledger(
-            kv_plan.memory,
+            compute_dtype=compute_dtype,
             device=device,
-            device_total_bytes=device_total_bytes,
             device_index=device_index,
+            zero_initialize=zero_initialize,
         )
-        leases = materialize_resident_kv(
-            kv_plan, ledger=ledger, device=device, zero_initialize=zero_initialize
+        kv, ledger = resources.kv, resources.ledger
+        worker = LocalWorker(
+            kv,
+            runner,
+            max_inflight=resolved_scheduler.max_inflight,
+            resources=resources,
         )
-        kv: LogicalKVManager | None = None
         try:
-            _, kv = bind_resident_kv(kv_plan, leases)
             execution = build_execution_plan(
                 architecture,
                 cache_config,
@@ -350,37 +303,7 @@ class ResidentKVEngine(Engine):
                 memory=ledger.snapshot(),
                 workspace=EMPTY_MEMORY_PLAN,
             )
-            lane = MemoryLane.CPU if str(device).strip().lower() == "cpu" else MemoryLane.CUDA
-            measured = profile
-            generation = mint_generation(
-                model_id=model_id,
-                model_revision=model_revision,
-                weights_revision=weights_revision,
-                kv_storage=kv.fingerprint,
-                backend=type(kv.backend).__name__,
-            )
-            snapshot = build_capacity_snapshot(
-                generation=generation,
-                lane=lane,
-                dtype=compute_dtype.label,
-                kv_dtype=cache_config.kv_dtype.label,
-                page_size=kv_plan.storage_specs[0][1].page_size,
-                group_pages={group.group_id: group.num_pages for group in kv_plan.physical.groups},
-                max_model_len=kv_plan.max_model_len,
-                max_num_seqs=resolved_scheduler.max_num_seqs,
-                max_num_batched_tokens=resolved_scheduler.max_num_batched_tokens,
-                max_inflight=resolved_scheduler.max_inflight,
-                activation_bytes=measured.activation_bytes if measured else 0,
-                workspace_ceiling_bytes=measured.kernel_workspace_bytes if measured else 0,
-                graph_bytes=measured.graph_pool_bytes if measured else 0,
-                staging_bytes=0,
-                budget_bytes=kv_plan.memory.policy_budget_bytes,
-                kv_budget_bytes=kv_plan.memory.kv_cache_bytes,
-                weights_bytes=measured.weights_bytes if measured else 0,
-                ledger=ledger,
-            )
-            kv.bind_capacity(snapshot)
-            reconcile_actual_usage(ledger, snapshot)
+
             return cls(
                 plan,
                 kv,
@@ -388,14 +311,13 @@ class ResidentKVEngine(Engine):
                 kind=kind,
                 sampling=sampling,
                 prefix_context=prefix_context,
+                worker=worker,
             )
         except BaseException:
-            if kv is not None:
-                with suppress(Exception):
-                    kv.close()
-            for lease in reversed(leases):
-                with suppress(Exception):
-                    lease.close()
+            try:
+                worker.close()
+            finally:
+                resources.close()
             raise
 
     def submit(self, request: Request) -> RequestLifecycle:
@@ -436,5 +358,6 @@ class ResidentKVEngine(Engine):
             self.scheduler.update_from_output(completed)
         if result.closed:
             self.scheduler.flush_reports()
-            self.kv.reclaim_deferred()
+            if not self.kv.closed:
+                self.kv.reclaim_deferred()
         return result

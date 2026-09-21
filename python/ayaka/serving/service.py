@@ -299,6 +299,10 @@ class ServingService:
     def _gauges(self):
         self.stats.running.set(self.engine.scheduler.num_running)
         self.stats.waiting.set(self.engine.scheduler.num_waiting)
+        if self.engine.kv.closed:
+            self.stats.kv_free.set(0)
+            self.stats.kv_total.set(0)
+            return
         snapshot = self.engine.kv.snapshot()
         self.stats.kv_free.set(snapshot.free_pages)
         self.stats.kv_total.set(snapshot.total_pages)

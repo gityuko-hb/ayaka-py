@@ -10,17 +10,16 @@ freed, so a rejected resize keeps the old caches serving.
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 from ayaka.attention.spec import AttentionGroupSpec, AttentionSpec
-from ayaka.configs.memory import MemoryConfig, MemoryProfile, plan_device_memory
+from ayaka.configs.memory import MemoryConfig
 from ayaka.configs.scheduler import PreemptionMode, SchedulerCapabilities, SchedulerConfig
 from ayaka.configs.serving import ServingConfig
 from ayaka.configs.tokenizer import TokenizerConfig
 from ayaka.kvcache.manager import LogicalKVManager
-from ayaka.kvcache.materialize import KVStorageLease, materialize_kv_storage
+from ayaka.kvcache.materialize import KVStorageLease
 from ayaka.kvcache.resize import (
     LEDGER_OVERHEAD_BYTES,
     CacheRebuildRejected,
@@ -37,15 +36,9 @@ from ayaka.memory.caching import CachingAllocator
 from ayaka.memory.capacity import (
     CapacityFreeze,
     CapacitySnapshot,
-    MemoryLane,
-    build_capacity_snapshot,
-    claim_tier,
-    mint_generation,
-    reconcile_actual_usage,
 )
-from ayaka.memory.ledger import MemoryLedger, Reservation
+from ayaka.memory.ledger import MemoryLedger
 from ayaka.memory.manager import RuntimeMemoryManager
-from ayaka.memory.source import TorchDeviceSource, TorchHostByteSource
 from ayaka.memory.workspace import WorkspaceManager
 from ayaka.plan import ComputePlan, ExecutionPlan, GraphMode, MemoryPlan
 from ayaka.prefix.identity import build_prefix_context
@@ -59,8 +52,10 @@ from ayaka.serving.http import create_app
 from ayaka.serving.prepare import RequestProcessor
 from ayaka.serving.service import ServingService
 from ayaka.tokenizers.service import TokenizerService
-from ayaka.types import AttentionType, DType, MemoryOwner, MemoryTier
-from ayaka.utils.torch_memory import device_memory, empty_cache
+from ayaka.types import AttentionType, DType
+from ayaka.utils.torch_memory import empty_cache
+from ayaka.worker.local import LocalWorker
+from ayaka.worker.resources import WorkerResourcePlan, WorkerResources
 
 #: Fixed bookkeeping bytes the ledger reserves on top of the aligned slab.
 _LEDGER_OVERHEAD_BYTES = LEDGER_OVERHEAD_BYTES
@@ -74,6 +69,7 @@ DEFAULT_RESIZE_SAFETY_BYTES = 256 << 20
 class _KVTail:
     """Every owner that is replaced together when the cache is rebuilt."""
 
+    resources: WorkerResources
     ledger: MemoryLedger
     storage: KVStorageLease
     manager: RuntimeMemoryManager
@@ -352,11 +348,7 @@ class ServingRuntime:
                 raise ValueError("activation_bytes must be a non-negative integer")
             return explicit
         if self._device.type == "cuda":
-            try:
-                return self._profile_activation()
-            except Exception:
-                # Profiling is best-effort; the config reserve is the fallback.
-                pass
+            return self._profile_activation()
         return self._memory_config.activation_reserve_bytes
 
     def _profile_activation(self) -> int:
@@ -382,249 +374,38 @@ class ServingRuntime:
             for tokens in shapes:
                 ids = torch.zeros(tokens, dtype=torch.int64, device=self._device)
                 try:
+                    baseline = torch.cuda.memory_allocated(self._device)
                     with peak_memory_bytes(self._device) as observed:
                         self._model.forward_dense(ids)
                 finally:
                     del ids
-                peak = max(peak, observed[0])
+                # peak_memory_bytes reports the process-wide absolute peak.
+                # Existing weights and unrelated live runtimes are already
+                # charged to their owners; only this forward's delta is ours.
+                peak = max(peak, max(0, observed[0] - baseline))
         return peak
 
-    def _resolve_budget(self, pages: int) -> tuple[int, int, int]:
-        """Resolve (budget, kv_budget, device_total) for one tail geometry.
-
-        On CUDA the policy budget is the device budget for every owner and the
-        KV slab is the remainder after the measured non-KV profile; on CPU the
-        diagnostic budget is derived from what the process owns (host memory is
-        not policy-bounded) and every claim stays on HOST_PAGEABLE.
-        """
-        spec = self._storage_spec(pages)
-        slab = spec.aligned_total_bytes(256) + _LEDGER_OVERHEAD_BYTES
-        if self._device.type == "cuda":
-            total = self._device_total_bytes
-            if total is None:
-                total = device_memory(self._device).driver_total
-            profile = MemoryProfile(
-                weights_bytes=self._weights_bytes,
-                activation_bytes=self._activation_bytes,
-                kernel_workspace_bytes=self._workspace_ceiling_bytes,
-                graph_pool_bytes=self._graph_bytes,
-                runner_buffer_bytes=self._runner_buffer_bytes,
-                measured=True,
-            )
-            plan = plan_device_memory(total, self._memory_config, profile)
-            if slab > plan.kv_cache_bytes:
-                raise CacheRebuildRejected(
-                    f"the {pages}-page KV slab needs {slab} bytes but only "
-                    f"{plan.kv_cache_bytes} bytes remain after non-KV allocations; "
-                    "lower pages or raise gpu_memory_utilization",
-                    reason=ResizeRejectionReason.BUDGET,
-                    requested_pages=pages,
-                    need_bytes=slab,
-                    available_bytes=plan.kv_cache_bytes,
-                )
-            return plan.policy_budget_bytes, plan.kv_cache_bytes, total
-        # Host diagnostics are not policy-bounded; the budget covers what the
-        # process owns plus allocator slack so no claim can exceed capacity.
-        owned = (
-            slab
-            + self._weights_bytes
-            + self._activation_bytes
-            + self._workspace_ceiling_bytes
-            + self._graph_bytes
-            + self._staging_bytes
-            + self._runner_buffer_bytes
-        )
-        overhead = max(4 << 20, owned // 16)
-        return owned + overhead, slab, owned + overhead
-
-    def _build_ledger(self, pages: int) -> tuple[MemoryLedger, int, int]:
-        """Create the full-budget ledger and admit the fixed non-KV claims."""
-        budget, kv_budget, total = self._resolve_budget(pages)
-        lane = MemoryLane.CUDA if self._device.type == "cuda" else MemoryLane.CPU
-        device_index = self._device.index or 0
-        if lane is MemoryLane.CPU:
-            ledger = MemoryLedger.for_device(
-                device_budget_bytes=budget,
-                device_total_bytes=total,
-                host_pageable_bytes=budget,
-                host_total_bytes=total,
-                host_pinned_bytes=self._staging_bytes,
-                device_index=device_index,
-            )
-        else:
-            ledger = MemoryLedger.for_device(
-                device_budget_bytes=budget,
-                device_total_bytes=total,
-                host_pinned_bytes=self._staging_bytes,
-                device_index=device_index,
-            )
-        for owner, label, nbytes in (
-            (MemoryOwner.WEIGHT, "serving.weights", self._weights_bytes),
-            (MemoryOwner.COMPILE, "serving.graph", self._graph_bytes),
-        ):
-            if not nbytes:
-                continue
-            ledger.admit(
-                Reservation.backed(
-                    owner,
-                    label,
-                    nbytes,
-                    tier=claim_tier(owner, lane=lane),
-                    device_index=device_index,
-                )
-            )
-        if self._staging_bytes:
-            ledger.admit(
-                Reservation.backed(
-                    MemoryOwner.WORKSPACE,
-                    "serving.staging",
-                    self._staging_bytes,
-                    tier=claim_tier(MemoryOwner.WORKSPACE, lane=lane, pinned_host=True),
-                    device_index=device_index,
-                )
-            )
-        return ledger, budget, kv_budget
-
-    def _build_workspace(self, ledger: MemoryLedger) -> tuple[WorkspaceManager, CachingAllocator]:
-        """Allocate the activation arena and freeze the workspace ceiling."""
-        if self._device.type == "cuda":
-            source = TorchDeviceSource(device_index=self._device.index or 0)
-            tier = MemoryTier.DEVICE
-        else:
-            source = TorchHostByteSource(pinned=False)
-            tier = MemoryTier.HOST_PAGEABLE
-        allocator = CachingAllocator(
-            source,
-            ledger=ledger,
-            tier=tier,
-            device_index=self._device.index or 0,
-            ledger_label="serving.workspace",
-        )
-        manager = WorkspaceManager(allocator, workspace_ceiling_bytes=self._workspace_ceiling_bytes)
-        manager.initialize(self._activation_bytes)
-        return manager, allocator
-
-    def _build_kv(
-        self, pages: int
-    ) -> tuple[
-        MemoryLedger,
-        KVStorageLease,
-        RuntimeMemoryManager,
-        LogicalKVManager,
-        WorkspaceManager,
-        CachingAllocator,
-        CapacitySnapshot,
-        RunnerBuffers,
-    ]:
-        """Materialize one charged slab set plus its workspace and snapshot.
-
-        Order matters: ledger with fixed claims, KV slab, workspace/activation
-        arena, then the frozen capacity snapshot that names all of them. Any
-        failure closes owners in reverse before re-raising.
-        """
-        ledger, budget, kv_budget = self._build_ledger(pages)
-        spec = self._storage_spec(pages)
-        storage = materialize_kv_storage(
-            spec,
-            ledger=ledger,
-            label="serving.kv",
-            device=str(self._device),
-            zero_initialize=True,
-        )
-        workspace: WorkspaceManager | None = None
-        allocator: CachingAllocator | None = None
-        buffers: RunnerBuffers | None = None
-        try:
-            manager = RuntimeMemoryManager(
-                total_pages=pages,
-                page_size=self._page_size,
-                max_sequences=self._max_requests,
-                max_sequence_tokens=self._max_seq,
-                storage=storage.storage,
-            )
-            kv = LogicalKVManager(manager, {"default": storage})
-        except BaseException:
-            storage.close()
-            with suppress(Exception):
-                ledger.release_owner(MemoryOwner.WEIGHT)
-            with suppress(Exception):
-                ledger.release_owner(MemoryOwner.COMPILE)
-            raise
-        try:
-            workspace, allocator = self._build_workspace(ledger)
-            lane = MemoryLane.CUDA if self._device.type == "cuda" else MemoryLane.CPU
-            # The pool admits its device metadata claim now, before the snapshot
-            # freezes the WORKSPACE budget that includes it. Pinned staging is
-            # already covered by the `serving.staging` claim admitted above.
-            buffers = RunnerBuffers(
-                self._buffer_spec,
-                device=self._device,
-                pin_staging=lane is MemoryLane.CUDA,
-                ledger=ledger,
-                device_index=self._device.index or 0,
-                label="serving.runner_buffers",
-                reserve_staging=False,
-            )
-            # Freeze the materialized activation capacity (pooled class bytes),
-            # not the profiling figure: the claim must cover what the pool holds.
-            activation_claim = allocator.bytes_by_owner().get(MemoryOwner.ACTIVATION, 0)
-            generation = mint_generation(
-                model_id=self.config.model,
-                model_revision=self._model_revision,
-                weights_revision=self._weights_revision,
-                kv_storage=kv.fingerprint,
-                backend=type(kv.backend).__name__,
-                workspace=workspace.workspace_generation,
-                buffers=buffers.generation,
-            )
-            snapshot = build_capacity_snapshot(
-                generation=generation,
-                lane=lane,
-                dtype=str(self._dtype).removeprefix("torch."),
-                kv_dtype=str(self._dtype).removeprefix("torch."),
-                page_size=self._page_size,
-                group_pages={"default": pages},
-                max_model_len=self._max_seq,
-                max_num_seqs=self._max_requests,
-                max_num_batched_tokens=self._batch_tokens,
-                max_inflight=self._scheduler_config.max_inflight,
-                activation_bytes=activation_claim,
-                workspace_ceiling_bytes=self._workspace_ceiling_bytes,
-                graph_bytes=self._graph_bytes,
-                staging_bytes=self._staging_bytes,
-                budget_bytes=budget,
-                kv_budget_bytes=kv_budget,
-                weights_bytes=self._weights_bytes,
-                ledger=ledger,
-                staging_pinned=lane is MemoryLane.CUDA,
-                runner_buffer_bytes=self._runner_buffer_bytes,
-            )
-            kv.bind_capacity(snapshot)
-            reconcile_actual_usage(ledger, snapshot)
-        except BaseException:
-            if buffers is not None:
-                with suppress(Exception):
-                    buffers.close()
-            if workspace is not None and allocator is not None:
-                self._close_workspace(workspace, allocator)
-            kv.close()
-            storage.close()
-            with suppress(Exception):
-                ledger.release_owner(MemoryOwner.WEIGHT)
-            with suppress(Exception):
-                ledger.release_owner(MemoryOwner.WORKSPACE)
-            with suppress(Exception):
-                ledger.release_owner(MemoryOwner.COMPILE)
-            raise
-        assert buffers is not None
-        return ledger, storage, manager, kv, workspace, allocator, snapshot, buffers
-
-    @staticmethod
-    def _close_workspace(workspace: WorkspaceManager, allocator: CachingAllocator) -> None:
-        with suppress(Exception):
-            workspace.close()
-        with suppress(Exception):
-            allocator.close()
+    def _build_kv(self, pages: int) -> WorkerResources:
+        """Delegate allocation, reconciliation and freeze to the Worker owner."""
+        return WorkerResourcePlan(
+            device=self._device,
+            storage_spec=self._storage_spec(pages),
+            buffer_spec=self._buffer_spec,
+            memory_config=self._memory_config,
+            device_total_bytes=self._device_total_bytes,
+            model_id=self.config.model,
+            model_revision=self._model_revision,
+            weights_revision=self._weights_revision,
+            max_model_len=self._max_seq,
+            max_num_seqs=self._max_requests,
+            max_num_batched_tokens=self._batch_tokens,
+            max_inflight=self._scheduler_config.max_inflight,
+            weights_bytes=self._weights_bytes,
+            activation_bytes=self._activation_bytes,
+            workspace_ceiling_bytes=self._workspace_ceiling_bytes,
+            graph_bytes=self._graph_bytes,
+            staging_bytes=self._staging_bytes,
+        ).build()
 
     def _build_runner(self, kv: LogicalKVManager, buffers: RunnerBuffers) -> PagedModelRunner:
         """Bind a fresh paged runner to the slab, this model and its buffers."""
@@ -647,6 +428,7 @@ class ServingRuntime:
         ledger: MemoryLedger,
         workspace: WorkspaceManager,
         buffers: RunnerBuffers,
+        resources: WorkerResources,
     ) -> ResidentKVEngine:
         """Resolve a fresh scheduler plan against the new ledger and wire it."""
         plan = self._scheduler_config.resolve(
@@ -665,6 +447,7 @@ class ServingRuntime:
             prefix_context=self._prefix_context,
             workspace=workspace,
             buffers=buffers,
+            worker=LocalWorker(kv, runner, max_inflight=plan.max_inflight, resources=resources),
         )
         if self._constraints is not None:
             runner.set_request_source(engine.requests.get, constraints=self._constraints)
@@ -687,27 +470,35 @@ class ServingRuntime:
 
     def _build_tail(self, pages: int) -> _KVTail:
         """Materialize every owner for one capacity, cleaning up on failure."""
-        ledger, storage, manager, kv, workspace, allocator, capacity, buffers = self._build_kv(
-            pages
-        )
+        resources = self._build_kv(pages)
+        ledger, kv = resources.ledger, resources.kv
+        storage = resources.storages[0]
+        workspace, allocator = resources.workspace, resources.allocator
+        capacity, buffers = resources.capacity, resources.buffers
+        assert workspace is not None and allocator is not None and buffers is not None
+        manager = kv.backend
+        assert isinstance(manager, RuntimeMemoryManager)
         runner = None
+        engine = None
         try:
             runner = self._build_runner(kv, buffers)
             if self._decode_graph:
                 runner.enable_graph(self._decode_graph_config(kv))
-            engine = self._build_engine(kv, runner, ledger, workspace, buffers)
+            engine = self._build_engine(kv, runner, ledger, workspace, buffers, resources)
             if self._decode_graph and runner.graph_pool is not None:
                 runner.graph_pool.attach_metrics(engine.executor.metrics)
         except BaseException:
-            if runner is not None:
-                runner.close()
-            with suppress(Exception):
-                buffers.close()
-            kv.close()
-            self._close_workspace(workspace, allocator)
-            storage.close()
+            try:
+                if engine is not None:
+                    engine.close()
+                elif runner is not None:
+                    runner.close()
+            finally:
+                if not resources.closed:
+                    resources.close()
             raise
         return _KVTail(
+            resources=resources,
             ledger=ledger,
             storage=storage,
             manager=manager,
@@ -769,9 +560,14 @@ class ServingRuntime:
     def _bind_tail(self, tail: _KVTail) -> None:
         """Point every public attribute at the new owner set."""
         if self._freeze is None:
-            self._freeze = CapacityFreeze(tail.capacity)
+            self._freeze = tail.resources.freeze
         else:
-            self._freeze.replace(tail.capacity)
+            if (
+                tail.capacity.generation.owner_incarnation
+                <= self._freeze.current.generation.owner_incarnation
+            ):
+                raise ValueError("rebuild must advance owner_incarnation")
+            self._freeze = tail.resources.freeze
         self._tail = tail
         self.storage = tail.storage
         self.manager = tail.manager
@@ -793,16 +589,10 @@ class ServingRuntime:
         """
         engine = self.engine
         if engine is not None:
-            engine.close()
-        if self.runner_buffers is not None:
-            self.runner_buffers.close()
-        if self.workspace is not None and self.workspace_allocator is not None:
-            self.workspace.close()
-            self.workspace_allocator.close()
-        if self.kv is not None and not self.kv.closed:
-            self.kv.close()
-        if self.storage is not None and not self.storage.closed:
-            self.storage.close()
+            if not engine.close().closed:
+                raise RuntimeError("engine still owns unsettled work; tail retained")
+        if self._tail is not None:
+            self._tail.resources.close()
 
     def _resolve_headroom(self) -> int | None:
         """Measured resizable headroom, or None when the device cannot report."""
