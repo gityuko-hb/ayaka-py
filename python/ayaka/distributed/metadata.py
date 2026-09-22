@@ -4,9 +4,29 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from ayaka.exceptions import InvariantViolationError
+
+
+@runtime_checkable
+class StepMetadataLike(Protocol):
+    """Checksummed step envelope the KV worker can begin without a concrete type.
+
+    Only an immutable ``step_id``, the validated ``payload`` and
+    :meth:`verify` are required: the worker validates before observing
+    state, so any canonical payload that proves its own integrity
+    (``DistributedKVMetadata``, ``DistributedStepEnvelope``) rides the same
+    state machine.
+    """
+
+    @property
+    def step_id(self) -> int: ...
+
+    @property
+    def payload(self) -> Mapping[str, Any]: ...
+
+    def verify(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,9 +80,7 @@ class DistributedKVMetadata:
                         "page_size": int(group.page_size),
                         "logical_blocks": [int(block) for block in group.logical_blocks],
                         "block_table": [int(page) for page in group.block_table],
-                        "write_slots": [
-                            write_slot_payload(slot) for slot in group.write_slots
-                        ],
+                        "write_slots": [write_slot_payload(slot) for slot in group.write_slots],
                         "attention_token_start": int(group.attention_token_start),
                         "attention_token_stop": int(group.attention_token_stop),
                         "retained_token_start": int(group.retained_token_start),
@@ -77,9 +95,7 @@ class DistributedKVMetadata:
                     None if state_slot is None else int(state_slot)
                 )
             else:
-                sequence_payload["block_table"] = [
-                    int(page) for page in sequence_view.block_table
-                ]
+                sequence_payload["block_table"] = [int(page) for page in sequence_view.block_table]
                 sequence_payload["write_slots"] = [
                     write_slot_payload(slot) for slot in sequence_view.write_slots
                 ]

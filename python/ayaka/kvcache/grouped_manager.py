@@ -8,6 +8,7 @@ from ayaka.exceptions import (
     InvalidHandleError,
     InvalidStateTransitionError,
     InvariantViolationError,
+    PrefixCapabilityStaleError,
     SequenceBusyError,
     SequenceCapacityError,
 )
@@ -20,13 +21,10 @@ from ayaka.handles import (
     SequenceHandle,
     StepMemoryLeaseHandle,
 )
+from ayaka.kvcache.grouped_prefix import GroupedPrefixCache
 from ayaka.kvcache.groups import KVCacheGroup
 from ayaka.kvcache.layout import (
-    LayoutFeature,
     LayoutFeatureCapability,
-    LayoutFeatureCompatibilityError,
-    LayoutFeatureIssue,
-    LayoutFeatureIssueCode,
     prefix_cache_capability,
 )
 from ayaka.kvcache.retention.range import retained_page_range
@@ -81,7 +79,7 @@ from ayaka.memory.views import (
     KVPageCopy,
 )
 from ayaka.prefix.identity import PrefixCacheContext
-from ayaka.prefix.interface import PrefixLookupResult
+from ayaka.prefix.interface import GroupedValidResume, PrefixLookupResult
 from ayaka.utils.validation import require_int, require_text
 
 
@@ -201,10 +199,14 @@ class KVCacheGroupManager:
         self._pressure_reclaim_attempts_total = 0
         self._pressure_reclaim_progress_total = 0
         self._pressure_prefix_eviction_attempts_total = 0
+        self._pressure_prefix_eviction_progress_total = 0
         self._pressure_preemptions_total = 0
         self._lock = RLock()
         self._prefix_snapshots: dict[int, GroupedPrefixSnapshot] = {}
         self._next_snapshot = 0
+        self._prefix_cache: GroupedPrefixCache | None = None
+        self._pending_prefix_matches: dict[int, GroupedValidResume] = {}
+        self._next_prefix_match = 0
 
     @property
     def current_epoch(self) -> int:
@@ -229,39 +231,32 @@ class KVCacheGroupManager:
         return min(runtime.descriptor.storage_spec.page_size for runtime in self._group_runtimes)
 
     @property
-    def prefix_capability(self) -> LayoutFeatureCapability:
-        """Layout-level prefix capability of the configured groups.
+    def prefix_cache(self) -> GroupedPrefixCache:
+        """Canonical resident prefix cache over all groups (lazily created).
 
-        This states only whether the *layout* could host a prefix cache. The
-        manager itself implements no prefix lookup, so callers gating a code
-        path should use :meth:`require_prefix_cache_supported`, which folds in
-        the manager-level limitation.
+        The cache publishes only boundaries a successful all-group pin
+        certified and owns no pages itself. Layout compatibility is checked at
+        creation, so an unsupported group family fails closed before any
+        lookup instead of silently missing.
         """
+        with self._lock:
+            if self._prefix_cache is None:
+                self._prefix_reuse_capability().require_supported()
+                self._prefix_cache = GroupedPrefixCache(self)
+            return self._prefix_cache
+
+    @property
+    def prefix_capability(self) -> LayoutFeatureCapability:
+        """Layout-level prefix capability of the configured groups."""
         return prefix_cache_capability(self.cache_groups)
 
     def _prefix_reuse_capability(self) -> LayoutFeatureCapability:
-        """Report prefix reuse as unimplemented even for compatible layouts.
-
-        A single full-retention MHA group is layout-compatible, but the
-        grouped manager has no canonical page chain or prefix cache, so the
-        capability degrades to ``PREFIX_CACHE_NOT_IMPLEMENTED`` instead of
-        silently promising behavior.
-        """
-        layout = self.prefix_capability
-        if layout.supported:
-            return LayoutFeatureCapability(
-                feature=LayoutFeature.PREFIX_CACHE,
-                issues=(
-                    LayoutFeatureIssue(
-                        LayoutFeatureIssueCode.PREFIX_CACHE_NOT_IMPLEMENTED,
-                        "advanced-layout managers do not implement A6 prefix lookup",
-                    ),
-                ),
-            )
-        return layout
+        """Manager-level prefix reuse statement for the R12A grouped cache."""
+        return prefix_cache_capability(self.cache_groups)
 
     def prefix_cache_reuse_available(self) -> bool:
-        return False
+        """Whether this manager serves canonical resident prefix reuse."""
+        return self._prefix_reuse_capability().supported
 
     def lookup_prefix(
         self,
@@ -270,36 +265,72 @@ class KVCacheGroupManager:
         context: PrefixCacheContext,
         max_matched_tokens: int | None = None,
     ) -> PrefixLookupResult:
-        raise LayoutFeatureCompatibilityError(self._prefix_reuse_capability())
+        """Borrow the longest certified boundary that prefixes ``token_ids``.
+
+        The returned handle owns no pages; :meth:`discard_prefix_match` must
+        consume it exactly once. ``max_matched_tokens`` bounds the candidate
+        length so a shorter certified boundary is returned instead of a hit
+        that would exceed the caller's budget.
+        """
+        self._prefix_reuse_capability().require_supported()
+        if max_matched_tokens is not None and max_matched_tokens <= 0:
+            return PrefixLookupResult.empty()
+        tokens = tuple(token_ids)
+        if max_matched_tokens is not None:
+            tokens = tokens[:max_matched_tokens]
+        if not tokens:
+            return PrefixLookupResult.empty()
+        match = self.prefix_cache.match_resume(tokens, context=context)
+        if match is None:
+            return PrefixLookupResult.empty()
+        with self._lock:
+            index = self._next_prefix_match
+            self._next_prefix_match += 1
+            self._pending_prefix_matches[index] = match
+        return PrefixLookupResult(
+            matched_tokens=match.logical_position,
+            handle=PrefixMatchHandle(index=index, generation=1),
+        )
 
     def discard_prefix_match(self, handle: PrefixMatchHandle) -> None:
-        raise LayoutFeatureCompatibilityError(self._prefix_reuse_capability())
+        """Consume a borrowed lookup handle; safe to call exactly once."""
+        with self._lock:
+            if handle.generation != 1 or handle.index not in self._pending_prefix_matches:
+                raise InvalidHandleError(f"stale prefix match handle: {handle}")
+            del self._pending_prefix_matches[handle.index]
 
     def cache_prefix(
         self,
         sequence: SequenceHandle,
-        token_ids: tuple[int, ...],
+        token_ids: Sequence[int],
         *,
         context: PrefixCacheContext,
     ) -> PrefixHandle | None:
-        raise LayoutFeatureCompatibilityError(self._prefix_reuse_capability())
+        """Publish committed grouped KV at its full length when every group can pin."""
+        result = self.cache_resume(sequence, token_ids, context=context)
+        if result is None:
+            return None
+        return PrefixHandle(index=result.entry_id, generation=1)
 
     @property
     def pressure_metrics(self) -> MemoryPressureMetrics:
         """Cumulative pressure counters; reclamation totals sum over groups."""
         with self._lock:
+            cache = self._prefix_cache
             return MemoryPressureMetrics(
                 kv_reclaims_total=sum(
                     runtime.allocator.snapshot().reclaimed_pages_total
                     for runtime in self._group_runtimes
                 ),
-                kv_prefix_evictions_total=0,
+                kv_prefix_evictions_total=0 if cache is None else cache.evicted_pages_total,
                 pressure_reclaim_attempts_total=self._pressure_reclaim_attempts_total,
                 pressure_reclaim_progress_total=self._pressure_reclaim_progress_total,
                 pressure_prefix_eviction_attempts_total=(
                     self._pressure_prefix_eviction_attempts_total
                 ),
-                pressure_prefix_eviction_progress_total=0,
+                pressure_prefix_eviction_progress_total=(
+                    self._pressure_prefix_eviction_progress_total
+                ),
                 pressure_preemptions_total=self._pressure_preemptions_total,
             )
 
@@ -378,55 +409,81 @@ class KVCacheGroupManager:
         require_int(num_tokens, "num_tokens", minimum=1)
         with self._lock:
             state = self._get_sequence_state(sequence)
-            if (
-                state.pending_transaction_index is not None
-                or state.active_lease_index is not None
-                or state.release_requested
-                or state.blocked_until_epoch > self.current_epoch
-            ):
-                raise SequenceBusyError("grouped producer has not retired")
-            if num_tokens > state.committed_tokens:
-                raise ValueError("resume exceeds completed state")
-            groups = []
-            for runtime in self._group_runtimes:
-                descriptor = runtime.descriptor
-                if descriptor.storage_spec.kind.value != "mha":
-                    raise ValueError("grouped resume supports paged MHA state only")
-                size = descriptor.storage_spec.page_size
-                required = tuple(
-                    retained_page_range(
-                        descriptor.retention,
-                        layer_id=descriptor.layer_ids[0],
-                        sequence_length=num_tokens,
-                        page_size=size,
-                    )
-                )
-                table = {e.logical_block: e for e in state.group_tables[descriptor.name]}
-                entries = []
-                for block in required:
-                    entry = table.get(block)
-                    valid = min(size, num_tokens - block * size)
-                    if entry is None or entry.valid_tokens < valid:
-                        raise ValueError("no common valid resume boundary across retained groups")
-                    entries.append(GroupPageTableEntry(block, entry.page, valid))
-                groups.append((descriptor.name, tuple(entries)))
-            pinned = []
-            try:
-                for name, entries in groups:
-                    allocator = self._runtime_by_name[name].allocator
-                    for entry in entries:
-                        allocator.pin_page(entry.page)
-                        pinned.append((allocator, entry.page))
-            except BaseException:
-                for allocator, page in reversed(pinned):
-                    allocator.unpin_page(page, safe_epoch=self.current_epoch)
-                raise
-            self._next_snapshot += 1
-            snapshot = GroupedPrefixSnapshot(
-                id(self), self._next_snapshot, num_tokens, tuple(groups)
-            )
-            self._prefix_snapshots[snapshot.snapshot_id] = snapshot
+            snapshot = self._pin_prefix_locked(state, num_tokens, require_boundary=True)
+            assert snapshot is not None
             return snapshot
+
+    def try_pin_prefix(
+        self, sequence: SequenceHandle, num_tokens: int
+    ) -> GroupedPrefixSnapshot | None:
+        """Pin an all-group boundary, or return ``None`` when none is restorable.
+
+        Same ownership contract as :meth:`pin_prefix`, but a boundary whose
+        required history sliding retention has already dropped is a clean
+        miss (``None``) instead of an error. Sequence-state violations still
+        raise, because they are caller bugs rather than cache misses.
+        """
+        require_int(num_tokens, "num_tokens", minimum=1)
+        with self._lock:
+            state = self._get_sequence_state(sequence)
+            return self._pin_prefix_locked(state, num_tokens, require_boundary=False)
+
+    def _pin_prefix_locked(
+        self,
+        state: _SequenceState,
+        num_tokens: int,
+        *,
+        require_boundary: bool,
+    ) -> GroupedPrefixSnapshot | None:
+        if (
+            state.pending_transaction_index is not None
+            or state.active_lease_index is not None
+            or state.release_requested
+            or state.blocked_until_epoch > self.current_epoch
+        ):
+            raise SequenceBusyError("grouped producer has not retired")
+        if num_tokens > state.committed_tokens:
+            raise ValueError("resume exceeds completed state")
+        groups = []
+        for runtime in self._group_runtimes:
+            descriptor = runtime.descriptor
+            if descriptor.storage_spec.kind.value != "mha":
+                raise ValueError("grouped resume supports paged MHA state only")
+            size = descriptor.storage_spec.page_size
+            required = tuple(
+                retained_page_range(
+                    descriptor.retention,
+                    layer_id=descriptor.layer_ids[0],
+                    sequence_length=num_tokens,
+                    page_size=size,
+                )
+            )
+            table = {e.logical_block: e for e in state.group_tables[descriptor.name]}
+            entries = []
+            for block in required:
+                entry = table.get(block)
+                valid = min(size, num_tokens - block * size)
+                if entry is None or entry.valid_tokens < valid:
+                    if not require_boundary:
+                        return None
+                    raise ValueError("no common valid resume boundary across retained groups")
+                entries.append(GroupPageTableEntry(block, entry.page, valid))
+            groups.append((descriptor.name, tuple(entries)))
+        pinned = []
+        try:
+            for name, entries in groups:
+                allocator = self._runtime_by_name[name].allocator
+                for entry in entries:
+                    allocator.pin_page(entry.page)
+                    pinned.append((allocator, entry.page))
+        except BaseException:
+            for allocator, page in reversed(pinned):
+                allocator.unpin_page(page, safe_epoch=self.current_epoch)
+            raise
+        self._next_snapshot += 1
+        snapshot = GroupedPrefixSnapshot(id(self), self._next_snapshot, num_tokens, tuple(groups))
+        self._prefix_snapshots[snapshot.snapshot_id] = snapshot
+        return snapshot
 
     def unpin_prefix(self, snapshot: GroupedPrefixSnapshot) -> None:
         """Drop publisher pins after its final borrower; never flatten logical gaps."""
@@ -1183,10 +1240,12 @@ class KVCacheGroupManager:
             )
 
     def evict_prefixes_for_pressure(self, required_pages: int) -> MemoryPressureResult:
-        """Grouped managers have no prefix cache to evict.
+        """Evict LRU canonical grouped prefix entries until capacity is gained.
 
-        Returns a structured ``NO_PROGRESS`` result so pressure handling stays
-        uniform across manager implementations.
+        Every evicted entry releases the pins of a whole all-group boundary;
+        pages still referenced by live requests stay deferred, exactly like
+        the homogeneous cache. The loop is bounded by the entry count, so a
+        cache whose pages are all request-owned can never spin.
         """
         if not isinstance(required_pages, int) or isinstance(required_pages, bool):
             raise TypeError("required_pages must be an integer")
@@ -1194,27 +1253,164 @@ class KVCacheGroupManager:
             raise ValueError("required_pages must be non-negative")
         with self._lock:
             before = self.snapshot()
+            before_cached = None if self._prefix_cache is None else self._prefix_cache.snapshot()
             self._pressure_prefix_eviction_attempts_total += 1
+            cache = self._prefix_cache
+            evicted = 0
+            reclaimed = 0
+            if cache is not None and cache.snapshot().terminal_entries:
+                total_usable = sum(
+                    runtime.allocator.snapshot().usable_pages for runtime in self._group_runtimes
+                )
+                desired_free = min(total_usable, before.free_pages + required_pages)
+                while (
+                    sum(runtime.allocator.available_pages() for runtime in self._group_runtimes)
+                    < desired_free
+                ):
+                    pages = cache.evict(1, safe_epoch=self.current_epoch)
+                    if pages == 0:
+                        break
+                    evicted += pages
+                    reclaimed += sum(
+                        runtime.allocator.reclaim_completed() for runtime in self._group_runtimes
+                    )
+            after = self.snapshot()
+            after_cached = None if cache is None else cache.snapshot()
+            progressed = evicted > 0 or reclaimed > 0
+            if progressed:
+                self._pressure_prefix_eviction_progress_total += 1
             return MemoryPressureResult(
                 action=PressureAction.EVICT_PREFIX,
-                status=PressureStatus.NO_PROGRESS,
+                status=PressureStatus.PROGRESSED if progressed else PressureStatus.NO_PROGRESS,
                 requested_pages=required_pages,
-                cache_pages_evicted=0,
-                pages_reclaimed=0,
+                cache_pages_evicted=evicted,
+                pages_reclaimed=reclaimed,
                 free_pages_before=before.free_pages,
-                free_pages_after=before.free_pages,
+                free_pages_after=after.free_pages,
                 deferred_pages_before=before.deferred_free_pages,
-                deferred_pages_after=before.deferred_free_pages,
-                cached_pages_before=0,
-                cached_pages_after=0,
+                deferred_pages_after=after.deferred_free_pages,
+                cached_pages_before=(0 if before_cached is None else before_cached.cached_blocks),
+                cached_pages_after=0 if after_cached is None else after_cached.cached_blocks,
             )
 
-    def require_prefix_cache_supported(self) -> None:
-        """Raise when this manager cannot serve A6 prefix sharing.
+    def cache_resume(
+        self,
+        sequence: SequenceHandle,
+        token_ids: Sequence[int],
+        *,
+        context: PrefixCacheContext,
+    ) -> GroupedValidResume | None:
+        """Publish retired committed grouped KV at one common restorable boundary.
 
-        Checks the *manager-level* capability, so a layout that is structurally
-        compatible still fails closed here: the grouped manager implements no
-        prefix lookup, and a caller must not be told otherwise.
+        The boundary is pinned in every group before the entry becomes
+        visible, so a published capability is always executable. A boundary
+        whose required history sliding retention has dropped is a clean
+        no-publish (``None``); a busy producer still raises.
+        """
+        with self._lock:
+            tokens = tuple(token_ids)
+            if not tokens:
+                return None
+            cache = self.prefix_cache
+            state = self._get_sequence_state(sequence)
+            snapshot = self._pin_prefix_locked(state, len(tokens), require_boundary=False)
+            if snapshot is None:
+                return None
+            existing = cache.find_exact(tokens, context=context)
+            if existing is not None:
+                self.unpin_prefix(snapshot)
+                return existing
+            try:
+                return cache.register(tokens, context=context, snapshot=snapshot)
+            except BaseException:
+                self.unpin_prefix(snapshot)
+                raise
+
+    def attach_resume(self, sequence: SequenceHandle, match: GroupedValidResume) -> int:
+        """Acquire all-group refs for a certified boundary or report a clean miss.
+
+        Stale capabilities (evicted entry, changed identity, boundary no
+        longer restorable, sequence limit) raise
+        :class:`~ayaka.exceptions.PrefixCapabilityStaleError` so the caller
+        reports zero acquired tokens; sequence-state violations propagate as
+        caller bugs, never as misses.
+        """
+        with self._lock:
+            cache = self.prefix_cache
+            snapshot = cache.resolve_resume(match)
+            state = self._get_sequence_state(sequence)
+            if state.committed_tokens or any(state.group_tables.values()):
+                raise InvalidStateTransitionError("grouped resume requires an empty sequence")
+            if (
+                state.pending_transaction_index is not None
+                or state.active_lease_index is not None
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("grouped resume requires an idle sequence")
+            if snapshot.logical_position > self.max_sequence_tokens:
+                raise PrefixCapabilityStaleError("grouped resume exceeds the sequence limit")
+            try:
+                return self.attach_pinned_prefix(sequence, snapshot)
+            except ValueError as exc:
+                raise PrefixCapabilityStaleError(
+                    f"grouped resume capability changed: {exc}"
+                ) from exc
+
+    def resume_ready(self, match: GroupedValidResume) -> bool:
+        """Admission hint: does every group have COW headroom for the shared tail?
+
+        Not a reservation. A stale capability reports ``True`` so the caller
+        proceeds to :meth:`attach_resume` and observes the clean miss there.
+        """
+        with self._lock:
+            cache = self._prefix_cache
+            if cache is None:
+                return True
+            try:
+                snapshot = cache.resolve_resume(match)
+            except PrefixCapabilityStaleError:
+                return True
+            for name, entries in snapshot.groups:
+                runtime = self._runtime_by_name[name]
+                tail = entries[-1]
+                if tail.valid_tokens == runtime.descriptor.storage_spec.page_size:
+                    continue
+                meta = runtime.allocator.get_meta(tail.page)
+                capacity = runtime.allocator.snapshot()
+                if not (
+                    capacity.free_pages
+                    or capacity.evictable_pages
+                    or not (meta.request_refs or meta.pin_refs or meta.inflight_refs)
+                ):
+                    return False
+            return True
+
+    def clear_prefix_cache(self, *, safe_epoch: int | None = None) -> int:
+        """Drop every canonical grouped prefix entry and release its pins."""
+        with self._lock:
+            cache = self._prefix_cache
+            if cache is None:
+                return 0
+            epoch = self.current_epoch if safe_epoch is None else safe_epoch
+            if epoch < self.current_epoch:
+                raise ValueError("safe_epoch cannot precede the completed epoch")
+            return cache.clear(safe_epoch=epoch)
+
+    def privatize_prefix_tail(self, sequence: SequenceHandle) -> bool:
+        """Grouped COW unshare is not implemented; pressure reports capacity instead.
+
+        Homogeneous KV can drop a sole-consumer cache ref on one truncated
+        tail page. A grouped boundary pins whole per-group page sets, so
+        unsharing would require evicting a canonical entry with no guarantee
+        that the pages freed are the ones an appender needs. Returning
+        ``False`` keeps the pressure loop honest: it reports a capacity error
+        instead of making an unsafe guess.
+        """
+        return False
+
+    def require_prefix_cache_supported(self) -> None:
+        """Raise when this manager cannot serve canonical prefix sharing.
 
         Raises:
             LayoutFeatureCompatibilityError: when prefix reuse is unsupported.

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from ayaka.kvcache.retention.policy import FullRetention, RetentionPolicy
+from ayaka.kvcache.retention.policy import RetentionPolicy
 from ayaka.kvcache.storage.geometry import BaseKVStorageSpec
 from ayaka.kvcache.storage.layout import KVStorageKind
 
@@ -100,36 +100,22 @@ class LayoutFeatureCompatibilityError(ValueError):
 def prefix_cache_capability(
     groups: tuple[_ResolvedKVCacheGroup, ...],
 ) -> LayoutFeatureCapability:
-    """Only the stable homogeneous full-retention MHA path reuses A6 pages.
+    """R12A grouped prefix reuse: MHA groups, full or sliding retention.
 
-    Evaluates the *layout-level* statement: a single MHA full-retention group
-    is compatible with prefix sharing; multi-group, retention-restricted, or
-    MLA layouts produce explicit issue codes instead of silent fallback.
+    The grouped canonical cache publishes only all-group restorable
+    boundaries, so multi-group layouts and sliding-window retention are
+    supported. Recurrent/MLA layouts stay explicitly unsupported instead of
+    silently falling back.
 
     Args:
         groups: The resolved cache groups to evaluate.
 
     Returns:
-        A structured capability; ``supported`` only for a single homogeneous
-        full-retention MHA group.
+        A structured capability; ``supported`` for MHA/GQA groups.
     """
 
     normalized = tuple(groups)
     issues: list[LayoutFeatureIssue] = []
-    if len(normalized) != 1:
-        issues.append(
-            LayoutFeatureIssue(
-                LayoutFeatureIssueCode.MULTI_GROUP_PREFIX_UNSUPPORTED,
-                "A9 multi-group prefix ownership has no canonical page chain",
-            )
-        )
-    if any(not isinstance(group.retention, FullRetention) for group in normalized):
-        issues.append(
-            LayoutFeatureIssue(
-                LayoutFeatureIssueCode.RETENTION_PREFIX_UNSUPPORTED,
-                "prefix sharing requires full retention in the current implementation",
-            )
-        )
     if any(group.storage_spec.kind is not KVStorageKind.MHA for group in normalized):
         issues.append(
             LayoutFeatureIssue(

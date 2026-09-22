@@ -307,6 +307,26 @@ class RuntimeMemoryManager:
 
         return True
 
+    def resume_ready(self, match: ValidResume) -> bool:
+        """Admission hint: is there COW headroom for a shared partial tail?
+
+        This is an engine-thread admission hint, not a reservation. A stale
+        capability proceeds to :meth:`attach_resume` and reports a clean miss
+        there, so an invalid handle is not a refusal.
+        """
+        if not match.pages or match.pages[-1].valid_tokens == self.page_size:
+            return True
+        try:
+            meta = self.allocator.get_meta(match.pages[-1].page)
+        except InvalidHandleError:
+            return True
+        capacity = self.allocator.snapshot()
+        return bool(
+            capacity.free_pages
+            or capacity.evictable_pages
+            or not (meta.request_refs or meta.pin_refs or meta.inflight_refs)
+        )
+
     @property
     def pressure_metrics(self) -> MemoryPressureMetrics:
         """Return exact cumulative counters owned by runtime memory."""

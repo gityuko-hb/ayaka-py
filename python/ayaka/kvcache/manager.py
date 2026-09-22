@@ -240,20 +240,17 @@ class LogicalKVManager:
     def privatize_prefix_tail(self, sequence: SequenceHandle) -> bool:
         """Relinquish cache sharing on a sole-consumer partial tail.
 
-        Grouped backends have no canonical prefix cache, so there is nothing to
-        privatize and the method reports ``False`` rather than raising.
+        Grouped boundaries pin whole per-group page sets, so unsharing is not
+        implemented there; the backend reports ``False`` and pressure handling
+        reports an explicit capacity error instead of guessing.
         """
         self._require_open()
-        if isinstance(self.backend, RuntimeMemoryManager):
-            return self.backend.privatize_prefix_tail(sequence)
-        return False
+        return self.backend.privatize_prefix_tail(sequence)
 
     def clear_prefix_cache(self, *, safe_epoch: int | None = None) -> int:
         """Teardown-only: drop every resident prefix entry; policy stays in PrefixService."""
         self._require_open()
-        if isinstance(self.backend, RuntimeMemoryManager):
-            return self.backend.clear_prefix_cache(safe_epoch=safe_epoch)
-        return 0
+        return self.backend.clear_prefix_cache(safe_epoch=safe_epoch)
 
     def physical_page(self, group_name: str, page: KVPageHandle) -> int:
         """Resolve a generation-safe page handle to its kernel slot address."""
@@ -389,6 +386,11 @@ class LogicalKVManager:
             service = self._prefix_service
             if service is not None and not service.closed and not service.close():
                 raise RuntimeError("prefix service still has active transfers")
+        else:
+            # Grouped prefix entries hold pins; drop them before the leak check
+            # so teardown can return every group page to the free pool.
+            self.backend.clear_prefix_cache()
+            self.backend.reclaim_deferred()
         if not self.backend.leak_report().clean:
             raise RuntimeError("logical KV still owns sequences, cache pages, or execution leases")
         for pin in reversed(self._pins):

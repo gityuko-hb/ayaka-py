@@ -32,7 +32,6 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
-from ayaka.kernel.triton.math_utils import block_size, vocab_block_size, vocab_num_warps
 from ayaka.kernel.triton.sampling.philox import philox_u01_f32
 from ayaka.sampling.rng import philox4x32_10
 
@@ -1253,7 +1252,7 @@ def _radix_sampling_from_logits(
     output = torch.empty((batch_size,), dtype=torch.int32, device=device)
     valid = torch.empty((batch_size,), dtype=torch.bool, device=device)
     chunk_size = triton.cdiv(vocab_size, _RADIX_SPLIT)
-    block = block_size(chunk_size, _RADIX_BLOCK)
+    block = min(_RADIX_BLOCK, triton.next_power_of_2(chunk_size))
 
     grid = (batch_size, _RADIX_SPLIT)
     cast(Any, _radix_hist_kernel)[grid](
@@ -1308,7 +1307,7 @@ def _radix_sampling_from_logits(
         vocab_size=vocab_size,
         logits_stride_b=logits.stride(0),
         CAP=_RADIX_CAP,
-        BLOCK_SIZE=vocab_block_size(vocab_size),
+        BLOCK_SIZE=min(4096, triton.next_power_of_2(vocab_size)),
         num_warps=4,
     )
     return output, valid
@@ -1483,8 +1482,8 @@ def fused_topk_topp_minp_sampling_from_logits(
     valid = torch.empty((batch_size,), dtype=torch.bool, device=logits.device)
 
     grid = (batch_size,)
-    block_size = vocab_block_size(vocab_size)
-    num_warps = vocab_num_warps(vocab_size)
+    block_size = min(4096, triton.next_power_of_2(vocab_size))
+    num_warps = 8 if vocab_size >= 32768 else 4
 
     cast(Any, _fused_topk_topp_minp_kernel)[grid](
         logits,
@@ -1600,8 +1599,8 @@ def sampling_from_probs(
     output, valid = _prepare_sampling_outputs(probs)
 
     grid = (batch_size,)
-    block_size = vocab_block_size(vocab_size)
-    num_warps = vocab_num_warps(vocab_size)
+    block_size = min(4096, triton.next_power_of_2(vocab_size))
+    num_warps = 8 if vocab_size >= 32768 else 4
 
     cast(Any, _sampling_from_probs_kernel)[grid](
         probs,
@@ -1738,8 +1737,8 @@ def _min_p_sampling_op(
     min_p_ptr = min_p
 
     grid = (batch_size,)
-    block_size = vocab_block_size(vocab_size)
-    num_warps = vocab_num_warps(vocab_size)
+    block_size = min(4096, triton.next_power_of_2(vocab_size))
+    num_warps = 8 if vocab_size >= 32768 else 4
 
     cast(Any, _min_p_sampling_kernel)[grid](
         probs,
@@ -1890,7 +1889,7 @@ def _top_p_sampling_op(
     top_p_ptr = top_p
 
     grid = (batch_size,)
-    block_size = vocab_block_size(vocab_size)
+    block_size = min(4096, triton.next_power_of_2(vocab_size))
 
     cast(Any, _top_p_sampling_kernel)[grid](
         probs,

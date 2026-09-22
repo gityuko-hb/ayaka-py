@@ -41,7 +41,8 @@ from ayaka.sampling.ops.sampling import (
     greedy_support_output,
 )
 from ayaka.sampling.params import SamplingParams
-from ayaka.sampling.plan import SamplingPlanner, create_sampler, trace_sampler
+from ayaka.sampling.plan import SamplingPlanner, create_sampler
+from ayaka.sampling.trace import trace_sampler
 from ayaka.utils.import_utils import CapabilityError
 
 __all__ = ["SamplingCoordinator"]
@@ -235,14 +236,27 @@ class SamplingCoordinator:
     # ------------------------------------------------------------------
 
     def plan_for(self, slices: Sequence[_SamplingSlice]) -> SamplingPlan:
-        """Pin active rows (packed sampling order) and freeze the plan."""
+        """Pin active rows (packed sampling order) and freeze the plan.
+
+        The active-row map is mirrored to the metadata device before returning.
+        Sampling runs on the same engine thread right after planning, so a plan
+        that left its rows dirty could be read against a stale row map. Flushing
+        here keeps the device mirror and the frozen plan consistent even when a
+        candidate plan is rebuilt (pressure shrink, transient retry) after a
+        previous flush.
+        """
         rows = [self._slot_for(slice_.request_id) for slice_ in slices if slice_.sample_last_query]
         self.md.set_active_rows(rows)
-        plan, _schedule = self.planner.build(self.md, custom_ops=self._custom_ops)
-        if plan.num_rows != len(rows):
-            raise RuntimeError(
-                f"sampling plan has {plan.num_rows} rows but {len(rows)} slices sample"
-            )
+        try:
+            plan, _schedule = self.planner.build(self.md, custom_ops=self._custom_ops)
+            if plan.num_rows != len(rows):
+                raise RuntimeError(
+                    f"sampling plan has {plan.num_rows} rows but {len(rows)} slices sample"
+                )
+        finally:
+            # Mirror even when the plan build fails: the row map must never stay
+            # dirty past the planning boundary.
+            self.flush()
         return plan
 
     def flush(self, stream: Any = None) -> int:

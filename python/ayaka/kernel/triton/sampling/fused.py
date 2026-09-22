@@ -25,6 +25,53 @@ from ayaka.kernel.ops import custom_op
 
 _HAS_TRITON_FUSED = True
 
+# Split-count policy for the small-batch/large-vocab path.
+#
+# ``_MIN_SPLITS`` preserves the historical 16-way split, which is the count
+# that was tuned and measured on 16-SM parts. A 16-SM device therefore keeps
+# exactly the old split count for every shape in the trigger range. Devices
+# with more SMs scale the count up to ``_MAX_SPLITS``, bounded so that no
+# chunk shrinks below ``_MIN_SPLIT_CHUNK`` elements (per-program loop and
+# partial-store overhead) and so that large row counts do not queue waves.
+_MIN_SPLITS = 16
+_MAX_SPLITS = 128
+_MIN_SPLIT_CHUNK = 1000
+
+
+def _floor_pow2(value: int) -> int:
+    """Largest power of two <= ``value`` (``value >= 1``)."""
+    return 1 << max(0, int(value).bit_length() - 1)
+
+
+def _split_count_from_sm(vocab: int, rows: int, sm_count: int) -> int:
+    """Pure split-count policy for a given SM count (unit-testable on CPU).
+
+    ``max_by_chunk`` is the largest power of two whose chunk is still at least
+    ``_MIN_SPLIT_CHUNK`` elements, so the documented bound holds exactly
+    instead of overshooting by one power-of-two step.
+    """
+    sm_count = max(1, int(sm_count) or _MIN_SPLITS)
+
+    max_by_chunk = _floor_pow2(max(1, vocab // _MIN_SPLIT_CHUNK))
+    max_by_rows = max(_MIN_SPLITS, triton.next_power_of_2(max(1, sm_count // max(rows, 1))))
+
+    splits = triton.next_power_of_2(max(_MIN_SPLITS, sm_count))
+    return max(1, min(splits, _MAX_SPLITS, max_by_chunk, max_by_rows))
+
+
+def _row_logsumexp_num_splits(vocab: int, rows: int, device: torch.device) -> int:
+    """Choose a power-of-two split count for the small-batch path.
+
+    The split path exists to parallelize a wide vocabulary scan across SMs
+    when the batch is too small to fill the device. The count scales with
+    ``multi_processor_count`` (capped at ``_MAX_SPLITS``) and shrinks when
+    the resulting chunk would fall below ``_MIN_SPLIT_CHUNK`` elements or
+    when the row count already covers the device.
+    """
+    props = torch.cuda.get_device_properties(device)
+    sm_count = int(getattr(props, "multi_processor_count", 0) or _MIN_SPLITS)
+    return _split_count_from_sm(vocab, rows, sm_count)
+
 
 @triton.jit
 def _row_logsumexp_kernel(
@@ -211,9 +258,10 @@ def row_logsumexp_gpu(logits: torch.Tensor, row_gate: torch.Tensor | None) -> to
         gate = gate.to(torch.float32)
     out = torch.empty(n, dtype=torch.float32, device=logits.device)
 
-    # When batch is small (e.g. n < 8) and vocab is large, split vocab across 16 SMs for parallelism
+    # When batch is small (e.g. n < 8) and vocab is large, split the row scan
+    # across SMs; the count follows the device's SM count, not a fixed 16.
     if n < 8 and v >= 16384:
-        num_splits = 16
+        num_splits = _row_logsumexp_num_splits(v, n, logits.device)
         chunk_size = triton.cdiv(v, num_splits)
         partial_max = torch.empty((n, num_splits), dtype=torch.float32, device=logits.device)
         partial_sum = torch.empty((n, num_splits), dtype=torch.float32, device=logits.device)

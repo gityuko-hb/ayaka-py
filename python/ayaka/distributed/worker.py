@@ -5,7 +5,7 @@ from enum import Enum, auto
 from threading import RLock
 from typing import Any
 
-from ayaka.distributed.metadata import DistributedKVMetadata
+from ayaka.distributed.metadata import StepMetadataLike
 from ayaka.exceptions import InvariantViolationError
 
 
@@ -52,7 +52,7 @@ class RankLocalKVWorker:
                 raise RuntimeError("only a created KV worker can start")
             self._state = RankLocalKVWorkerState.READY
 
-    def begin(self, metadata: DistributedKVMetadata) -> Mapping[str, Any]:
+    def begin(self, metadata: StepMetadataLike) -> Mapping[str, Any]:
         metadata.verify()
         with self._lock:
             if self._state is not RankLocalKVWorkerState.READY:

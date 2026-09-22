@@ -149,20 +149,28 @@ class TorchHostByteSource:
     def alloc(self, nbytes: int) -> tuple[Any, int]:
         if nbytes < 1:
             raise RuntimeMemoryError("a source allocation must be positive")
+        # Torch's host allocators only guarantee natural alignment, so a raw
+        # pageable/pinned block can start at a pointer that misses this
+        # module's floor. Over-allocate one alignment slack and hand the
+        # allocator an aligned view; the base tensor stays alive through the
+        # view (``_base``) until the block is freed.
+        slack = SOURCE_ALIGNMENT - 1
         try:
             tensor, _ = empty_host_tensor(
-                (nbytes,), "uint8", pinned=self._pinned, allow_pageable=False
+                (nbytes + slack,), "uint8", pinned=self._pinned, allow_pageable=False
             )
         except CapabilityError as exc:
             raise RuntimeMemoryError(
                 f"host source {self.name} could not allocate {nbytes} B: {exc}"
             ) from exc
+        offset = -int(tensor.data_ptr()) % SOURCE_ALIGNMENT
+        aligned = tensor.narrow(0, offset, nbytes)
         try:
-            base_ptr = _checked_base(tensor, source=self.name)
+            base_ptr = _checked_base(aligned, source=self.name)
         except RuntimeMemoryError:
             tensor = None
             raise
-        return tensor, base_ptr
+        return aligned, base_ptr
 
     def free(self, keepalive: Any) -> None:
         del keepalive

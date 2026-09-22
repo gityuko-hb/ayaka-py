@@ -295,7 +295,15 @@ def write_qwen_checkpoint(
 
 
 class _QwenAttention(nn.Module):
-    def __init__(self, config: QwenConfig, *, device, dtype, backend: LayerBackend) -> None:
+    def __init__(
+        self,
+        config: QwenConfig,
+        *,
+        device,
+        dtype,
+        backend: LayerBackend,
+        parallel_context: ParallelContext | None = None,
+    ) -> None:
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
@@ -308,6 +316,7 @@ class _QwenAttention(nn.Module):
             params_dtype=dtype,
             return_bias=False,
             device=device,
+            parallel_context=parallel_context,
         )
         self.c_proj = RowParallelLinear(
             self.num_heads * self.head_dim,
@@ -316,6 +325,7 @@ class _QwenAttention(nn.Module):
             params_dtype=dtype,
             return_bias=False,
             device=device,
+            parallel_context=parallel_context,
         )
         self.rotary = get_rope(
             self.head_dim,
@@ -339,10 +349,10 @@ class _QwenAttention(nn.Module):
         tokens = hidden.shape[0]
         packed = self.c_attn(hidden)
         assert isinstance(packed, torch.Tensor)
-        query, key, value = packed.split(self.num_heads * self.head_dim, dim=-1)
-        query = query.view(tokens, self.num_heads, self.head_dim)
-        key = key.view(tokens, self.num_heads, self.head_dim)
-        value = value.view(tokens, self.num_heads, self.head_dim)
+        query, key, value = packed.split(self.c_attn_layout_sizes(), dim=-1)
+        query = query.view(tokens, self.c_attn.num_heads, self.head_dim)
+        key = key.view(tokens, self.c_attn.num_kv_heads, self.head_dim)
+        value = value.view(tokens, self.c_attn.num_kv_heads, self.head_dim)
         self.rotary(positions, query, key)
         output = attention(layer_index, query, key, value)
         reshaped = output.reshape(tokens, self.num_heads * self.head_dim)
@@ -350,9 +360,22 @@ class _QwenAttention(nn.Module):
         assert isinstance(projected, torch.Tensor)
         return projected
 
+    def c_attn_layout_sizes(self) -> list[int]:
+        """Rank-local packed widths of the q/k/v projections."""
+        layout = self.c_attn.layout
+        return [layout[name].local_size for name in ("q", "k", "v")]
+
 
 class _QwenMLP(nn.Module):
-    def __init__(self, config: QwenConfig, *, device, dtype, backend: LayerBackend) -> None:
+    def __init__(
+        self,
+        config: QwenConfig,
+        *,
+        device,
+        dtype,
+        backend: LayerBackend,
+        parallel_context: ParallelContext | None = None,
+    ) -> None:
         super().__init__()
         hidden = config.hidden_size
         inner = config.mlp_inner_size
@@ -362,6 +385,7 @@ class _QwenMLP(nn.Module):
             params_dtype=dtype,
             return_bias=False,
             device=device,
+            parallel_context=parallel_context,
         )
         self.c_proj = RowParallelLinear(
             inner,
@@ -370,6 +394,7 @@ class _QwenMLP(nn.Module):
             params_dtype=dtype,
             return_bias=False,
             device=device,
+            parallel_context=parallel_context,
         )
         self.activation = SiluAndMul(backend=backend)
 
@@ -380,17 +405,29 @@ class _QwenMLP(nn.Module):
 
 
 class _QwenBlock(nn.Module):
-    def __init__(self, config: QwenConfig, *, device, dtype, backend: LayerBackend) -> None:
+    def __init__(
+        self,
+        config: QwenConfig,
+        *,
+        device,
+        dtype,
+        backend: LayerBackend,
+        parallel_context: ParallelContext | None = None,
+    ) -> None:
         super().__init__()
         hidden = config.hidden_size
         self.ln_1 = RMSNorm(
             hidden, eps=config.layer_norm_epsilon, device=device, dtype=dtype, backend=backend
         )
-        self.attn = _QwenAttention(config, device=device, dtype=dtype, backend=backend)
+        self.attn = _QwenAttention(
+            config, device=device, dtype=dtype, backend=backend, parallel_context=parallel_context
+        )
         self.ln_2 = RMSNorm(
             hidden, eps=config.layer_norm_epsilon, device=device, dtype=dtype, backend=backend
         )
-        self.mlp = _QwenMLP(config, device=device, dtype=dtype, backend=backend)
+        self.mlp = _QwenMLP(
+            config, device=device, dtype=dtype, backend=backend, parallel_context=parallel_context
+        )
 
     def forward(
         self,
@@ -434,7 +471,13 @@ class _QwenModel(nn.Module):
         )
         self.h = nn.ModuleList(
             [
-                _QwenBlock(config, device=device, dtype=dtype, backend=backend)
+                _QwenBlock(
+                    config,
+                    device=device,
+                    dtype=dtype,
+                    backend=backend,
+                    parallel_context=parallel_context,
+                )
                 for _ in range(config.num_hidden_layers)
             ]
         )

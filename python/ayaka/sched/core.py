@@ -483,9 +483,19 @@ class SchedulerCore(BaseScheduler):
             return
         if lifecycle.request_id in self._waiting_ids:
             return
-        self._waiting_add(
-            self._new_queue_entry(lifecycle, self._sequences.get(lifecycle.request_id))
-        )
+        entry = self._new_queue_entry(lifecycle, self._sequences.get(lifecycle.request_id))
+        if lifecycle.request_id in self._prefilling:
+            # A continuation owns a partial-prefill slot and resident KV. Parking
+            # it behind the staging queue can deadlock a full hot window: every
+            # new partial prompt waits for the slot its hidden owner must release.
+            # Keep that owner visible without enlarging the bounded window.
+            if len(self._hot) >= HOT_WINDOW_SIZE:
+                self._staging.appendleft(self._hot.pop())
+            self._hot.insert(0, entry)
+            self._waiting_ids.add(lifecycle.request_id)
+            self._refresh_window_hints([entry])
+        else:
+            self._waiting_add(entry)
 
     def _queue_report(self, report: RequestReport) -> None:
         """Keep at most one pending observation per request/report step."""

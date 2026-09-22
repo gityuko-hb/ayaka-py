@@ -424,6 +424,7 @@ class _LlamaAttention(nn.Module):
         dtype: torch.dtype,
         backend: LayerBackend,
         quant_config: QuantConfig = None,
+        parallel_context: ParallelContext | None = None,
     ) -> None:
         super().__init__()
         self.head_dim = config.resolved_head_dim
@@ -440,6 +441,7 @@ class _LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
             device=device,
+            parallel_context=parallel_context,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -450,6 +452,7 @@ class _LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             device=device,
+            parallel_context=parallel_context,
         )
         self.rotary = get_rope(
             self.head_dim,
@@ -498,6 +501,7 @@ class _LlamaMLP(nn.Module):
         dtype: torch.dtype,
         backend: LayerBackend,
         quant_config: QuantConfig = None,
+        parallel_context: ParallelContext | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = FusedGateUpLinear(
@@ -509,6 +513,7 @@ class _LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
             device=device,
+            parallel_context=parallel_context,
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -519,6 +524,7 @@ class _LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
             device=device,
+            parallel_context=parallel_context,
         )
         self.activation = SiluAndMul(backend=backend)
 
@@ -542,6 +548,7 @@ class _LlamaDecoderLayer(nn.Module):
         dtype: torch.dtype,
         backend: LayerBackend,
         quant_config: QuantConfig = None,
+        parallel_context: ParallelContext | None = None,
     ) -> None:
         super().__init__()
         hidden = config.hidden_size
@@ -555,6 +562,7 @@ class _LlamaDecoderLayer(nn.Module):
             dtype=dtype,
             backend=backend,
             quant_config=quant_config,
+            parallel_context=parallel_context,
         )
         self.post_attention_layernorm = RMSNorm(
             hidden, eps=config.rms_norm_eps, device=device, dtype=dtype, backend=backend
@@ -566,6 +574,7 @@ class _LlamaDecoderLayer(nn.Module):
             dtype=dtype,
             backend=backend,
             quant_config=quant_config,
+            parallel_context=parallel_context,
         )
 
     def forward(
@@ -620,6 +629,7 @@ class _LlamaModel(nn.Module):
                     dtype=dtype,
                     backend=backend,
                     quant_config=quant_config,
+                    parallel_context=parallel_context,
                 )
                 for index in range(config.num_hidden_layers)
             ]

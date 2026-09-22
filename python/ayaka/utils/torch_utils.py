@@ -10,7 +10,7 @@ from types import ModuleType
 from typing import Any, Final
 
 from ayaka.types import COMPUTE_DTYPES, DType
-from ayaka.utils.import_utils import CapabilityError, LazyModule
+from ayaka.utils.import_utils import CapabilityError, LazyModule, has_module
 
 #: Lazy handle. Import this instead of ``torch`` in modules that must stay
 #: importable without PyTorch.
@@ -256,6 +256,16 @@ def supports_fp8(index: int = 0) -> bool:
     ``ayaka.kvcache.storage.validation``.
     """
     return _at_least(SM_ADA, index)
+
+
+def fp8_emulation_available() -> bool:
+    """Whether the Triton-backed FP8 emulation path can run in this process.
+
+    Below sm_89 an FP8 kernel has no native instructions to lower to, so the
+    emulation in ``ayaka.kernel.triton.fp8_compat`` is the only execution path.
+    It needs Triton; a CPU-only install without it cannot run those kernels.
+    """
+    return has_module("triton")
 
 
 def supports_tma(index: int = 0) -> bool:

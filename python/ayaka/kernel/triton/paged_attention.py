@@ -8,8 +8,13 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton.fp8_compat import (
+    e4m3_native_cx,
+    e4m3_u8_to_f32,
+    e5m2_u8_to_f32,
+    fp8_kernel_view,
+)
 from ayaka.types import DType
-from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.validation import require_int
 
 _QUERY_DTYPES = (DType.FP16.torch_dtype, DType.BF16.torch_dtype)
@@ -184,6 +189,24 @@ def _prepare_kv_scales(
     return True, key_scale, value_scale
 
 
+def _prepare_fp8_kernel_caches(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    is_fp8_kv: bool,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Return the kernel-visible caches plus the E5M2 selector.
+
+    Below sm_89 the launch hands Triton ``uint8`` byte views instead of FP8
+    tensors, because the IR parser rejects FP8 dtypes for those targets; the
+    kernel decodes the bytes itself. On sm_89+ the original tensors pass
+    through untouched.
+    """
+    if not is_fp8_kv:
+        return key_cache, value_cache, False
+    is_e5m2 = key_cache.dtype == DType.FP8_E5M2.torch_dtype
+    return fp8_kernel_view(key_cache), fp8_kernel_view(value_cache), is_e5m2
+
+
 def _prepare_output(query: torch.Tensor, output: torch.Tensor | None) -> torch.Tensor:
     if output is None:
         return torch.empty_like(query)
@@ -227,6 +250,7 @@ def _paged_attention_single_pass_kernel(
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     IS_FP8_KV: tl.constexpr,
+    FP8_IS_E5M2: tl.constexpr,
 ):
     """Executes single-pass online softmax GEMV per (token, query head).
 
@@ -293,7 +317,12 @@ def _paged_attention_single_pass_kernel(
                 other=0.0,
             )
             if IS_FP8_KV:
-                key = key_raw.to(tl.float32) * key_scale
+                if e4m3_native_cx():
+                    key = key_raw.to(tl.float32) * key_scale
+                elif FP8_IS_E5M2:
+                    key = e5m2_u8_to_f32(key_raw) * key_scale
+                else:
+                    key = e4m3_u8_to_f32(key_raw) * key_scale
             else:
                 key = key_raw.to(tl.float32)
             scores = tl.sum(query[None, :] * key, axis=1) * softmax_scale
@@ -314,7 +343,12 @@ def _paged_attention_single_pass_kernel(
                 other=0.0,
             )
             if IS_FP8_KV:
-                value = value_raw.to(tl.float32) * value_scale
+                if e4m3_native_cx():
+                    value = value_raw.to(tl.float32) * value_scale
+                elif FP8_IS_E5M2:
+                    value = e5m2_u8_to_f32(value_raw) * value_scale
+                else:
+                    value = e4m3_u8_to_f32(value_raw) * value_scale
             else:
                 value = value_raw.to(tl.float32)
             accumulator = accumulator * rescale_factor + tl.sum(
@@ -395,6 +429,11 @@ def paged_attention(
         value_scale,
         query,
     )
+    key_cache_arg, value_cache_arg, fp8_is_e5m2 = _prepare_fp8_kernel_caches(
+        key_cache,
+        value_cache,
+        is_fp8_kv,
+    )
     o = _prepare_output(query, output)
     if num_tokens == 0:
         return o
@@ -404,8 +443,8 @@ def paged_attention(
     with torch.cuda.device(query.device):
         cast(Any, _paged_attention_single_pass_kernel)[grid](
             query,
-            key_cache,
-            value_cache,
+            key_cache_arg,
+            value_cache_arg,
             o,
             indptr,
             indices,
@@ -430,6 +469,7 @@ def paged_attention(
             SLIDING_WINDOW=sliding_window_value,
             HAS_SINKS=sinks is not None,
             IS_FP8_KV=is_fp8_kv,
+            FP8_IS_E5M2=fp8_is_e5m2,
             num_warps=8 if head_dim >= 256 else 4,
             num_stages=2,
         )
@@ -474,6 +514,7 @@ def _paged_attention_split_kv_kernel(
     VALUE_HEAD_DIM: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     IS_FP8_KV: tl.constexpr,
+    FP8_IS_E5M2: tl.constexpr,
 ):
     batch_index = tl.program_id(0)
     head_block_index = tl.program_id(1)
@@ -543,7 +584,12 @@ def _paged_attention_split_kv_kernel(
                 other=0.0,
             )
             if IS_FP8_KV:
-                key = (key_raw.to(tl.float32) * key_scale).to(query.dtype)
+                if e4m3_native_cx():
+                    key = (key_raw.to(tl.float32) * key_scale).to(query.dtype)
+                elif FP8_IS_E5M2:
+                    key = (e5m2_u8_to_f32(key_raw) * key_scale).to(query.dtype)
+                else:
+                    key = (e4m3_u8_to_f32(key_raw) * key_scale).to(query.dtype)
             else:
                 key = key_raw
             scores = tl.dot(query, key) * softmax_scale
@@ -555,7 +601,12 @@ def _paged_attention_split_kv_kernel(
                 other=0.0,
             )
             if IS_FP8_KV:
-                value = (value_raw.to(tl.float32) * value_scale).to(query.dtype)
+                if e4m3_native_cx():
+                    value = (value_raw.to(tl.float32) * value_scale).to(query.dtype)
+                elif FP8_IS_E5M2:
+                    value = (e5m2_u8_to_f32(value_raw) * value_scale).to(query.dtype)
+                else:
+                    value = (e4m3_u8_to_f32(value_raw) * value_scale).to(query.dtype)
             else:
                 value = value_raw
 
@@ -703,7 +754,7 @@ def compute_max_num_partitions(
     effective_bound = max_context_len_bucket
     if sliding_window_value:
         effective_bound = min(effective_bound, sliding_window_value)
-    return div_ceil(effective_bound, kv_partition_size)
+    return -(-effective_bound // kv_partition_size)  # ceil div
 
 
 def decode_paged_attention(
@@ -792,6 +843,11 @@ def decode_paged_attention(
         value_scale,
         query,
     )
+    key_cache_arg, value_cache_arg, fp8_is_e5m2 = _prepare_fp8_kernel_caches(
+        key_cache,
+        value_cache,
+        is_fp8_kv,
+    )
     o = _prepare_output(query, out)
     if batch == 0:
         return o
@@ -812,8 +868,8 @@ def decode_paged_attention(
     with torch.cuda.device(query.device):
         cast(Any, _paged_attention_split_kv_kernel)[grid_split](
             query,
-            key_cache,
-            value_cache,
+            key_cache_arg,
+            value_cache_arg,
             scale,
             indptr,
             indices,
@@ -847,6 +903,7 @@ def decode_paged_attention(
             VALUE_HEAD_DIM=head_dim,
             SLIDING_WINDOW=sliding_window_value,
             IS_FP8_KV=is_fp8_kv,
+            FP8_IS_E5M2=fp8_is_e5m2,
             num_warps=4,
             num_stages=2,
         )

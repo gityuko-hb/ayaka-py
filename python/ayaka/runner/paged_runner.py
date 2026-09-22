@@ -189,6 +189,19 @@ class PagedModelRunner(ModelRunner):
             configured = {name for name, _ in buffers.spec.group_columns}
             if configured != set(groups):
                 raise ValueError("runner buffer groups must exactly match attention groups")
+            # Buffer/budget coverage follows the group layout: each group's
+            # block-table columns must fit its own page geometry, not a
+            # single shared page size.
+            max_sequence_tokens = getattr(kv.backend, "max_sequence_tokens", None)
+            if isinstance(max_sequence_tokens, int):
+                for name, group in groups.items():
+                    columns = buffers.spec.columns_for(name)
+                    required = (max_sequence_tokens + group.page_size - 1) // group.page_size
+                    if columns < required:
+                        raise ValueError(
+                            f"runner buffer group {name!r} covers {columns} blocks but its "
+                            f"page geometry needs {required}"
+                        )
         self.buffers = buffers
         self.kv = kv
         self._backend_name = backend
@@ -307,6 +320,36 @@ class PagedModelRunner(ModelRunner):
         """Observability snapshot, or None while graphs are not enabled."""
         return None if self._graph_pool is None else self._graph_pool.planner.stats()
 
+    def graph_unavailable_reason(self) -> str | None:
+        """Static reason this runner cannot capture decode graphs, or ``None``.
+
+        Declared, not discovered: ``enable_graph`` enforces exactly the reason
+        reported here, so callers can gate on it without attempting a capture.
+        Multi-group grouped KV stays fail-closed: every attention group would
+        need its own captured metadata, and the graph identity and budget must
+        cover the whole group tuple -- a combination with no capture/replay
+        certification yet. A single coalesced group over every layer keeps the
+        R08/R10 certification.
+        """
+        if self.device.type != "cuda":
+            return "decode graphs require a CUDA device"
+        head = getattr(self._model, "lm_head", None)
+        if getattr(head, "requires_gather", False):
+            return (
+                "decode graphs do not support a vocabulary-parallel LM head, which "
+                "all-gathers logits across the TP group"
+            )
+        if len(self.backends) != 1:
+            return (
+                "decode graphs are certified for exactly one attention group; grouped KV "
+                "stays eager until a group-layout combination passes capture/replay"
+            )
+        builder = next(iter(self.builders.values()))
+        support = builder.cudagraph_support
+        if support < AttentionCudaGraphSupport.PURE_DECODE:
+            return f"attention backend does not support pure-decode CUDA graphs: {support.name}"
+        return None
+
     def enable_graph(self, config: DecodeGraphConfig, *, stream=None) -> int:
         """Warm up, capture and reconcile pure-decode graphs before admission.
 
@@ -321,28 +364,16 @@ class PagedModelRunner(ModelRunner):
             raise RuntimeError("decode graphs are already enabled for this runner")
         if self.buffers is None:
             raise ValueError("decode graphs require the persistent runner buffer pool")
-        if self.device.type != "cuda":
-            raise ValueError("decode graphs require a CUDA device")
-        head = getattr(self._model, "lm_head", None)
-        if getattr(head, "requires_gather", False):
-            raise ValueError(
-                "decode graphs do not support a vocabulary-parallel LM head, which "
-                "all-gathers logits across the TP group"
-            )
-        if len(self.backends) != 1:
-            raise ValueError("decode graphs currently support exactly one attention group")
-        builder = next(iter(self.builders.values()))
-        support = builder.cudagraph_support
-        if support < AttentionCudaGraphSupport.PURE_DECODE:
-            raise ValueError(
-                f"attention backend does not support pure-decode CUDA graphs: {support.name}"
-            )
+        reason = self.graph_unavailable_reason()
+        if reason is not None:
+            raise ValueError(reason)
         spec = self.buffers.spec
         ceiling = min(spec.max_num_seqs, spec.max_num_batched_tokens)
         buckets = tuple(bucket for bucket in config.buckets if bucket <= ceiling)
         if not buckets:
             raise ValueError("no decode graph bucket fits the runner buffer ceilings")
         resolved = replace(config, buckets=buckets)
+        support = next(iter(self.builders.values())).cudagraph_support
         self._graph_config = resolved
         pool = DecodeGraphPool(
             device=self.device,

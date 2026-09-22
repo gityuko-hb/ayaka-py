@@ -49,6 +49,7 @@ from ayaka.memory.workspace import WorkspaceManager
 from ayaka.runner.buffers import RunnerBuffers, RunnerBufferSpec
 from ayaka.types import DType, MemoryOwner, MemoryTier
 from ayaka.utils.torch_memory import device_memory
+from ayaka.utils.validation import require_int
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,8 @@ class WorkerResourcePlan:
     workspace_ceiling_bytes: int
     graph_bytes: int
     staging_bytes: int
+    # Logical handles for waiting lifecycle; no KV pages until reservation.
+    max_num_requests: int | None = None
 
     @property
     def lane(self) -> MemoryLane:
@@ -116,6 +119,10 @@ class WorkerResourcePlan:
 
     def build(self) -> WorkerResources:
         """Allocate, reconcile and freeze; roll back every claim on failure."""
+        max_sequences = self.max_num_requests
+        if max_sequences is None:
+            max_sequences = self.max_num_seqs
+        require_int(max_sequences, "max_num_requests", minimum=1)
         budget, kv_budget, total = self.budget()
         index = self.device.index or 0
         ledger = MemoryLedger.for_device(
@@ -160,7 +167,7 @@ class WorkerResourcePlan:
             manager = RuntimeMemoryManager(
                 total_pages=self.storage_spec.capacity_pages,
                 page_size=self.storage_spec.page_size,
-                max_sequences=self.max_num_seqs,
+                max_sequences=max_sequences,
                 max_sequence_tokens=self.max_model_len,
                 storage=storage.storage,
             )

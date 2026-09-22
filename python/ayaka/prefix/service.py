@@ -10,11 +10,17 @@ from ayaka.exceptions import (
     PrefixCapabilityStaleError,
 )
 from ayaka.handles import SequenceHandle
+from ayaka.kvcache.grouped_manager import KVCacheGroupManager
+from ayaka.kvcache.grouped_prefix import GroupedPrefixCache
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.sequence import PageTableEntry
 from ayaka.prefix.global_index import PrefixIndexPublisher
 from ayaka.prefix.identity import PrefixCacheContext
-from ayaka.prefix.interface import CachedBlockInfo, ValidResume
+from ayaka.prefix.interface import (
+    CachedBlockInfo,
+    GroupedValidResume,
+    ValidResume,
+)
 from ayaka.utils.validation import require_int
 
 if TYPE_CHECKING:
@@ -41,12 +47,15 @@ def common_resume_boundary(group_boundaries: tuple[tuple[int, ...], ...], limit:
 
 
 class PrefixService:
-    """Policy and transfer lifecycle; durable page ownership stays in radix/ownership.
+    """Policy and transfer lifecycle; durable page ownership stays in the backend.
 
-    One service belongs to one LogicalKVManager. Partial-tail reuse is supported
-    only for resident homogeneous KV. A lookup is borrowed and may become stale;
-    acquisition revalidates it and returns zero on eviction. Callers supply the
-    complete execution identity and keep the final prompt query for logits.
+    One service belongs to one LogicalKVManager. Both the homogeneous resident
+    manager and the grouped manager serve canonical reuse: the homogeneous
+    store keeps per-page ownership, the grouped store keeps all-group pinned
+    boundaries. Partial-tail reuse is supported by both. A lookup is borrowed
+    and may become stale; acquisition revalidates it and returns zero on
+    eviction. Callers supply the complete execution identity and keep the
+    final prompt query for logits.
     """
 
     def __init__(
@@ -55,11 +64,16 @@ class PrefixService:
         *,
         index_publisher: PrefixIndexPublisher | None = None,
     ) -> None:
-        if not isinstance(kv.backend, RuntimeMemoryManager) or kv.backend.tiering_enabled:
-            raise ValueError("canonical prefix resume requires homogeneous resident KV")
+        backend = kv.backend
+        if isinstance(backend, RuntimeMemoryManager):
+            if backend.tiering_enabled:
+                raise ValueError("canonical prefix resume requires resident KV")
+        elif not isinstance(backend, KVCacheGroupManager):
+            raise ValueError("canonical prefix resume requires a resident KV backend")
         self.kv = kv
-        self.backend = kv.backend
-        self.store = self.backend.prefix_cache
+        self.backend = backend
+        self._grouped = isinstance(backend, KVCacheGroupManager)
+        self.store = backend.prefix_cache
         self.cache_id = self.store.cache_id
         self._max_entries: int | None = None
         self._transfers: set[PrefixTransfer] = set()
@@ -95,36 +109,25 @@ class PrefixService:
 
     def lookup(
         self, token_ids: Sequence[int], *, context: PrefixCacheContext
-    ) -> ValidResume | None:
+    ) -> ValidResume | GroupedValidResume | None:
         self.require_open()
         return self.store.match_resume(token_ids, context=context)
 
-    def ready(self, match: ValidResume) -> bool:
+    def ready(self, match: ValidResume | GroupedValidResume) -> bool:
         """Avoid attaching another partial-tail consumer with no COW headroom.
 
-        This is an engine-thread admission hint, not a reservation. A sole
-        consumer can privatize cache ownership under pressure; additional
-        consumers wait until a page or the source owner becomes available.
-        Stale hints proceed to acquire's generation-safe miss handling.
+        This is an engine-thread admission hint, not a reservation. A stale
+        capability proceeds to acquire's generation-safe miss handling.
         """
         self.require_open()
-        if not match.pages or match.pages[-1].valid_tokens == self.backend.page_size:
-            return True
-        try:
-            meta = self.backend.allocator.get_meta(match.pages[-1].page)
-        except InvalidHandleError:
-            return True
-        capacity = self.backend.allocator.snapshot()
-        return bool(
-            capacity.free_pages
-            or capacity.evictable_pages
-            or not (meta.request_refs or meta.pin_refs or meta.inflight_refs)
-        )
+        if isinstance(self.backend, RuntimeMemoryManager):
+            return self.backend.resume_ready(match) if isinstance(match, ValidResume) else True
+        return self.backend.resume_ready(match) if isinstance(match, GroupedValidResume) else True
 
     def acquire(
         self,
         sequence: SequenceHandle,
-        match: ValidResume,
+        match: ValidResume | GroupedValidResume,
         *,
         token_ids: Sequence[int],
         context: PrefixCacheContext,
@@ -141,18 +144,35 @@ class PrefixService:
         if n <= 0 or match.context != context or match.token_ids != tuple(token_ids[:n]):
             return 0
         try:
+            if isinstance(self.backend, RuntimeMemoryManager):
+                if not isinstance(match, ValidResume):
+                    return 0
+                return self.backend.attach_resume(sequence, match)
+            if not isinstance(match, GroupedValidResume):
+                return 0
             return self.backend.attach_resume(sequence, match)
         except (InvalidHandleError, PrefixCapabilityStaleError):
             return 0
 
     def publish(
         self, sequence: SequenceHandle, token_ids: Sequence[int], *, context: PrefixCacheContext
-    ) -> ValidResume | None:
+    ) -> ValidResume | GroupedValidResume | None:
         self.require_open()
-        result = self.backend.cache_resume(sequence, token_ids, context=context)
-        if result is not None and self._index_publisher is not None:
+        published = tuple(token_ids)
+        result = self.backend.cache_resume(sequence, published, context=context)
+        if self._grouped and result is not None and len(published) > 1:
+            # Also certify the runtime's lookup boundary (the prompt without
+            # its final query) when every group can still restore it. Sliding
+            # history that already left the window makes this a clean no-op,
+            # so an identical repeat is a miss there by policy; a longer
+            # candidate still hits the primary boundary.
+            self.backend.cache_resume(sequence, published[:-1], context=context)
+        if result is not None and self._index_publisher is not None and not self._grouped:
+            # The global index keys digests by one page size; a grouped entry
+            # is pinned at the smallest group's granularity, so advertising
+            # those digests would route peers to boundaries they cannot match.
             self._index_publisher.publish(
-                token_ids, context=context, page_size=self.backend.page_size
+                published, context=context, page_size=self.backend.page_size
             )
         if self.max_entries is not None:
             while self.store.snapshot().terminal_entries > self.max_entries:
@@ -160,11 +180,15 @@ class PrefixService:
         return result
 
     def pin(self, match: ValidResume) -> tuple[PageTableEntry, ...]:
+        if isinstance(self.store, GroupedPrefixCache):
+            raise RuntimeError("grouped prefix entries have no per-page transfer pins")
         self.require_open()
         return self.store.pin_resume(match)
 
     def evict(self, entry_id: int | None = None) -> bool:
         self.require_open()
+        if isinstance(self.store, GroupedPrefixCache):
+            return self.store.evict_entry(entry_id, safe_epoch=self.backend.current_epoch)
         publisher = self._index_publisher
         before = self.store.evictable_leaves() if publisher is not None else ()
         evicted = self.store.evict_entry(entry_id, safe_epoch=self.backend.current_epoch)

@@ -55,6 +55,7 @@ from ayaka.tokenizers.service import TokenizerService
 from ayaka.types import AttentionType, DType
 from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.torch_memory import empty_cache
+from ayaka.utils.validation import require_int
 from ayaka.worker.local import LocalWorker
 from ayaka.worker.resources import WorkerResourcePlan, WorkerResources
 
@@ -103,6 +104,8 @@ class ServingRuntime:
         pages=1024,
         page_size=16,
         max_requests=32,
+        max_pending_requests: int | None = None,
+        max_inflight: int = 1,
         batch_tokens=256,
         prefill_chunk=128,
         tokenizer_workers=2,
@@ -129,6 +132,12 @@ class ServingRuntime:
                 padding page must fit.
             page_size: Tokens per KV page.
             max_requests: Scheduler sequence ceiling.
+            max_pending_requests: Host lifecycle ceiling, including waiting and
+                running requests. Defaults to ``max_requests``; increasing it
+                reserves logical handles and sampling slots, but does not
+                increase KV pages or per-step metadata capacity.
+            max_inflight: Concurrent ticket ceiling. Sizes worker, workspace,
+                metadata and graph resources before capacity is frozen.
             batch_tokens: Maximum batched tokens per step.
             prefill_chunk: Chunked-prefill cap.
             tokenizer_workers: Encode worker count.
@@ -170,6 +179,10 @@ class ServingRuntime:
         max_seq = model_config.max_position_embeddings
         if max_requests < 1 or pages < 2 or not 1 <= prefill_chunk <= batch_tokens:
             raise ValueError("invalid serving capacity")
+        require_int(max_inflight, "max_inflight", minimum=1)
+        if max_pending_requests is None:
+            max_pending_requests = max_requests
+        require_int(max_pending_requests, "max_pending_requests", minimum=1)
         if (pages - 1) * page_size < max_seq:
             raise ValueError("KV slab must fit at least one full model context plus padding page")
         if device.type == "cpu" and backend != "reference":
@@ -187,6 +200,8 @@ class ServingRuntime:
         self._backend_name = backend
         self._page_size = page_size
         self._max_requests = max_requests
+        self._max_inflight = max_inflight
+        self._max_pending_requests = max_pending_requests
         self._batch_tokens = batch_tokens
         self._prefill_chunk = prefill_chunk
         self._tokenizer_path = Path(tokenizer_path)
@@ -219,7 +234,7 @@ class ServingRuntime:
         self.tokenizer = self.kv = self.storage = self.engine = self.service = None
         self.manager = self.workspace = self.workspace_allocator = self.runner_buffers = None
         self._sampling = SamplingCoordinator(
-            max_requests, device=device, vocab_size=model_config.vocab_size
+            max_pending_requests, device=device, vocab_size=model_config.vocab_size
         )
         dtype_name = str(dtype).removeprefix("torch.")
         kv_heads = getattr(model_config, "num_kv_heads", model_config.num_attention_heads)
@@ -259,7 +274,8 @@ class ServingRuntime:
         self._scheduler_config = SchedulerConfig(
             preemption_mode=PreemptionMode.RECOMPUTE,
             max_num_seqs=max_requests,
-            max_num_requests=max_requests,
+            max_num_requests=max_pending_requests,
+            max_inflight=max_inflight,
             max_num_batched_tokens=batch_tokens,
             max_prefill_chunk_tokens=prefill_chunk,
         )
@@ -399,6 +415,7 @@ class ServingRuntime:
             weights_revision=self._weights_revision,
             max_model_len=self._max_seq,
             max_num_seqs=self._max_requests,
+            max_num_requests=self._max_pending_requests,
             max_num_batched_tokens=self._batch_tokens,
             max_inflight=self._scheduler_config.max_inflight,
             weights_bytes=self._weights_bytes,
@@ -556,7 +573,7 @@ class ServingRuntime:
             output_dtype=self._dtype,
             sliding_window=spec.sliding_window,
         )
-        return persistent + self._activation_bytes
+        return (persistent + self._activation_bytes) * self._max_inflight
 
     def _bind_tail(self, tail: _KVTail) -> None:
         """Point every public attribute at the new owner set."""

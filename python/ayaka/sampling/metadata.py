@@ -250,8 +250,8 @@ class SamplingMetadata:
 
         ``None`` restores identity mode ``[0, n_active)``. Explicit rows must be
         unique and in range; they are staged on the host and mirrored to the
-        device by ``flush``. Device reads before a CUDA flush fail closed rather
-        than silently using last step's map.
+        device by ``flush``. A device read that happens before an explicit flush
+        mirrors the pending rows first instead of using last step's map.
         """
         if rows is None:
             self._rows_list = None
@@ -277,17 +277,18 @@ class SamplingMetadata:
         return self._rows_stg[: self.n_active]
 
     def _sync_rows(self) -> torch.Tensor | None:
-        """Return the active-row indices on the metadata device."""
+        """Return the active-row indices on the metadata device.
+
+        Mirrors a pending row update instead of failing, so a device read can
+        never observe a stale map. The copy is ordered on the caller's stream
+        (``non_blocking``), exactly like ``flush``; callers that need a specific
+        stream order still call ``flush`` explicitly.
+        """
         rows = self._rows_cpu()
         if rows is None:
             return None
         if self._rows_dirty:
-            if self.device.type != "cpu":
-                raise RuntimeError(
-                    "active rows changed but flush() has not mirrored them to the "
-                    "device yet; call flush() before any device read"
-                )
-            self._rows_dev[: self.n_active].copy_(rows)
+            self._rows_dev[: self.n_active].copy_(rows, non_blocking=self.device.type == "cuda")
             self._rows_dirty = False
         return self._rows_dev[: self.n_active]
 

@@ -8,7 +8,10 @@ model runners that ignore memory_view do not satisfy the paged runner contract.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from ayaka.configs.assembly import (
+    ResidentKVPlan,
     build_execution_plan,
     build_parallel_plan,
 )
@@ -47,6 +50,30 @@ from ayaka.types import DType
 from ayaka.worker.base import StepWorker, WorkerStep
 from ayaka.worker.local import LocalWorker
 from ayaka.worker.resources import build_configured_resources
+
+
+def _require_prefix_reuse_compatible(cache_config: CacheConfig, plan: ResidentKVPlan) -> None:
+    """Fail closed when resolved groups need an explicit prefix reuse opt-in.
+
+    Sliding-window groups share KV only with per-group matching and
+    ``cache.prefix.allow_sliding_window_reuse``; MLA/recurrent layouts are
+    rejected by the grouped cache capability itself before any lookup.
+    """
+    from ayaka.kvcache.layout import prefix_cache_capability
+    from ayaka.kvcache.retention.policy import SlidingWindowRetention
+
+    sliding = [
+        group.name
+        for group in plan.cache_groups
+        if isinstance(group.retention, SlidingWindowRetention)
+    ]
+    if sliding and not cache_config.prefix.allow_sliding_window_reuse:
+        raise ValueError(
+            "prefix reuse over sliding-window groups requires "
+            "cache.prefix.allow_sliding_window_reuse=true with per-group reuse mode; "
+            f"sliding groups: {sliding}"
+        )
+    prefix_cache_capability(plan.cache_groups).require_supported()
 
 
 class ResidentKVExecutor(Executor):
@@ -236,6 +263,8 @@ class ResidentKVEngine(Engine):
         zero_initialize: bool = False,
         sampling: SamplingCoordinator | None = None,
         prefix_context: PrefixContextProvider | None = None,
+        worker_factory: Callable[[object, LogicalKVManager, SampleRunner, int], StepWorker]
+        | None = None,
     ) -> ResidentKVEngine:
         """Resolve model/cache/memory/scheduler/parallel configs into an engine.
 
@@ -243,6 +272,12 @@ class ResidentKVEngine(Engine):
         logical facade -> execution identity -> resolved scheduler plan. On any
         failure after materialization the logical manager and every lease are
         closed, so a caller never inherits an uncharged or half-owned slab.
+
+        ``worker_factory`` replaces the default single-GPU ``LocalWorker`` for
+        rank workflows (for example the R11 distributed step worker). It is
+        called once with ``(resources, kv, runner, max_inflight)`` and owns
+        every object handed to it exactly like ``LocalWorker`` would — the
+        resources owner is still built here and still closed by the worker.
         """
         resolved_scheduler = scheduler_config or SchedulerConfig()
         parallel = parallel_config or ParallelConfig()
@@ -264,13 +299,18 @@ class ResidentKVEngine(Engine):
             zero_initialize=zero_initialize,
         )
         kv, ledger = resources.kv, resources.ledger
-        worker = LocalWorker(
-            kv,
-            runner,
-            max_inflight=resolved_scheduler.max_inflight,
-            resources=resources,
-        )
+        if worker_factory is not None:
+            worker = worker_factory(resources, kv, runner, resolved_scheduler.max_inflight)
+        else:
+            worker = LocalWorker(
+                kv,
+                runner,
+                max_inflight=resolved_scheduler.max_inflight,
+                resources=resources,
+            )
         try:
+            if prefix_context is not None:
+                _require_prefix_reuse_compatible(cache_config, kv_plan)
             execution = build_execution_plan(
                 architecture,
                 cache_config,
@@ -320,14 +360,14 @@ class ResidentKVEngine(Engine):
                 resources.close()
             raise
 
-    def submit(self, request: Request) -> RequestLifecycle:
+    def submit(self, request: Request, *, defer_to_remote_kv: bool = False) -> RequestLifecycle:
         if self._closing:
             raise RuntimeError("resident engine is closing")
         prepare = getattr(self.executor.runner, "prepare_request", None)
         if prepare is not None:
             prepare(request)
         try:
-            lifecycle = super().submit(request)
+            lifecycle = super().submit(request, defer_to_remote_kv=defer_to_remote_kv)
         except BaseException:
             if prepare is not None:
                 self._forget_runner_request(str(request.request_id))

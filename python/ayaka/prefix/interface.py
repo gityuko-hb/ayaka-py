@@ -30,6 +30,27 @@ class ValidResume:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupedValidResume:
+    """Borrowed grouped-cache capability for one all-group resume boundary.
+
+    Unlike :class:`ValidResume` the capability carries no page tables: a
+    grouped boundary pins pages in every cache group and the owning backend
+    resolves them from the entry identity. The capability is a token/context
+    identity only; acquisition revalidates it against the live canonical
+    entry and returns zero (a clean miss) when it is stale.
+    """
+
+    cache_id: int
+    entry_id: int
+    context: PrefixCacheContext
+    token_ids: tuple[int, ...]
+
+    @property
+    def logical_position(self) -> int:
+        return len(self.token_ids)
+
+
+@dataclass(frozen=True, slots=True)
 class PrefixMatch:
     """Full-page match that must be revalidated before attachment."""
 

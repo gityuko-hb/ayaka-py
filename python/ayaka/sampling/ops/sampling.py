@@ -1023,7 +1023,10 @@ def build_support_output(
     ).to(torch.int32)
 
     packed_size = min(max_tokens, weights_by_id.shape[-1])
-    _, packed = torch.topk(weights_by_id, k=packed_size, dim=-1, largest=True, sorted=True)
+    # Descending weight with a stable token-id tie-break: torch.topk leaves
+    # equal-weight order unspecified, which breaks reproducible support sets.
+    order = torch.argsort(weights_by_id, dim=-1, descending=True, stable=True)
+    packed = order[:, :packed_size]
     return SamplingSupportTensors(
         token_ids=packed.to(torch.int32),
         lengths=realized.clamp(max=packed_size),

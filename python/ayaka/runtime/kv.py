@@ -183,8 +183,9 @@ class KVRequestPreparer:
     Contexts must encode model/weights, layout, adapters and isolation salt.
     Prefix lookup hints own no pages. Only attach_resume advances logical
     progress. The prompt boundary lives solely in
-    :func:`prefix_prompt_candidate`. Grouped canonical prefix caching is
-    deliberately unsupported by its backend.
+    :func:`prefix_prompt_candidate`. Both the homogeneous store and the
+    grouped all-group boundary cache serve this path; a grouped capability
+    that is no longer executable reports a clean miss.
     """
 
     def __init__(
@@ -269,6 +270,17 @@ class KVRequestPreparer:
                 lifecycle.machine.transition(RequestState.WAITING)
                 lifecycle.machine.transition(RequestState.ADMITTED)
             state = self.kv.get_sequence(sequence)
+            lifecycle.bind_sequence(
+                sequence, state_version=state.version, computed_tokens=state.committed_tokens
+            )
+        elif (
+            state.version != lifecycle.state_version
+            or state.committed_tokens != lifecycle.computed_tokens
+        ):
+            # The physical sequence advanced or was reset outside this request's
+            # snapshot (for example a recompute preemption that released its KV
+            # before the lifecycle state was updated). Rebinding here prevents a
+            # plan from being built on the pre-reset view and failing validation.
             lifecycle.bind_sequence(
                 sequence, state_version=state.version, computed_tokens=state.committed_tokens
             )
