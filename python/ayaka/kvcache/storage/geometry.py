@@ -9,10 +9,10 @@ from ayaka.kvcache.storage.layout import (
     KVStorageKind,
     PlaneLayout,
     PlaneSpec,
-    align_up,
 )
 from ayaka.kvcache.storage.quantization import KVQuantization
 from ayaka.types import KVLayoutKind
+from ayaka.utils.math_utils import align_up
 
 
 class BaseKVStorageSpec(ABC):

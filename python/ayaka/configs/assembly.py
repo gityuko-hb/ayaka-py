@@ -61,6 +61,7 @@ from ayaka.memory.ledger import MemoryLedger
 from ayaka.plan import ComputePlan, ExecutionPlan, ParallelPlan
 from ayaka.types import AttentionType, DeviceKind, DType, KVCacheDtype, MaskKind
 from ayaka.utils.import_utils import CapabilityError
+from ayaka.utils.math_utils import div_ceil
 
 if TYPE_CHECKING:
     from ayaka.distributed.parallel import ParallelContext
@@ -362,9 +363,7 @@ def plan_physical_cache(
             )
     specs = {group.group_id: _spec_for(storage_specs, group.group_id) for group in groups}
     minimum_pages = {
-        group.group_id: max(
-            2, (group.retained_tokens(max_model_len) + group.page_size - 1) // group.page_size
-        )
+        group.group_id: max(2, div_ceil(group.retained_tokens(max_model_len), group.page_size))
         for group in groups
     }
 

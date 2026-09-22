@@ -13,6 +13,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ayaka.utils.math_utils import align_down
+
 if TYPE_CHECKING:
     from ayaka.kvcache.storage.geometry import BaseKVStorageSpec
 
@@ -124,7 +126,7 @@ def full_token_blocks(
         ):
             raise ValueError(f"token ids must be integers in [0, {_MAX_TOKEN_ID}]")
         normalized.append(token_id)
-    full_token_count = len(normalized) // page_size * page_size
+    full_token_count = align_down(len(normalized), page_size)
     return tuple(
         tuple(normalized[offset : offset + page_size])
         for offset in range(0, full_token_count, page_size)

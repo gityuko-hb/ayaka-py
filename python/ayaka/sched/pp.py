@@ -26,6 +26,7 @@ from ayaka.sched.plan import (
     KVRequirement,
 )
 from ayaka.types import DType, StreamRole
+from ayaka.utils.math_utils import align_up
 from ayaka.utils.validation import require_int
 
 __all__ = ["PpMicrobatchPlanner", "stage_spans"]
@@ -161,8 +162,7 @@ class PpMicrobatchPlanner:
         )
 
     def _pad(self, total: int) -> int:
-        multiple = self._token_padding_multiple
-        return ((total + multiple - 1) // multiple) * multiple
+        return align_up(total, self._token_padding_multiple)
 
     def _boundary_plan(self, padded_tokens: int) -> CommunicationPlan:
         if self._parallel.pp_size == 1:

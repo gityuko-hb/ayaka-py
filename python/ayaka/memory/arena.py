@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from ayaka.memory.region import MemoryRegion, first_aligned_offset
 from ayaka.types import MemoryOwner
+from ayaka.utils.math_utils import align_up
 
 __all__ = ["Arena", "ArenaExhausted", "ArenaStats", "SlabAllocator", "SlabStats"]
 
@@ -190,7 +191,7 @@ class SlabAllocator:
             )
         self._region = region
         self._object_bytes = object_bytes
-        self._stride = (object_bytes + alignment - 1) // alignment * alignment
+        self._stride = align_up(object_bytes, alignment)
         self._capacity = region.nbytes // self._stride
         if self._capacity == 0:
             raise ValueError(

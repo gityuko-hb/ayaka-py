@@ -28,6 +28,7 @@ from ayaka.caps import Cap
 from ayaka.device.backend import DeviceBackend, get_backend
 from ayaka.sampling.mask.producer import MaskRows
 from ayaka.sampling.metadata import SamplingFootprint, measure
+from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.torch_memory import pinned_empty
 from ayaka.utils.torch_utils import resolve_device
 
@@ -42,7 +43,7 @@ def bitmask_words(vocab_size: int) -> int:
     Returns:
         ``ceil(vocab_size / 32)``.
     """
-    return (vocab_size + 31) // 32
+    return div_ceil(vocab_size, 32)
 
 
 @dataclass(slots=True)

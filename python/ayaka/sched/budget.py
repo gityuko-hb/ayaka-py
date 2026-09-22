@@ -15,6 +15,7 @@ from ayaka.configs.scheduler import (
     scheduler_config_from_dict,
 )
 from ayaka.sched.plan import BatchStepPlan, Phase
+from ayaka.utils.math_utils import align_down, div_ceil
 from ayaka.utils.validation import require_int
 
 __all__ = [
@@ -80,7 +81,7 @@ class BatchBudget:
         if new_sequence and self.remaining_sequences <= 0:
             return 0
         multiple = self.capabilities.token_padding_multiple
-        capacity = (self.max_physical_tokens // multiple) * multiple
+        capacity = align_down(self.max_physical_tokens, multiple)
         headroom = capacity - self.physical_tokens + ((-self.logical_tokens) % multiple)
         return min(requested, max(0, headroom))
 
@@ -155,7 +156,7 @@ class TimeEstimator:
             * 2
         )
         pages = sum(
-            (s.query_end + g.page_size - 1) // g.page_size
+            div_ceil(s.query_end, g.page_size)
             for s in step.slices
             for g in self.runner.attention.execution.attention_groups
         )

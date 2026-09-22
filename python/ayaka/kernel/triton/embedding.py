@@ -18,6 +18,7 @@ import triton.language as tl
 
 from ayaka.caps import Cap
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton.math_utils import block_size
 from ayaka.utils.torch_utils import compute_torch_dtypes
 from ayaka.utils.validation import require_int
 
@@ -158,7 +159,7 @@ def vocab_parallel_embedding(
     output = torch.empty((num_tokens, hidden), dtype=weight.dtype, device=weight.device)
     if num_tokens == 0:
         return output
-    block_d = min(_MAX_BLOCK_D, triton.next_power_of_2(hidden))
+    block_d = block_size(hidden, _MAX_BLOCK_D)
     grid = (num_tokens, triton.cdiv(hidden, block_d))
     with torch.cuda.device(weight.device):
         cast(Any, _vocab_parallel_embedding_kernel)[grid](
@@ -229,7 +230,7 @@ def embedding_lookup(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor
     output = torch.empty((num_tokens, hidden), dtype=weight.dtype, device=weight.device)
     if num_tokens == 0:
         return output
-    block_d = min(_MAX_BLOCK_D, triton.next_power_of_2(hidden))
+    block_d = block_size(hidden, _MAX_BLOCK_D)
     grid = (num_tokens, triton.cdiv(hidden, block_d))
     with torch.cuda.device(weight.device):
         cast(Any, _simple_embedding_kernel)[grid](

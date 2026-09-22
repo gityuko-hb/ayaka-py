@@ -6,6 +6,7 @@ from typing import Any
 import torch
 from torch.nn import Parameter
 
+from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.validation import require_int
 
 from .layout import ProjectionLayout
@@ -43,8 +44,8 @@ def adjust_block_scale_shard(
     if block_n <= 0:
         raise ValueError("weight block size must be positive")
     return (
-        (shard_size + block_n - 1) // block_n,
-        (shard_offset + block_n - 1) // block_n,
+        div_ceil(shard_size, block_n),
+        div_ceil(shard_offset, block_n),
     )
 
 

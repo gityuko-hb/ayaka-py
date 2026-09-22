@@ -12,6 +12,7 @@ from ayaka.attention.spec import AttentionGroupSpec
 from ayaka.kvcache.storage.geometry import BaseKVStorageSpec
 from ayaka.memory.views import ExecutionMemoryView, SequenceExecutionView
 from ayaka.sched.plan import PreparedStep
+from ayaka.utils.math_utils import div_ceil
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +44,7 @@ def validate_paged_inputs(
         for name, binding in bindings.items():
             group, storage = binding.group, binding.storage
             page_size = group.page_size
-            width = (scheduled.query_end + page_size - 1) // page_size
+            width = div_ceil(scheduled.query_end, page_size)
             window = group.spec.sliding_window
             read_start = 0 if window is None else max(0, scheduled.query_start + 1 - window)
             if isinstance(view, SequenceExecutionView):

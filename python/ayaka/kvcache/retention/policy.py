@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Final
 
+from ayaka.utils.math_utils import div_ceil
+
 #: Ceiling on the exhaustive scan the default page bound falls back to.
 #: 64k lengths is roughly 50 ms; beyond that a policy must state its own bound
 #: rather than making bring-up quietly take seconds per layer.
@@ -38,7 +40,7 @@ def _pages_for(start: int, stop: int, page_size: int) -> int:
     """Pages an interval touches. A partially retained page stays readable."""
     if start >= stop:
         return 0
-    return (stop + page_size - 1) // page_size - start // page_size
+    return div_ceil(stop, page_size) - start // page_size
 
 
 class RetentionPolicy(ABC):
@@ -107,7 +109,7 @@ class RetentionPolicy(ABC):
                 f"{max_sequence_tokens} lengths exceeds the {max_scan_tokens} limit. "
                 "Override max_retained_pages() on the policy."
             )
-        ceil = (max_sequence_tokens + page_size - 1) // page_size
+        ceil = div_ceil(max_sequence_tokens, page_size)
         best = 0
         for length in range(1, max_sequence_tokens + 1):
             token_range = self.required_token_range(layer_id, length)
@@ -158,7 +160,7 @@ class FullRetention(RetentionPolicy):
         _validate_layer_id(layer_id)
         _validate_sequence_length(max_sequence_tokens)
         _validate_page_size(page_size)
-        return (max_sequence_tokens + page_size - 1) // page_size
+        return div_ceil(max_sequence_tokens, page_size)
 
     @property
     def compatibility_key(self) -> tuple[object, ...]:
@@ -235,7 +237,7 @@ class SlidingWindowRetention(RetentionPolicy):
             return 0
         retained = min(self.window_size, max_sequence_tokens)
         worst_alignment = (retained + 2 * page_size - 2) // page_size
-        total_pages = (max_sequence_tokens + page_size - 1) // page_size
+        total_pages = div_ceil(max_sequence_tokens, page_size)
         return min(worst_alignment, total_pages)
 
     @property

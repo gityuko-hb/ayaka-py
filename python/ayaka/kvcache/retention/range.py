@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ayaka.kvcache.retention.policy import DEFAULT_MAX_SCAN_TOKENS, RetentionPolicy
+from ayaka.utils.math_utils import div_ceil
 
 
 def retained_page_range(
@@ -49,7 +50,7 @@ def retained_page_range(
     # Floor the start and ceil the stop so both boundary pages are covered.
     return range(
         token_range.start // page_size,
-        (token_range.stop + page_size - 1) // page_size,
+        div_ceil(token_range.stop, page_size),
     )
 
 

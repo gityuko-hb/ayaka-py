@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from types import TracebackType
 
 from ayaka.exceptions import CheckpointCorruptError
+from ayaka.utils.math_utils import align_down
 from ayaka.weights.plan import FileReadPlan
 from ayaka.weights.spec import WeightSource
 
@@ -241,7 +242,7 @@ class BoundedCheckpointReader:
         # and the returned slice is adjusted to the requested offset.
         nbytes = len(destination)
         page = mmap.ALLOCATIONGRANULARITY
-        base = (offset // page) * page
+        base = align_down(offset, page)
         span = (offset - base) + nbytes
         try:
             with mmap.mmap(fd, span, offset=base, access=mmap.ACCESS_READ) as mapped:

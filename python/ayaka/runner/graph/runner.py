@@ -27,6 +27,7 @@ import torch
 
 from ayaka.runner.graph.backend import BreakableGraphBackend, FullGraphBackend, slice_rows
 from ayaka.runner.graph.graph import CanRun, GraphBackend, GraphCapabilityError, ShapeKey
+from ayaka.utils.math_utils import align_down
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ def build_buckets(
     configured bucket is silently unreachable, dedupe, sort.
     """
     buckets = {s for s in sizes if 0 < s <= max_size and s % multiple_of == 0}
-    largest_aligned = max_size - (max_size % multiple_of)
+    largest_aligned = align_down(max_size, multiple_of)
     if largest_aligned > 0:
         buckets.add(largest_aligned)
     if not buckets:

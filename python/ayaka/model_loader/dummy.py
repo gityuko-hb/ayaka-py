@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ayaka.types import DType
+from ayaka.utils.math_utils import div_ceil
 
 __all__ = [
     "DUMMY_ARCH_JSON",
@@ -89,7 +90,7 @@ class TensorSeed:
         pass a zero-based check.
         """
         pattern = bytes(((self.fill + i) & 0xFF) or 0x5A for i in range(7))
-        reps = -(-self.nbytes // len(pattern))
+        reps = div_ceil(self.nbytes, len(pattern))
         return (pattern * reps)[: self.nbytes]
 
 

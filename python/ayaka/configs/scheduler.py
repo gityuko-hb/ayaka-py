@@ -24,6 +24,7 @@ from ayaka.plan import (
 )
 from ayaka.request.schema import Request
 from ayaka.types import MemoryTier
+from ayaka.utils.math_utils import align_down, align_up
 from ayaka.utils.validation import require_frozen, require_int
 
 __all__ = [
@@ -90,8 +91,7 @@ class SchedulerCapabilities(ConfigMixin):
     def physical_token_slots(self, query_tokens: int) -> int:
         """Packed slots after padding; no speculative expansion is supported."""
         require_int(query_tokens, "query_tokens")
-        multiple = self.token_padding_multiple
-        return ((query_tokens + multiple - 1) // multiple) * multiple
+        return align_up(query_tokens, self.token_padding_multiple)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -289,7 +289,7 @@ class SchedulerConfig(ConfigMixin):
         issue = self.max_num_scheduled_tokens
         if issue is None:
             multiple = capabilities.token_padding_multiple
-            issue = (self.max_num_batched_tokens // multiple) * multiple
+            issue = align_down(self.max_num_batched_tokens, multiple)
             if issue < 1:
                 raise ConfigError(
                     "scheduler.max_num_scheduled_tokens",

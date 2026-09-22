@@ -42,6 +42,7 @@ from ayaka.types import (
     KVLayoutKind,
     MaskKind,
 )
+from ayaka.utils.math_utils import div_ceil
 
 if TYPE_CHECKING:
     from ayaka.serving.constraints import GrammarConstraints
@@ -688,7 +689,7 @@ class PagedModelRunner(ModelRunner):
         starts = list(step.query_start_loc)
         tables = []
         slots = []
-        width = (max(lengths) + page_size - 1) // page_size
+        width = div_ceil(max(lengths), page_size)
         for view in prepared.memory_view.sequences:
             if isinstance(view, SequenceExecutionView):
                 table = list(view.block_table)

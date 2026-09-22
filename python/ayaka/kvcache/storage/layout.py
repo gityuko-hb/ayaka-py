@@ -147,21 +147,3 @@ class PlaneLayout:
             return self.names.index(name)
         except ValueError:
             raise KeyError(f"unknown plane {name!r}; layout has {self.names}") from None
-
-
-def align_up(value: int, alignment: int) -> int:
-    """Round ``value`` up to the next multiple of ``alignment``.
-
-    Kept general (``alignment`` need not be a power of two) because it only
-    runs in planning code, never per step. The bitmask form
-    ``(v + a - 1) & ~(a - 1)`` would be faster but would silently produce
-    garbage for a non-power-of-two alignment.
-
-    Raises:
-        ValueError: for a non-positive alignment or a negative value.
-    """
-    if alignment <= 0:
-        raise ValueError("alignment must be positive")
-    if value < 0:
-        raise ValueError("value must not be negative")
-    return ((value + alignment - 1) // alignment) * alignment

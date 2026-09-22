@@ -41,6 +41,7 @@ from ayaka.memory.caching import CachingAllocator
 from ayaka.memory.region import MemoryRegion
 from ayaka.plan import MemoryPlan, WorkspaceRequest
 from ayaka.types import MemoryOwner
+from ayaka.utils.math_utils import align_up
 
 __all__ = [
     "ActivationOverflowError",
@@ -351,7 +352,7 @@ def _required_bytes(requests: tuple[WorkspaceRequest, ...]) -> int:
     """
     total = 0
     for request in requests:
-        total = (total + request.alignment - 1) // request.alignment * request.alignment
+        total = align_up(total, request.alignment)
         total += request.nbytes
     return total
 
@@ -433,7 +434,7 @@ class _OwnedBuffer:
         # plus rounding rather than 50% it will never use. ``cap`` is the frozen
         # ceiling: the allocation never exceeds it, even to satisfy rounding.
         target = max(required if floor else required + required // 2, floor, 2 << 20)
-        target = (target + (2 << 20) - 1) // (2 << 20) * (2 << 20)
+        target = align_up(target, 2 << 20)
         if cap is not None:
             target = max(required, min(target, cap))
         new_region = self._allocator.allocate(target, owner=self._owner)

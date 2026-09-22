@@ -47,6 +47,7 @@ from ayaka.memory.ledger import MemoryLedger, Reservation
 from ayaka.memory.region import MemoryRegion, first_aligned_offset
 from ayaka.memory.source import SOURCE_ALIGNMENT, RawMemorySource
 from ayaka.types import MemoryOwner, MemoryTier
+from ayaka.utils.math_utils import align_down, align_up
 
 __all__ = [
     "SIZE_CLASSES",
@@ -69,7 +70,7 @@ def _build_size_classes() -> tuple[int, ...]:
     value = 8192
     while value <= (16 << 30):
         classes.append(value)
-        value = max(value + 256, int(value * 1.25) // 256 * 256)
+        value = max(value + 256, align_down(int(value * 1.25), 256))
     return tuple(classes)
 
 
@@ -94,7 +95,7 @@ def size_class(nbytes: int) -> int:
     if lo == len(SIZE_CLASSES):
         # Beyond the ladder: round to 2 MiB, the large-page granularity, so a
         # 30 GiB weight buffer does not get a class of its own on every call.
-        return (nbytes + (2 << 20) - 1) // (2 << 20) * (2 << 20)
+        return align_up(nbytes, 2 << 20)
     return SIZE_CLASSES[lo]
 
 

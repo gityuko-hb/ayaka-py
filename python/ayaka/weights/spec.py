@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ayaka.types import DType, Layout, MemoryOwner, MemoryTier
+from ayaka.utils.math_utils import align_up
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,8 +37,7 @@ class TensorSpec:
 
     @property
     def padded_nbytes(self) -> int:
-        a = self.alignment
-        return (self.nbytes + a - 1) // a * a
+        return align_up(self.nbytes, self.alignment)
 
     def contiguous_strides(self) -> tuple[int, ...]:
         """Element strides for the declared layout.  Sub-byte dtypes are packed

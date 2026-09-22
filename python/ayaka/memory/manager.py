@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
-from math import ceil
 from threading import RLock
 
 from ayaka.exceptions import (
@@ -86,6 +85,7 @@ from ayaka.memory.views import (
 from ayaka.prefix.identity import PrefixBlockIdentity, PrefixCacheContext
 from ayaka.prefix.interface import CachedBlockInfo, PrefixMatch, ValidResume
 from ayaka.prefix.store import RadixPagePrefixCache
+from ayaka.utils.math_utils import align_down, div_ceil
 from ayaka.utils.validation import require_int
 
 
@@ -374,7 +374,7 @@ class RuntimeMemoryManager:
                 raise ValueError("prefix exceeds completed KV")
             entries = tuple(
                 PageTableEntry(entry.page, min(self.page_size, num_tokens - i * self.page_size))
-                for i, entry in enumerate(state.page_table[: ceil(num_tokens / self.page_size)])
+                for i, entry in enumerate(state.page_table[: div_ceil(num_tokens, self.page_size)])
             )
             acquired = []
             try:
@@ -471,7 +471,7 @@ class RuntimeMemoryManager:
             tokens = tuple(token_ids)
             if len(tokens) > state.committed_tokens:
                 raise ValueError("prefix exceeds completed KV")
-            entries = state.page_table[: ceil(len(tokens) / self.page_size)]
+            entries = state.page_table[: div_ceil(len(tokens), self.page_size)]
             return self.prefix_cache.insert_resume(
                 tokens, tuple(e.page for e in entries), context=context
             )
@@ -582,7 +582,7 @@ class RuntimeMemoryManager:
 
             # floor(committed_tokens / page_size) * page_size: only complete
             # pages are cacheable.
-            shareable_tokens = state.committed_tokens // self.page_size * self.page_size
+            shareable_tokens = align_down(state.committed_tokens, self.page_size)
             if shareable_tokens == 0:
                 return None
             if len(token_ids) < shareable_tokens:
@@ -1039,7 +1039,7 @@ class RuntimeMemoryManager:
                 final_tokens = execution_base_tokens + num_new_tokens
                 usable_pages = self.allocator.snapshot().usable_pages
                 # ceil(final / page_size) - existing blocks = pages to allocate.
-                required_total_pages = ceil(final_tokens / self.page_size)
+                required_total_pages = div_ceil(final_tokens, self.page_size)
                 existing_page_count = len(state.page_table.entries)
                 required_new_pages = required_total_pages - existing_page_count
                 old_entries = state.page_table.snapshot()

@@ -9,6 +9,7 @@ import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
 from ayaka.types import DType
+from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.validation import require_int
 
 _QUERY_DTYPES = (DType.FP16.torch_dtype, DType.BF16.torch_dtype)
@@ -702,7 +703,7 @@ def compute_max_num_partitions(
     effective_bound = max_context_len_bucket
     if sliding_window_value:
         effective_bound = min(effective_bound, sliding_window_value)
-    return -(-effective_bound // kv_partition_size)  # ceil div
+    return div_ceil(effective_bound, kv_partition_size)
 
 
 def decode_paged_attention(

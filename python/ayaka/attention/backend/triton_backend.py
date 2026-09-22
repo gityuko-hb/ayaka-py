@@ -31,6 +31,7 @@ from ayaka.types import (
     KVLayoutKind,
     MaskKind,
 )
+from ayaka.utils.math_utils import div_ceil
 
 __all__ = [
     "DEFAULT_KV_PARTITION_SIZE",
@@ -310,7 +311,7 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
             )
         total_kv_tokens = int(seq_lens_cpu.sum().item())
         actual_max_seq_len = int(seq_lens_cpu.max().item()) if common.num_reqs else 0
-        required_columns = -(-actual_max_seq_len // self.group.page_size)
+        required_columns = div_ceil(actual_max_seq_len, self.group.page_size)
         if common.block_table.shape[1] < required_columns:
             raise AttentionMetadataError(
                 AttentionErrorCode.METADATA_SHAPE_MISMATCH,
@@ -389,7 +390,7 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
         :meth:`estimate_graph_state_bytes` prices it without a device, so the
         reserve admitted before capture cannot drift from the real allocation.
         """
-        columns = (max_seq_len + page_size - 1) // page_size
+        columns = div_ceil(max_seq_len, page_size)
         max_slots = columns * page_size
         partitions = compute_max_num_partitions(
             max(1, max_seq_len),
@@ -473,7 +474,7 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
                 max_query_len=max_query_len,
             )
         page = self.group.page_size
-        columns = (max_seq_len + page - 1) // page
+        columns = div_ceil(max_seq_len, page)
         max_slots = columns * page
         spec = self.spec
         device = self.device

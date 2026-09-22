@@ -11,6 +11,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ayaka.utils.math_utils import median
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -183,9 +185,7 @@ def _bench_cuda_events(fn: Callable[..., Any], *, warmup: int, rep: int) -> floa
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
 
-    times.sort()
-    mid = len(times) // 2
-    return times[mid] if len(times) % 2 == 1 else (times[mid - 1] + times[mid]) / 2
+    return median(times)
 
 
 def _bench_cpu(fn: Callable[..., Any], *, warmup: int, rep: int) -> float:
@@ -202,6 +202,4 @@ def _bench_cpu(fn: Callable[..., Any], *, warmup: int, rep: int) -> float:
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)
 
-    times.sort()
-    mid = len(times) // 2
-    return times[mid] if len(times) % 2 == 1 else (times[mid - 1] + times[mid]) / 2
+    return median(times)

@@ -21,6 +21,7 @@ from ayaka.attention.spec import AttentionGroupSpec
 from ayaka.runner.graph.buffer import GraphBuffer
 from ayaka.types import AttentionCudaGraphSupport, AttentionType, KVLayoutKind, MaskKind
 from ayaka.utils.import_utils import CapabilityError, require_module
+from ayaka.utils.math_utils import div_ceil
 
 __all__ = [
     "FlashAttentionBackend",
@@ -175,7 +176,7 @@ class FlashAttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self._buffers = GraphBuffer.create(
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
-            max_columns=(max_seq_len + page - 1) // page,
+            max_columns=div_ceil(max_seq_len, page),
             device=self.device,
             max_query_len=max_query_len,
         )

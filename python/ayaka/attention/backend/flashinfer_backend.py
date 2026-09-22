@@ -21,6 +21,7 @@ from ayaka.attention.ports import PagedKVCache
 from ayaka.attention.spec import AttentionGroupSpec
 from ayaka.types import AttentionCudaGraphSupport, AttentionType, KVLayoutKind, MaskKind
 from ayaka.utils.import_utils import CapabilityError, require_module
+from ayaka.utils.math_utils import div_ceil
 
 __all__ = [
     "FlashInferBackend",
@@ -116,7 +117,7 @@ def _derive_workspace_bytes(spec, device: torch.device) -> int:
     except Exception:  # pragma: no cover
         sm_count = 128
     cta_tile_q = 64 if spec.head_dim_qk >= 256 else 128
-    padded_batch = -(-2 * sm_count // max(1, spec.num_kv_heads))
+    padded_batch = div_ceil(2 * sm_count, max(1, spec.num_kv_heads))
     tmp_v = spec.num_qo_heads * padded_batch * cta_tile_q * spec.head_dim_qk * 4
     return max(_MIN_WORKSPACE, tmp_v + _WORKSPACE_SLACK)
 
@@ -283,7 +284,7 @@ class FlashInferMetadataBuilder(BaseAttentionMetadataBuilder):
                 max_query_len=max_query_len,
             )
         page = self.group.page_size
-        self._max_columns = (max_seq_len + page - 1) // page
+        self._max_columns = div_ceil(max_seq_len, page)
         spec = self.spec
         # indices is the flattened worst case: every request at the full column width.
         self._graph_indptr = torch.zeros(max_batch_size + 1, dtype=torch.int32, device=self.device)

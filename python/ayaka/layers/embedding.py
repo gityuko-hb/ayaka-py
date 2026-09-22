@@ -39,6 +39,7 @@ from ayaka.layers.quantization.base import (
     QuantizeMethodBase,
 )
 from ayaka.utils.import_utils import CapabilityError, resolve_qualname
+from ayaka.utils.math_utils import align_up
 from ayaka.utils.torch_utils import compute_torch_dtypes
 from ayaka.utils.validation import require_int
 
@@ -63,7 +64,7 @@ def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) ->
     """Round ``vocab_size`` up to the next multiple of ``pad_to``."""
     require_int(vocab_size, "vocab_size", minimum=1)
     require_int(pad_to, "pad_to", minimum=1)
-    return ((vocab_size + pad_to - 1) // pad_to) * pad_to
+    return align_up(vocab_size, pad_to)
 
 
 def vocab_range_from_per_partition_vocab_size(

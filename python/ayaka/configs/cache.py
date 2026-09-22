@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from ayaka.configs.base import ConfigError, ConfigMixin
 from ayaka.types import DType, KVLayoutKind
+from ayaka.utils.math_utils import align_down, div_ceil
 
 if TYPE_CHECKING:
     from ayaka.configs.model import ArchitectureConfig
@@ -295,7 +296,7 @@ class CacheGroupPlan(ConfigMixin):
                 "cache.sequence_length", "SEQUENCE_LENGTH_NEGATIVE", "sequence length must be >= 0"
             )
         retained = self.retained_tokens(sequence_length)
-        pages = (retained + self.page_size - 1) // self.page_size
+        pages = div_ceil(retained, self.page_size)
         return pages * self.bytes_per_page + self.state_bytes_per_sequence
 
 
@@ -347,7 +348,7 @@ class CachePlan(ConfigMixin):
                     "PREFIX_MATCH_NEGATIVE",
                     "prefix match length must be non-negative",
                 )
-            normalized.append((group.group_id, value - value % group.page_size))
+            normalized.append((group.group_id, align_down(value, group.page_size)))
         return tuple(normalized)
 
     def common_model_prefix(self, matches: Mapping[str, int]) -> int:

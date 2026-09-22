@@ -8,23 +8,14 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton.math_utils import norm_block_and_warps
+from ayaka.utils.math_utils import FP8_E4M3_MAX
 from ayaka.utils.torch_utils import compute_torch_dtypes
 
 _SUPPORTED_INPUT_DTYPES = compute_torch_dtypes()
 _BLOCK_SIZE = 256
 _NUM_WARPS = 8
 _FP8_E4M3 = getattr(torch, "float8_e4m3fn", None)
-
-
-def _norm_block_and_warps(d: int) -> tuple[int, int]:
-    block_size = min(8192, triton.next_power_of_2(d))
-    if block_size >= 4096:
-        warps = 16
-    elif block_size >= 1024:
-        warps = 8
-    else:
-        warps = 4
-    return block_size, warps
 
 
 @triton.jit
@@ -98,7 +89,7 @@ def _rms_norm_quant_kernel(
         scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
         weight = tl.load(weight_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
         output = x * rms_rcp * (weight + WEIGHT_BIAS) * scale_inv
-        output = tl.maximum(-448.0, tl.minimum(output, 448.0))
+        output = tl.maximum(-FP8_E4M3_MAX, tl.minimum(output, FP8_E4M3_MAX))
         tl.store(output_ptr + row * stride_output + lanes, output.to(tl.float8e4nv), mask=mask)
     else:
         sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
@@ -122,7 +113,7 @@ def _rms_norm_quant_kernel(
             )
             weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
             output = x * rms_rcp * (weight + WEIGHT_BIAS) * scale_inv
-            output = tl.maximum(-448.0, tl.minimum(output, 448.0))
+            output = tl.maximum(-FP8_E4M3_MAX, tl.minimum(output, FP8_E4M3_MAX))
             tl.store(
                 output_ptr + row * stride_output + offsets, output.to(tl.float8e4nv), mask=mask
             )
@@ -213,7 +204,7 @@ def _fused_add_rms_norm_kernel(
         if QUANTIZE:
             scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
             normed *= scale_inv
-            normed = tl.maximum(-448.0, tl.minimum(normed, 448.0))
+            normed = tl.maximum(-FP8_E4M3_MAX, tl.minimum(normed, FP8_E4M3_MAX))
             tl.store(output_ptr + row * stride_output + lanes, normed.to(tl.float8e4nv), mask=mask)
         else:
             tl.store(output_ptr + row * stride_output + lanes, normed, mask=mask)
@@ -250,7 +241,7 @@ def _fused_add_rms_norm_kernel(
             normed = x * rms_rcp * (weight + WEIGHT_BIAS)
             if QUANTIZE:
                 normed *= scale_inv
-                normed = tl.maximum(-448.0, tl.minimum(normed, 448.0))
+                normed = tl.maximum(-FP8_E4M3_MAX, tl.minimum(normed, FP8_E4M3_MAX))
                 tl.store(
                     output_ptr + row * stride_output + offsets, normed.to(tl.float8e4nv), mask=mask
                 )
@@ -435,7 +426,7 @@ def _launch_rms_norm(
     output, stride_output = _prepare_output_like(input, out)
     if rows == 0:
         return output
-    block_size, num_warps = _norm_block_and_warps(d)
+    block_size, num_warps = norm_block_and_warps(d)
     with torch.cuda.device(input.device):
         cast(Any, _rms_norm_kernel)[(rows,)](
             input,
@@ -535,7 +526,7 @@ def rms_norm_quant(
     output, stride_output = _quant_output(input, out)
     if rows == 0:
         return output
-    block_size, num_warps = _norm_block_and_warps(d)
+    block_size, num_warps = norm_block_and_warps(d)
     with torch.cuda.device(input.device):
         cast(Any, _rms_norm_quant_kernel)[(rows,)](
             input,
@@ -594,7 +585,7 @@ def qk_rms_norm(
     if batch_size == 0 or num_heads == 0:
         return output
 
-    block_size, num_warps = _norm_block_and_warps(d)
+    block_size, num_warps = norm_block_and_warps(d)
     with torch.cuda.device(input.device):
         cast(Any, _qk_rms_norm_kernel)[(batch_size * num_heads,)](
             input,
@@ -657,7 +648,7 @@ def _fused_add_impl(
     if rows == 0:
         return output if quantize else None
 
-    block_size, num_warps = _norm_block_and_warps(d)
+    block_size, num_warps = norm_block_and_warps(d)
     scale_ptr = quant_scale if quant_scale is not None else input
 
     with torch.cuda.device(input.device):
@@ -849,7 +840,7 @@ def layer_norm(
         return output
     beta_ptr = beta if beta is not None else weight
 
-    block_size, num_warps = _norm_block_and_warps(d)
+    block_size, num_warps = norm_block_and_warps(d)
     with torch.cuda.device(input.device):
         cast(Any, _layer_norm_kernel)[(rows,)](
             input,

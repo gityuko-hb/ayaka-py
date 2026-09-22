@@ -24,6 +24,7 @@ from enum import StrEnum
 from ayaka.exceptions import RuntimeMemoryError
 from ayaka.kvcache.storage.geometry import BaseKVStorageSpec
 from ayaka.kvcache.storage.layout import DEFAULT_KV_ALIGNMENT_BYTES
+from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.torch_memory import device_memory
 
 __all__ = [
@@ -206,7 +207,7 @@ def minimum_pages(page_size: int, max_sequence_tokens: int | None) -> int:
         raise ValueError("page_size must be positive")
     if max_sequence_tokens is None:
         return 2
-    context_pages = (max_sequence_tokens + page_size - 1) // page_size
+    context_pages = div_ceil(max_sequence_tokens, page_size)
     return max(2, context_pages + 1)
 
 

@@ -53,6 +53,7 @@ from ayaka.serving.prepare import RequestProcessor
 from ayaka.serving.service import ServingService
 from ayaka.tokenizers.service import TokenizerService
 from ayaka.types import AttentionType, DType
+from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.torch_memory import empty_cache
 from ayaka.worker.local import LocalWorker
 from ayaka.worker.resources import WorkerResourcePlan, WorkerResources
@@ -277,7 +278,7 @@ class ServingRuntime:
             max_num_seqs=max_requests,
             max_num_batched_tokens=batch_tokens,
             max_inflight=self._scheduler_config.max_inflight,
-            group_columns={"default": (max_seq + page_size - 1) // page_size},
+            group_columns={"default": div_ceil(max_seq, page_size)},
         )
         self._runner_buffer_bytes = self._buffer_spec.device_bytes
         self._runner_staging_bytes = self._buffer_spec.staging_bytes if device.type == "cuda" else 0
