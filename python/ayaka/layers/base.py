@@ -230,6 +230,22 @@ class BaseLayer(nn.Module, ABC):
         self.quant_method.validate_layer(self, prefix=self.prefix)
         self._quantization_state = "ready"
 
+    def _load_from_state_dict(
+        self,
+        state_dict: Any,
+        prefix: str,
+        local_metadata: Any,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        if self.quant_config is not None and self.quant_method is not None:
+            self.quant_method.validate_checkpoint(self, state_dict, prefix=prefix)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
     def apply_quantization(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Execute the selected target only after successful weight finalization."""
         if self._quantization_state != "ready" or self.quant_method is None:

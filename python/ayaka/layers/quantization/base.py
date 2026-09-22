@@ -48,6 +48,56 @@ class QuantizationTarget(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class QuantizedTensorSpec:
+    """Physical checkpoint storage, separate from a projection's logical shape.
+
+    ``packed_factor`` also describes grouped scale axes: one scale row can
+    represent 128 logical output rows. Loaders must reject unaligned shards.
+    This describes storage only; it does not convert AWQ/GPTQ or other formats.
+    """
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    input_dim: int | None = None
+    output_dim: int | None = None
+    packed_dim: int | None = None
+    packed_factor: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.shape:
+            raise ValueError("quantized storage must have at least one dimension")
+        for size in self.shape:
+            _positive_int(size, "storage dimension")
+        if not isinstance(self.dtype, torch.dtype):
+            raise TypeError("dtype must be a torch.dtype")
+        _positive_int(self.packed_factor, "packed_factor")
+        for name in ("input_dim", "output_dim", "packed_dim"):
+            dim = getattr(self, name)
+            if dim is not None and (
+                isinstance(dim, bool) or not isinstance(dim, int) or not 0 <= dim < len(self.shape)
+            ):
+                raise ValueError(f"{name} must index the physical shape")
+        if self.packed_factor != 1 and self.packed_dim is None:
+            raise ValueError("packed_factor requires packed_dim")
+
+    def validate(self, tensor: torch.Tensor, *, name: str) -> None:
+        """Reject a changed dtype/layout before passing storage to a raw kernel."""
+        if tuple(tensor.shape) != self.shape or tensor.dtype != self.dtype:
+            raise ValueError(f"{name} must have shape {self.shape} and dtype {self.dtype}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    def loader_attrs(self) -> dict[str, Any]:
+        attrs: dict[str, Any] = {"quant_storage_dtype": self.dtype}
+        for name in ("input_dim", "output_dim", "packed_dim"):
+            if (value := getattr(self, name)) is not None:
+                attrs[name] = value
+        if self.packed_dim is not None:
+            attrs["packed_factor"] = self.packed_factor
+        return attrs
+
+
+@dataclass(frozen=True, slots=True)
 class QuantizationContext:
     """Facts required to validate a quantization backend at runtime."""
 
@@ -388,6 +438,16 @@ class QuantizeMethodBase(ABC):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         del layer
         return None
+
+    def validate_checkpoint(
+        self, layer: nn.Module, state_dict: Mapping[str, Any], *, prefix: str
+    ) -> None:
+        """Validate a PyTorch state-dict load before it can cast packed storage.
+
+        Existing methods retain PyTorch's behavior. Packed methods can override
+        this to reject format changes and enforce their reload lifecycle.
+        """
+        del layer, state_dict, prefix
 
     def validate_layer(self, layer: nn.Module, *, prefix: str = "") -> None:
         del layer, prefix
