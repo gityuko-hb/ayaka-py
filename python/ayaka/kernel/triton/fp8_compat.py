@@ -63,6 +63,8 @@ __all__ = [
     "e5m2_u8_to_f16",
     "e5m2_u8_to_f32",
     "round_e5m2",
+    # JIT primitives: E8M0 scales
+    "e8m0_u8_to_f32",
 ]
 
 logger = logging.getLogger(__name__)
@@ -302,3 +304,20 @@ def e5m2_f32_to_u8(x):
     grid = round_e5m2(tl.clamp(x, -_E5M2_MAX, _E5M2_MAX))
     h = grid.to(tl.float16).to(tl.uint16, bitcast=True)
     return (h >> 8).to(tl.uint8)
+
+
+@triton.jit
+def e8m0_u8_to_f32(v):
+    """Decode an E8M0 power-of-two scale byte to fp32.
+
+    E8M0 is the OCP MX scale format: an unsigned, biased exponent with no
+    mantissa. Placing the byte in the fp32 exponent field (``v << 23``) decodes
+    every finite code exactly, without an ``exp2`` rounding step. ``0x00``
+    decodes to ``+0.0`` rather than the spec's ``2^-127``: that value is an
+    fp32 subnormal, GPUs flush it, and it underflows every product anyway.
+    ``0xFF`` is the format's only non-finite code (NaN), mapped through so a
+    corrupt scale is not silently accepted as a finite power of two.
+    """
+    raw = v.to(tl.uint32)
+    value = (raw << 23).to(tl.float32, bitcast=True)
+    return tl.where(raw == 0xFF, float("nan"), value)

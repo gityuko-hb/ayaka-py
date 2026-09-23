@@ -8,6 +8,8 @@ import time
 from functools import partial
 from typing import Any, cast
 
+from tqdm.auto import tqdm as _BaseTqdm
+
 from ayaka.distributed.env import describe, is_distributed, is_master, rank
 
 __all__ = [
@@ -75,9 +77,6 @@ def quiet_http_loggers() -> None:
         client_logger = logging.getLogger(name)
         if client_logger.level == logging.NOTSET:
             client_logger.setLevel(logging.WARNING)
-
-
-from tqdm.auto import tqdm as _BaseTqdm
 
 
 class DisabledTqdm(_BaseTqdm):

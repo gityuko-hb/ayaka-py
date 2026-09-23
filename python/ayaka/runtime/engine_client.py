@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
+from typing import Any, cast
 
 import zmq
 
@@ -507,7 +508,9 @@ def _spawn_engine_core_process(
     """
     import torch.multiprocessing as torch_mp
 
-    spawn_fn = getattr(torch_mp, "spawn")
+    # Attribute access through Any: pyright rejects torch_mp.spawn as a
+    # private import even though it is the supported entry point.
+    spawn_fn = cast(Any, torch_mp).spawn
     return spawn_fn(
         _engine_core_child,
         args=(
