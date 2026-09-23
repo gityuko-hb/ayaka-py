@@ -91,9 +91,6 @@ _E4M3_MAX = tl.constexpr(_max_finite(DType.FP8_E4M3))
 _E5M2_MAX = tl.constexpr(_max_finite(DType.FP8_E5M2))
 
 
-# ── 1. Environment & Cache Salting ───────────────────────────────────────────
-
-
 def _forced_by() -> str | None:
     """Return the environment variable forcing emulation, or None."""
     for var in _ENV_VARS:
@@ -117,9 +114,6 @@ if FORCE_EMU:
         "even where the device supports them",
         _forced_by(),
     )
-
-
-# ── 2. Host-Side Detection & Branching ───────────────────────────────────────
 
 
 @cache
@@ -162,9 +156,6 @@ def e5m2_native() -> bool:
     return fp8_native()
 
 
-# ── 3. Host-Side Adapters (Tensors & Buffers) ────────────────────────────────
-
-
 def fp8_kernel_view(t: torch.Tensor) -> torch.Tensor:
     """Return a raw ``uint8`` view of an FP8 tensor where emulation is active.
 
@@ -196,9 +187,6 @@ def e5m2_act_dtype() -> torch.dtype:
     return torch_dtype(DType.FP8_E5M2) if e5m2_native() else torch_dtype(DType.FP16)
 
 
-# ── 4. Compile-Time Constexprs (Triton IR) ───────────────────────────────────
-
-
 @constexpr_function
 def fp8_native_cx() -> bool:
     """Compile-time constant: True only when the target has native FP8."""
@@ -215,9 +203,6 @@ def e4m3_native_cx() -> bool:
 def e5m2_native_cx() -> bool:
     """Compile-time constant for E5M2, resolving on the compilation target."""
     return fp8_native_cx()
-
-
-# ── 5. E4M3 Emulation Primitives (1S, 4E, 3M) ────────────────────────────────
 
 
 @triton.jit
@@ -266,9 +251,6 @@ def e4m3_f32_to_u8(x):
     grid = round_e4m3(tl.clamp(x, -_E4M3_MAX, _E4M3_MAX))
     h = (grid * 0.00390625).to(tl.float16).to(tl.uint16, bitcast=True)
     return (((h >> 8) & 0x80) | ((h >> 7) & 0x7F)).to(tl.uint8)
-
-
-# ── 6. E5M2 Emulation Primitives (1S, 5E, 2M) ────────────────────────────────
 
 
 @triton.jit

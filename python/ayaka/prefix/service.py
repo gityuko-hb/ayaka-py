@@ -66,8 +66,11 @@ class PrefixService:
     ) -> None:
         backend = kv.backend
         if isinstance(backend, RuntimeMemoryManager):
-            if backend.tiering_enabled:
-                raise ValueError("canonical prefix resume requires resident KV")
+            # Homogeneous tiering is certified from R12B: the backend trims
+            # attaches to device-valid boundaries, publishes only device-valid
+            # pages and queues asynchronous promotions itself, so canonical
+            # resume stays radix-owned with the tier as a placement authority.
+            pass
         elif not isinstance(backend, KVCacheGroupManager):
             raise ValueError("canonical prefix resume requires a resident KV backend")
         self.kv = kv
@@ -147,7 +150,7 @@ class PrefixService:
             if isinstance(self.backend, RuntimeMemoryManager):
                 if not isinstance(match, ValidResume):
                     return 0
-                return self.backend.attach_resume(sequence, match)
+                return self.backend.attach_resume(sequence, match, token_ids=token_ids)
             if not isinstance(match, GroupedValidResume):
                 return 0
             return self.backend.attach_resume(sequence, match)

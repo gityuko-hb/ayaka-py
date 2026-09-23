@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ayaka.attention.spec import AttentionGroupSpec, AttentionSpec
+from ayaka.configs.cache import TieredCacheConfig
 from ayaka.configs.memory import MemoryConfig
 from ayaka.configs.scheduler import PreemptionMode, SchedulerCapabilities, SchedulerConfig
 from ayaka.configs.serving import ServingConfig
@@ -39,6 +40,7 @@ from ayaka.memory.capacity import (
 )
 from ayaka.memory.ledger import MemoryLedger
 from ayaka.memory.manager import RuntimeMemoryManager
+from ayaka.memory.tiering import TieringConfig
 from ayaka.memory.workspace import WorkspaceManager
 from ayaka.plan import ComputePlan, ExecutionPlan, GraphMode, MemoryPlan
 from ayaka.prefix.identity import build_prefix_context
@@ -65,6 +67,25 @@ _LEDGER_OVERHEAD_BYTES = LEDGER_OVERHEAD_BYTES
 #: Default reserve kept free across a resize; covers allocator fragmentation
 #: and activations that are not part of the KV slab.
 DEFAULT_RESIZE_SAFETY_BYTES = 256 << 20
+
+
+def _validate_serving_tiering(tiering: TieredCacheConfig | None) -> None:
+    """R12B scope guard for the serving boundary's host tier policy.
+
+    The homogeneous full-retention host tier is the only certified
+    combination: NVMe and swap tiers belong to a later phase with their own
+    contracts, and a host tier without capacity is a configuration error.
+    """
+
+    if tiering is None:
+        return
+    if tiering.nvme_bytes or tiering.swap_bytes:
+        raise ValueError(
+            "R12B tiering certifies the host tier only; nvme_bytes and "
+            "swap_bytes need a separate phase"
+        )
+    if tiering.host_bytes < 1:
+        raise ValueError("tiering.host_bytes must be positive when tiering is enabled")
 
 
 @dataclass(slots=True)
@@ -119,6 +140,7 @@ class ServingRuntime:
         graph_pool_bytes: int = 0,
         staging_bytes: int = 0,
         device_total_bytes: int | None = None,
+        tiering: TieredCacheConfig | None = None,
     ):
         """Build model bindings and materialize the initial KV slab.
 
@@ -159,6 +181,10 @@ class ServingRuntime:
                 the persistent runner-buffer staging requirement when smaller.
             device_total_bytes: Device size for the policy budget; queried from
                 CUDA when omitted.
+            tiering: Opt-in host KV tier policy (R12B). ``host_bytes`` sizes a
+                frozen host mirror; ``max_inflight_bytes`` bounds in-flight
+                staging. NVMe/swap tiers are rejected. Tiering moves block
+                residency only: the device slab capacity stays frozen.
 
         Decode-graph policy comes from ``config.decode_graph`` /
         ``config.graph_buckets``; ``graph_pool_bytes`` overrides the auto-sized
@@ -221,6 +247,13 @@ class ServingRuntime:
         self._graph_bytes = graph_pool_bytes
         self._staging_bytes = staging_bytes
         self._device_total_bytes = device_total_bytes
+        # Host tiering is opt-in at the serving boundary (R12B): only the
+        # homogeneous full-retention tier is certified, so an NVMe or swap
+        # configuration is rejected here instead of being half-wired.
+        if tiering is not None and not isinstance(tiering, TieredCacheConfig):
+            raise TypeError("tiering must be a TieredCacheConfig or None")
+        _validate_serving_tiering(tiering)
+        self._tiering = tiering
         self._weights_bytes = (
             self._measure_weights(model) if weights_bytes is None else weights_bytes
         )
@@ -404,6 +437,8 @@ class ServingRuntime:
 
     def _build_kv(self, pages: int) -> WorkerResources:
         """Delegate allocation, reconciliation and freeze to the Worker owner."""
+        spec = self._storage_spec(pages)
+        tiering_config, max_inflight_bytes = self._tiering_config(spec)
         return WorkerResourcePlan(
             device=self._device,
             storage_spec=self._storage_spec(pages),
@@ -423,7 +458,27 @@ class ServingRuntime:
             workspace_ceiling_bytes=self._workspace_ceiling_bytes,
             graph_bytes=self._graph_bytes,
             staging_bytes=self._staging_bytes,
+            tiering=tiering_config,
+            max_inflight_bytes=max_inflight_bytes,
         ).build()
+
+    def _tiering_config(self, spec: MHAStorageSpec) -> tuple[TieringConfig | None, int | None]:
+        """Convert the serving tiering policy into the runtime tier config.
+
+        The mirror is page-for-page with the device slab, so its capacity in
+        pages is ``host_bytes // bytes_per_page``; a host_bytes that cannot
+        hold one page is a configuration error, not a silent empty tier.
+        """
+
+        if self._tiering is None:
+            return None, None
+        host_pages, remainder = divmod(self._tiering.host_bytes, spec.bytes_per_page)
+        if host_pages < 1:
+            raise ValueError(
+                f"tiering.host_bytes ({self._tiering.host_bytes}) must cover at least one "
+                f"KV page ({spec.bytes_per_page} B at page_size={spec.page_size})"
+            )
+        return TieringConfig(host_capacity_pages=host_pages), self._tiering.max_inflight_bytes
 
     def _build_runner(self, kv: LogicalKVManager, buffers: RunnerBuffers) -> PagedModelRunner:
         """Bind a fresh paged runner to the slab, this model and its buffers."""

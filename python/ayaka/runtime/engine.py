@@ -14,15 +14,20 @@ completion boundary hit ``RequestLifecycle.publish_sample``'s budget guard.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable, Sequence
+
 from ayaka.configs.base import ConfigError
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.completion import CompletionCoordinator, ShutdownResult
+from ayaka.metrics import IterationStats, StatLogger, StatLoggerManager
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
+from ayaka.request.parallel import expand_parallel_request
 from ayaka.request.schema import Request
 from ayaka.runtime.output import FinishDecision, OutputProcessor
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import SequenceAllocator
-from ayaka.sched.outcome import FinishReason
+from ayaka.sched.outcome import FinishReason, RequestOutcome, SchedulerReport
 from ayaka.sched.plan import BatchStepPlan
 from ayaka.serving.router import RemoteKVPending
 
@@ -42,6 +47,9 @@ class Engine:
         output: OutputProcessor,
         allocator: SequenceAllocator,
         remote_kv: RemoteKVPending | None = None,
+        stat_loggers: Sequence[StatLogger] = (),
+        log_interval: float = 10.0,
+        log_clock: Callable[[], float] | None = None,
     ) -> None:
         if not isinstance(plan, ResolvedSchedulerPlan):
             raise TypeError("plan must be ResolvedSchedulerPlan")
@@ -53,35 +61,51 @@ class Engine:
         self._allocator = allocator
         self._remote_kv = remote_kv
         self._settled = 0
+        self._manager = (
+            StatLoggerManager(loggers=stat_loggers, log_interval=log_interval, clock=log_clock)
+            if stat_loggers
+            else None
+        )
 
     def submit(self, request: Request, *, defer_to_remote_kv: bool = False) -> RequestLifecycle:
         """Register output state, then admit. Failures leave no output state.
 
         ``defer_to_remote_kv`` parks the request in ``WAITING_REMOTE_KV``; a
         :class:`RemoteKVPending` registry must be wired so the transport can
-        drive it out of the park.
+        drive it out of the park. Parallel families (n>1) register one output
+        state per child — the child id set is derived by the shared
+        ``expand_parallel_request`` helper, matching the scheduler's fan-out.
         """
-        if request.sampling.n > 1:
-            raise ConfigError(
-                "request.sampling.n",
-                "UNSUPPORTED_PARALLEL_SAMPLING",
-                "the output owner binds one request id; n>1 children are expanded "
-                "by the scheduler and cannot be registered here",
-            )
         if defer_to_remote_kv and self._remote_kv is None:
             raise ConfigError(
                 "engine.remote_kv",
                 "REMOTE_KV_REGISTRY_REQUIRED",
                 "deferring a request to WAITING_REMOTE_KV requires a remote-KV pending registry",
             )
-        self._output.register(request)
+        children = expand_parallel_request(request) if request.sampling.n > 1 else None
+        if children is None:
+            self._output.register(request)
+            try:
+                lifecycle = self._scheduler.add_request(
+                    request, defer_to_remote_kv=defer_to_remote_kv
+                )
+            except BaseException:
+                self._output.forget(str(request.request_id))
+                raise
+            if defer_to_remote_kv and self._remote_kv is not None:
+                self._remote_kv.park(str(request.request_id))
+            return lifecycle
+        for index, child in enumerate(children):
+            self._output.register(child, child_index=index)
         try:
             lifecycle = self._scheduler.add_request(request, defer_to_remote_kv=defer_to_remote_kv)
         except BaseException:
-            self._output.forget(str(request.request_id))
+            for child in children:
+                self._output.forget(str(child.request_id))
             raise
         if defer_to_remote_kv and self._remote_kv is not None:
-            self._remote_kv.park(str(request.request_id))
+            for child in children:
+                self._remote_kv.park(str(child.request_id))
         return lifecycle
 
     def release_remote_kv(self, request_id: str, *, num_cached_tokens: int = 0) -> bool:
@@ -97,19 +121,31 @@ class Engine:
         return self._remote_kv.abandon(request_id)
 
     def abort(self, request_id: str) -> bool:
+        """Abort one request; parallel parents fan out to every child."""
+        children = self._scheduler.children_of(request_id)
+        if children is not None:
+            did = False
+            for child in children:
+                did = self._scheduler.abort(child) or did
+            return did
         return self._scheduler.abort(request_id)
 
     def step(self) -> bool:
         """One serialized iteration; True when any owner changed state."""
+        started = time.monotonic()
+        settled_before = self._settled
         did = False
         for lifecycle in self._requests.cancelled_requests():
             if self._scheduler.abort(lifecycle.request_id):
                 did = True
 
         finishes: list[FinishDecision] = []
+        published_tokens = 0
+        launched_tokens = 0
         for result in self._coordinator.poll():
             did = True
             self._settled += 1
+            published_tokens += len(result.published)
             for sample in result.published:
                 lifecycle = self._requests.find(sample.request_id)
                 if lifecycle is None or lifecycle.is_terminal:
@@ -130,7 +166,8 @@ class Engine:
         for decision in finishes:
             self._finish(decision.request_id, decision.reason, decision.detail)
 
-        if self._scheduler.flush_reports():
+        report = self._scheduler.flush_reports()
+        if report is not None:
             did = True
 
         if self._finish_exhausted():
@@ -141,12 +178,58 @@ class Engine:
             if ticket is None:
                 break
             self._coordinator.launch(ticket)
+            launched_tokens += sum(
+                scheduled.query_count for scheduled in ticket.prepared.step.slices
+            )
             did = True
 
         self._allocator.advance_epoch(self._settled)
+        if self._manager is not None:
+            self._record_stats(
+                report,
+                settled_before,
+                published_tokens,
+                launched_tokens,
+                time.monotonic() - started,
+            )
         # A pending completion fence is progress-capable work: the loop must
         # stay alive until the executor settles or quarantines it.
         return did or self._coordinator.executor.pending_completion
+
+    def _record_stats(
+        self,
+        report: SchedulerReport | None,
+        settled_before: int,
+        published_tokens: int,
+        launched_tokens: int,
+        step_seconds: float,
+    ) -> None:
+        assert self._manager is not None
+        if report is not None:
+            outcomes = [r.outcome for r in report.reports]
+            stats = IterationStats(
+                step_id=report.step_id,
+                num_running=report.num_running,
+                num_waiting=report.num_waiting,
+                num_preempted=report.num_preempted_this_step,
+                num_finished=outcomes.count(RequestOutcome.FINISHED),
+                num_aborted=outcomes.count(RequestOutcome.ABORTED),
+                num_failed=outcomes.count(RequestOutcome.FAILED),
+                num_settled=self._settled - settled_before,
+                num_new_tokens=published_tokens,
+                num_scheduled_tokens=launched_tokens,
+                step_seconds=step_seconds,
+            )
+        else:
+            stats = IterationStats(
+                step_id=-1,
+                num_settled=self._settled - settled_before,
+                num_new_tokens=published_tokens,
+                num_scheduled_tokens=launched_tokens,
+                step_seconds=step_seconds,
+            )
+        self._manager.record(stats)
+        self._manager.maybe_log()
 
     def run_until_idle(self, *, max_steps: int = 1024) -> int:
         """Run until no active request remains or a step makes no progress."""

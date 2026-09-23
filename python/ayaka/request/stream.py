@@ -51,7 +51,11 @@ class TokenUsage:
 
 @dataclass(frozen=True, slots=True)
 class OutputEvent:
-    """Append-only output. event_index is per request incarnation, starting at 0."""
+    """Append-only output. event_index is per request incarnation, starting at 0.
+
+    ``child_index`` is set only for parallel-sampling children; the parent
+    stream interleaves children and the caller separates them by this index.
+    """
 
     request_id: str
     sequence_epoch: int
@@ -59,6 +63,7 @@ class OutputEvent:
     delta: str
     usage: TokenUsage
     finish_reason: FinishReason | None = None
+    child_index: int | None = None
 
     def __post_init__(self) -> None:
         require_frozen(self, "output event")
@@ -69,6 +74,8 @@ class OutputEvent:
             raise TypeError("output needs text delta and TokenUsage")
         if self.finish_reason is not None and not isinstance(self.finish_reason, FinishReason):
             raise TypeError("finish_reason must be FinishReason")
+        if self.child_index is not None:
+            require_int(self.child_index, "child_index", minimum=0)
 
 
 @dataclass(frozen=True, slots=True)

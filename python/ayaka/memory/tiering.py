@@ -77,6 +77,52 @@ class TransferState(Enum):
     """Terminal: the copy raised; the caller must abort its state machine."""
 
 
+class ReadinessState(Enum):
+    """Consumer-facing readiness of one cached block (R12B).
+
+    A placement state (:class:`TierState`) says where bytes are being *moved*;
+    a readiness state says what a consumer may trust right now. The pairing is
+    deliberately not one-to-one: an ``EVICTING`` block is still device-readable
+    (the copy only reads immutable source bytes), while a ``PROMOTING`` block
+    is not device-readable anywhere -- its destination page is still RESERVED
+    and no published copy exists.
+    """
+
+    DEVICE_VALID = auto()
+    """Bytes are readable at the device page; safe for model reads."""
+    HOST_VALID = auto()
+    """Bytes are readable only in the host mirror; never device-readable."""
+    TRANSFER_PENDING = auto()
+    """A copy is in flight; neither side is settled for a new consumer."""
+    FAILED_CANCELLED = auto()
+    """The transfer failed or was cancelled; destination owners are held
+    in quarantine until a quiescence proof releases them."""
+
+
+@runtime_checkable
+class TransferBudget(Protocol):
+    """Byte semaphore over in-flight tier staging, shared across engines.
+
+    Structural twin of :class:`~ayaka.prefix.transfer.TransferCredits`; the
+    protocol keeps :mod:`ayaka.memory.tiering` importable without importing
+    the prefix transfer stack (which imports this package).
+    """
+
+    def acquire(self, owner: object, nbytes: int) -> None: ...
+
+    def release(self, owner: object, nbytes: int | None = None) -> None: ...
+
+
+class TransferBudgetExhausted(RuntimeError):
+    """The shared in-flight staging budget is full; nothing was admitted.
+
+    A saturated budget is an explicit rejection, never a queue that grows
+    without bound: callers treat this as backpressure and fall back to the
+    GPU-only drop path. :class:`~ayaka.prefix.transfer.TransferCreditError`
+    subclasses this, so both transfer paths share one exhaustion boundary.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class TransferTicket:
     """Opaque identity of one submitted transfer.
@@ -704,6 +750,12 @@ class _TierRecord:
     """How many times this block has been pulled back onto the device."""
     spills: int = 0
     """How many times this block has been pushed out to the host."""
+    quarantined: bool = False
+    """A transfer failed or was cancelled; destination owners are held until
+    a quiescence proof releases them. While set, neither tier publishes the
+    destination as authoritative and the record refuses new work."""
+    budget_held: bool = False
+    """Whether the tier holds in-flight staging bytes from the shared budget."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -756,6 +808,8 @@ class HostTierSnapshot:
     promotion_aborts_total: int
     dropped_host_blocks_total: int
     """Host entries discarded because the mirror was full or a chain vanished."""
+    quarantined_blocks: int
+    """Blocks whose failed/cancelled transfer still holds destination owners."""
     transfers: TransferMetrics
 
     @property
@@ -785,10 +839,12 @@ class TierManager:
         allocator: PageAllocator,
         engine: TransferEngine,
         config: TieringConfig,
+        budget: TransferBudget | None = None,
     ) -> None:
         self._allocator = allocator
         self._engine = engine
         self._config = config
+        self._budget = budget
         self._slots = HostSlotPool(config.host_capacity_pages)
         self._records: dict[PrefixBlockIdentity, _TierRecord] = {}
         self._by_ticket: dict[int, PrefixBlockIdentity] = {}
@@ -864,6 +920,12 @@ class TierManager:
                     record.state = TierState.DEVICE
                     record.device_page = info.page
                 elif record.state is TierState.PROMOTING:
+                    if record.quarantined:
+                        # A failed promotion keeps its RESERVED destination
+                        # until a quiescence proof; the device copy that just
+                        # reappeared is already authoritative, and the
+                        # rollback happens in the quarantine settlement.
+                        continue
                     # The promotion raced a recompute and lost; roll it back.
                     self._abort_promotion(record)
                     self._release_host_slot(record)
@@ -924,6 +986,83 @@ class TierManager:
         """Whether a block currently lives only in the host tier."""
         return self.placement(identity) is TierState.HOST
 
+    def readiness(self, identity: PrefixBlockIdentity) -> ReadinessState | None:
+        """Readiness of one tracked block, or None when the tier is untracked.
+
+        None means the tier has never seen this identity: a cached block the
+        next ``reconcile`` has not yet registered. A cache page is physically
+        device-resident by construction, so callers treat None as device-valid;
+        every state the tier does track is authoritative.
+
+        The projection pins the R12B contract: ``EVICTING`` stays device-valid
+        (the copy only reads), ``PROMOTING`` is transfer-pending (the reserved
+        destination is not readable and no published copy exists yet), a
+        quarantined record is failed/cancelled, and ``HOST`` is host-valid
+        only -- a host-resident block must never be bound as a device page.
+        """
+
+        with self._lock:
+            record = self._records.get(identity)
+            if record is None:
+                return None
+            return self._record_readiness(record)
+
+    @staticmethod
+    def _record_readiness(record: _TierRecord) -> ReadinessState:
+        if record.quarantined:
+            return ReadinessState.FAILED_CANCELLED
+        if record.state is TierState.HOST:
+            return ReadinessState.HOST_VALID
+        if record.state is TierState.PROMOTING:
+            return ReadinessState.TRANSFER_PENDING
+        if record.state is TierState.DEVICE:
+            return ReadinessState.DEVICE_VALID
+        assert record.state is TierState.EVICTING
+        return ReadinessState.DEVICE_VALID
+
+    def page_readiness(self, page: KVPageHandle) -> ReadinessState:
+        """Readiness of one physical page for a device read.
+
+        Untracked pages (ordinary request-owned or cache pages the tier has
+        never moved) are device-valid by construction; the tier only knows
+        pages it touched. A page that is a promotion destination in flight is
+        RESERVED and never device-readable, which is exactly the state the
+        attach path must refuse to bind.
+        """
+
+        with self._lock:
+            for record in self._records.values():
+                if record.device_page != page:
+                    continue
+                if record.quarantined:
+                    return ReadinessState.FAILED_CANCELLED
+                if record.state is TierState.PROMOTING:
+                    return ReadinessState.TRANSFER_PENDING
+                return ReadinessState.DEVICE_VALID
+            return ReadinessState.DEVICE_VALID
+
+    def host_child(
+        self,
+        parent: PrefixBlockIdentity | None,
+        block_token_ids: tuple[int, ...],
+    ) -> PrefixBlockIdentity | None:
+        """Identity of the host-resident child block matching ``block_token_ids``.
+
+        Promotion is chain-anchored: a host block can only re-enter the cache
+        once its parent is device resident, so a continuation is looked up
+        parent-by-parent. Registration order breaks ties deterministically.
+        """
+
+        with self._lock:
+            for identity, record in self._records.items():
+                if (
+                    record.state is TierState.HOST
+                    and record.parent_identity == parent
+                    and record.block_token_ids == block_token_ids
+                ):
+                    return identity
+            return None
+
     def begin_eviction(
         self,
         info: CachedBlockInfo,
@@ -969,6 +1108,7 @@ class TierManager:
             record.position_at_submit = (info.last_access, info.terminal, info.children)
             record.release_anchor = release_anchor
             try:
+                self._acquire_budget(record)
                 ticket = self._engine.submit(
                     TransferDirection.DEVICE_TO_HOST,
                     device_page=self._allocator.physical_id(info.page).value,
@@ -1015,6 +1155,7 @@ class TierManager:
             record.device_page = page
             record.issue_epoch = issue_epoch
             try:
+                self._acquire_budget(record)
                 ticket = self._engine.submit(
                     TransferDirection.HOST_TO_DEVICE,
                     device_page=self._allocator.physical_id(page).value,
@@ -1055,8 +1196,12 @@ class TierManager:
                     continue
                 record.ticket = None
                 if outcome.state is TransferState.FAILED:
-                    self._abort(record, by_identity)
+                    # A failed copy must never make its destination valid, and
+                    # an unproven quiescence means nobody may assume the copy
+                    # is dead: hold every destination owner in quarantine.
+                    self._quarantine(record)
                     continue
+                self._release_budget(record)
                 if record.state is TierState.EVICTING:
                     settled = self._settle_eviction(record, by_identity)
                     if settled is not None:
@@ -1074,7 +1219,40 @@ class TierManager:
                 ready = self._settle_promotion(record, by_identity)
                 if ready is not None:
                     promoted.append(ready)
+            if drain:
+                # A drained engine has a quiescent copy stream: no partial
+                # write can still be in flight, so quarantined destinations
+                # can finally be rolled back without racing a live copy.
+                self._settle_quarantined(by_identity)
             return tuple(evicted), tuple(promoted)
+
+    def _quarantine(self, record: _TierRecord) -> None:
+        """Mark a failed transfer: destination owners stay held, work refused.
+
+        The record keeps its transient placement and every destination
+        resource: an eviction keeps the host slot (its bytes may be partially
+        written), a promotion keeps the RESERVED page. In-flight staging is
+        handed back immediately -- the copy is dead as a *transfer*, but its
+        destination resources are reclaimed only at the quiescence proof.
+        """
+
+        self._forget_ticket(record)
+        record.copy_landed = False
+        record.quarantined = True
+        self._release_budget(record)
+
+    def _settle_quarantined(
+        self,
+        by_identity: dict[PrefixBlockIdentity, CachedBlockInfo],
+    ) -> None:
+        """Release every quarantined record after a proven-quiet copy stream."""
+
+        for identity in [
+            identity for identity, record in self._records.items() if record.quarantined
+        ]:
+            record = self._records[identity]
+            record.quarantined = False
+            self._abort(record, by_identity)
 
     def publish_promotion(
         self,
@@ -1095,6 +1273,7 @@ class TierManager:
             record = self._records.get(identity)
             if record is None or record.state is not TierState.PROMOTING:
                 raise InvalidStateTransitionError("block is not awaiting promotion publication")
+            self._release_budget(record)
             self._release_host_slot(record)
             record.state = TierState.DEVICE
             record.device_page = device_page
@@ -1193,6 +1372,9 @@ class TierManager:
                 spill_aborts_total=self._spill_aborts_total,
                 promotion_aborts_total=self._promotion_aborts_total,
                 dropped_host_blocks_total=self._dropped_host_blocks_total,
+                quarantined_blocks=sum(
+                    1 for record in self._records.values() if record.quarantined
+                ),
                 transfers=self._engine.metrics,
             )
 
@@ -1221,6 +1403,8 @@ class TierManager:
                     raise InvariantViolationError(
                         f"tier state {record.state.name} owns the wrong tier resources"
                     )
+                if record.quarantined and record.ticket is not None:
+                    raise InvariantViolationError("a quarantined record still holds a ticket")
                 if record.tier_request_ref and record.state is not TierState.EVICTING:
                     raise InvariantViolationError("tier request ref outlived its eviction")
                 if record.host_slot is not None:
@@ -1368,6 +1552,7 @@ class TierManager:
         """
 
         self._release_host_slot(record)
+        self._release_budget(record)
         safe_epoch = max(self._allocator.current_epoch, record.issue_epoch)
         self._release_tier_request_ref(record, safe_epoch=safe_epoch)
         self._forget_ticket(record)
@@ -1390,6 +1575,7 @@ class TierManager:
         page = record.device_page
         record.device_page = None
         record.state = TierState.HOST
+        self._release_budget(record)
         self._forget_ticket(record)
         record.copy_landed = False
         self._promotion_aborts_total += 1
@@ -1401,6 +1587,36 @@ class TierManager:
             return
         if meta.allocation_state is PageAllocationState.RESERVED:
             self._allocator.rollback_reserved([page])
+
+    def _release_budget(self, record: _TierRecord) -> None:
+        """Hand a record's in-flight staging bytes back to the shared budget.
+
+        Idempotent: the marker lives on the record, and every terminal path
+        (settle, abort, quarantine) funnels through exactly one release.
+        """
+
+        if not record.budget_held or self._budget is None:
+            record.budget_held = False
+            return
+        record.budget_held = False
+        nbytes = int(self._engine.bytes_per_page)
+        if nbytes > 0:
+            self._budget.release(record.identity, nbytes)
+
+    def _acquire_budget(self, record: _TierRecord) -> None:
+        """Charge one page copy against the shared in-flight budget, if any.
+
+        Exhaustion raises the budget's own error; the caller rolls the record
+        back so a saturated budget produces backpressure, never a stuck state.
+        """
+
+        if self._budget is None:
+            return
+        nbytes = int(self._engine.bytes_per_page)
+        if nbytes <= 0:
+            return
+        self._budget.acquire(record.identity, nbytes)
+        record.budget_held = True
 
     def _forget_ticket(self, record: _TierRecord) -> None:
         """Drop a record's ticket and its reverse index entry together.

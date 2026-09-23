@@ -21,6 +21,14 @@ _NUM_WARPS = 8
 _BLOCK_SIZE = 1024
 _SUPPORTED_DTYPES = compute_torch_dtypes()
 
+# 1 / sqrt(2), used by exact GELU (erf form).
+_GELU_KALPHA = tl.constexpr(0.7071067811865475)
+# tanh-approximate GELU constants.
+_GELU_TANH_KALPHA = tl.constexpr(0.044715)
+_GELU_TANH_KBETA = tl.constexpr(0.7978845608028654)
+# Quick-GELU / gelu_quick_act constant.
+_QUICK_GELU_ALPHA = tl.constexpr(1.702)
+
 
 @triton.jit
 def _act_and_mul_kernel(
@@ -43,10 +51,10 @@ def _act_and_mul_kernel(
     if ACTIVATION == 0:
         activated_f32 = x_f32 / (1.0 + tl.exp(-x_f32))
     elif ACTIVATION == 1:
-        activated_f32 = x_f32 * (0.5 * (1.0 + tl.erf(x_f32 * 0.7071067811865476)))
+        activated_f32 = x_f32 * (0.5 * (1.0 + tl.erf(x_f32 * _GELU_KALPHA)))
     else:
         x_cubed = x_f32 * x_f32 * x_f32
-        cdf = 0.5 * (1.0 + tanh(0.7978845608028654 * (x_f32 + 0.044715 * x_cubed)))
+        cdf = 0.5 * (1.0 + tanh(_GELU_TANH_KBETA * (x_f32 + _GELU_TANH_KALPHA * x_cubed)))
         activated_f32 = x_f32 * cdf
 
     # Match activation<T>: FP32 transcendental evaluation followed by T cast.
@@ -68,7 +76,7 @@ def _gelu_quick_kernel(
     mask = offsets < n_elements
     x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
     x_f32 = x.to(tl.float32)
-    activated_f32 = x_f32 / (1.0 + tl.exp(-1.702 * x_f32))
+    activated_f32 = x_f32 / (1.0 + tl.exp(-_QUICK_GELU_ALPHA * x_f32))
     tl.store(output_ptr + offsets, activated_f32.to(x.dtype), mask=mask)
 
 
@@ -87,10 +95,10 @@ def _gelu_kernel(
     x_f32 = x.to(tl.float32)
 
     if ACTIVATION == 1:
-        activated_f32 = x_f32 * (0.5 * (1.0 + tl.erf(x_f32 * 0.7071067811865476)))
+        activated_f32 = x_f32 * (0.5 * (1.0 + tl.erf(x_f32 * _GELU_KALPHA)))
     else:
         x_cubed = x_f32 * x_f32 * x_f32
-        cdf = 0.5 * (1.0 + tanh(0.7978845608028654 * (x_f32 + 0.044715 * x_cubed)))
+        cdf = 0.5 * (1.0 + tanh(_GELU_TANH_KBETA * (x_f32 + _GELU_TANH_KALPHA * x_cubed)))
         activated_f32 = x_f32 * cdf
 
     tl.store(output_ptr + offsets, activated_f32.to(x.dtype), mask=mask)
@@ -244,7 +252,7 @@ def _gelu_quick_ref(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x = input.float()
-    res = (x / (1.0 + torch.exp(-1.702 * x))).to(input.dtype)
+    res = (x / (1.0 + torch.exp(-_QUICK_GELU_ALPHA.value * x))).to(input.dtype)
     if out is not None:
         out.copy_(res)
         return out

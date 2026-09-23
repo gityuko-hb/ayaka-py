@@ -17,6 +17,7 @@ from ayaka.request.stream import OutputEvent, ResolvedStopPolicy, TokenUsage
 from ayaka.sched.outcome import FinishReason
 
 if TYPE_CHECKING:
+    from ayaka.runtime.collection import OutputListener
     from ayaka.tokenizers.detokenizer import IncrementalDetokenizer
     from ayaka.tokenizers.process_pool import ProcessDetokenizer, ProcessTokenizerPool
     from ayaka.tokenizers.service import TokenizerService
@@ -40,6 +41,7 @@ class _OutputState:
     decoder: IncrementalDetokenizer | ProcessDetokenizer | None
     text: str = ""
     events: list[OutputEvent] = field(default_factory=list)
+    child_index: int | None = None
 
 
 class OutputProcessor:
@@ -58,16 +60,31 @@ class OutputProcessor:
         self._tokenizer = tokenizer
         self._eos_token_ids = tuple(eos_token_ids)
         self._states: dict[str, _OutputState] = {}
+        self._listener: OutputListener | None = None
 
     @property
     def text_stops_supported(self) -> bool:
         return self._tokenizer is not None
 
+    def set_listener(self, listener: OutputListener | None) -> None:
+        """Attach a push listener; it fires on the engine thread mid-step.
+
+        Must never raise and never block — the collector contract. The
+        pull-based ``events()`` history is unchanged, so both delivery models
+        can coexist.
+        """
+        self._listener = listener
+
     @property
     def eos_token_ids(self) -> tuple[int, ...]:
         return self._eos_token_ids
 
-    def register(self, request: Request) -> None:
+    def register(self, request: Request, *, child_index: int | None = None) -> None:
+        """Register one request incarnation's output state.
+
+        ``child_index`` marks a parallel-sampling child; its published events
+        carry the index so a parent stream can interleave children.
+        """
         request_id = str(request.request_id)
         if request_id in self._states:
             raise ValueError(f"request {request_id!r} already registered")
@@ -92,6 +109,7 @@ class OutputProcessor:
             policy=policy,
             prompt_tokens=request.prompt_len,
             decoder=decoder,
+            child_index=child_index,
         )
 
     def forget(self, request_id: str) -> None:
@@ -130,16 +148,18 @@ class OutputProcessor:
         if state.decoder is not None and reason is not None:
             delta += state.decoder.finish().delta
         state.text += delta
-        state.events.append(
-            OutputEvent(
-                request_id=request_id,
-                sequence_epoch=sequence_epoch,
-                event_index=len(state.events),
-                delta=delta,
-                usage=TokenUsage(prompt_tokens, generated_tokens),
-                finish_reason=reason,
-            )
+        event = OutputEvent(
+            request_id=request_id,
+            sequence_epoch=sequence_epoch,
+            event_index=len(state.events),
+            delta=delta,
+            usage=TokenUsage(prompt_tokens, generated_tokens),
+            finish_reason=reason,
+            child_index=state.child_index,
         )
+        state.events.append(event)
+        if self._listener is not None:
+            self._listener.on_output_event(event)
         if reason is None:
             return None
         return FinishDecision(request_id, reason, "stop policy matched")

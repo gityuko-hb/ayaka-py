@@ -22,6 +22,7 @@ from typing import Any
 from ayaka.executor.ticket import TicketState
 from ayaka.kvcache.manager import KVCapacityError
 from ayaka.memory.buffer import BufferAllocator
+from ayaka.memory.tiering import TransferBudgetExhausted
 from ayaka.plan import WorkspaceRequest
 from ayaka.prefix.interface import ValidResume
 from ayaka.types import MemoryOwner, MemoryTier
@@ -31,12 +32,14 @@ from ayaka.utils.validation import require_int
 _TRANSFER_IDS = count(1)
 
 
-class TransferCreditError(RuntimeError):
+class TransferCreditError(TransferBudgetExhausted):
     """Host transfer credits would be exceeded; no ticket was admitted.
 
-    Its own type rather than ``KVCapacityError``: credit exhaustion is a host
-    transfer-budget outcome, not a KV page-capacity outcome, and callers that
-    retry on one must not silently retry the other.
+    A subclass of :class:`~ayaka.memory.tiering.TransferBudgetExhausted` so
+    the tier and the prefix transfer path share one exhaustion boundary. Its
+    own name stays for callers that must not silently retry a KV page-capacity
+    failure: credit exhaustion is a host transfer-budget outcome, not a KV
+    page-capacity outcome.
     """
 
 

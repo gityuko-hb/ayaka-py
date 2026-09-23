@@ -59,8 +59,11 @@ from ayaka.memory.tiering import (
     HostKVStorage,
     HostTierSnapshot,
     PromotedBlock,
+    ReadinessState,
     TieringConfig,
     TierManager,
+    TransferBudget,
+    TransferBudgetExhausted,
     TransferEngine,
     build_transfer_engine,
 )
@@ -113,6 +116,7 @@ class RuntimeMemoryManager:
         tiering: TieringConfig | None = None,
         host_storage: HostKVStorage | None = None,
         transfer_engine: TransferEngine | None = None,
+        transfer_budget: TransferBudget | None = None,
     ) -> None:
         if total_pages < 2:
             raise ValueError("at least two pages are required, including padding")
@@ -142,6 +146,7 @@ class RuntimeMemoryManager:
             tiering,
             host_storage=host_storage,
             transfer_engine=transfer_engine,
+            transfer_budget=transfer_budget,
         )
 
         self._transactions: dict[int, TransactionRecord] = {}
@@ -166,6 +171,7 @@ class RuntimeMemoryManager:
         *,
         host_storage: HostKVStorage | None,
         transfer_engine: TransferEngine | None,
+        transfer_budget: TransferBudget | None = None,
     ) -> TierManager | None:
         """Construct the optional host tier, or return None when it is off.
 
@@ -191,7 +197,12 @@ class RuntimeMemoryManager:
                 )
                 self.host_storage = mirror
             engine = build_transfer_engine(mirror)
-        return TierManager(allocator=self.allocator, engine=engine, config=config)
+        return TierManager(
+            allocator=self.allocator,
+            engine=engine,
+            config=config,
+            budget=transfer_budget,
+        )
 
     @property
     def tiering_enabled(self) -> bool:
@@ -477,10 +488,12 @@ class RuntimeMemoryManager:
 
         This uses the same canonical cache refs, pressure eviction and accounting
         as complete-page caching. Tiered checkpoint restore is a separate policy.
+
+        With tiering enabled, publication still requires every published page
+        to be device-readable right now: a page the tier is moving or holds
+        quarantined blocks publication instead of advertising unreadable bytes.
         """
         with self._lock:
-            if self.tiering_enabled:
-                raise ValueError("partial resume requires resident KV")
             state = self.get_sequence(sequence)
             if (
                 state.busy
@@ -492,17 +505,35 @@ class RuntimeMemoryManager:
             if len(tokens) > state.committed_tokens:
                 raise ValueError("prefix exceeds completed KV")
             entries = state.page_table[: div_ceil(len(tokens), self.page_size)]
+            if self._tier is not None:
+                for entry in entries:
+                    if self._tier.page_readiness(entry.page) is not ReadinessState.DEVICE_VALID:
+                        return None
             return self.prefix_cache.insert_resume(
                 tokens, tuple(e.page for e in entries), context=context
             )
 
-    def attach_resume(self, sequence: SequenceHandle, match: ValidResume) -> int:
+    def attach_resume(
+        self,
+        sequence: SequenceHandle,
+        match: ValidResume,
+        *,
+        token_ids: Sequence[int] | None = None,
+    ) -> int:
         """Acquire canonical cache refs as request ownership before publishing progress.
 
         A capability that revalidates cleanly but cannot fit the sequence limit
         raises ``PrefixCapabilityStaleError`` so ``acquire`` reports a miss.
         Sequence-state violations (busy, non-empty, stale) propagate: they are
         caller bugs, not cache misses.
+
+        With tiering enabled the capability is trimmed to its device-readable
+        boundary first: a handle alone never implies device-readable bytes, so
+        only a prefix whose every block is device-valid is attached. The host
+        continuation of ``token_ids`` -- the full prompt candidate the caller
+        wants to execute -- is then queued for asynchronous promotion. The
+        return value is the attached position, which may be lower than the
+        match's own boundary.
         """
         with self._lock, self.sequences.mutate(sequence) as state:
             if state.committed_tokens or state.page_table.entries:
@@ -519,11 +550,89 @@ class RuntimeMemoryManager:
                 and match.logical_position > self.max_sequence_tokens
             ):
                 raise PrefixCapabilityStaleError("resume exceeds sequence limit")
-            entries = self.prefix_cache.acquire_resume(match)
+            if self._tier is None:
+                entries = self.prefix_cache.acquire_resume(match)
+                attached = match.logical_position
+            else:
+                entries, attached = self._attach_device_valid_resume_locked(match, token_ids)
             state.page_table.entries = list(entries)
-            state.committed_tokens = match.logical_position
+            state.committed_tokens = attached
             state.version += 1
-            return match.logical_position
+            return attached
+
+    def _attach_device_valid_resume_locked(
+        self, match: ValidResume, token_ids: Sequence[int] | None
+    ) -> tuple[tuple[PageTableEntry, ...], int]:
+        """Trim a resume to its device-valid boundary and queue the tail.
+
+        Every entry in the trimmed prefix is revalidated and ref-acquired
+        under the cache lock, so the returned table is safe to bind. The
+        queued promotion is best effort: a saturated device or host tier
+        simply leaves the tail host-resident for a later pass.
+        """
+
+        identities = self.prefix_cache.chain_identities(match)
+        if identities is None:
+            raise PrefixCapabilityStaleError("resume is stale")
+        assert self._tier is not None
+        ready = 0
+        for index, identity in enumerate(identities):
+            readiness = self._tier.readiness(identity)
+            if readiness is None or readiness is ReadinessState.DEVICE_VALID:
+                ready = index + 1
+                continue
+            break
+        if ready == len(identities):
+            entries = self.prefix_cache.acquire_resume(match)
+        elif ready == 0:
+            raise PrefixCapabilityStaleError("resume has no device-valid boundary")
+        else:
+            entries = self.prefix_cache.acquire_resume_prefix(match, pages=ready)
+        attached = sum(entry.valid_tokens for entry in entries)
+        continuation = () if token_ids is None else tuple(token_ids)[attached:]
+        self._queue_host_promotions_locked(
+            identities[:ready],
+            remaining=continuation,
+        )
+        return entries, attached
+
+    def _queue_host_promotions_locked(
+        self,
+        attached_identities: tuple[PrefixBlockIdentity, ...],
+        *,
+        remaining: tuple[int, ...],
+    ) -> int:
+        """Begin promoting host blocks that continue an attached boundary.
+
+        A host block can only re-enter the cache once its parent is device
+        resident, so continuations are matched block by block from the last
+        attached identity. Copies resolve asynchronously through
+        :meth:`poll_transfers`; zero submissions is an ordinary capacity
+        outcome, never an error.
+        """
+
+        assert self._tier is not None
+        if not remaining:
+            return 0
+        started = 0
+        identity = attached_identities[-1] if attached_identities else None
+        page_size = self.page_size
+        for start in range(0, len(remaining), page_size):
+            if started >= self._tier.config.max_promotion_blocks:
+                break
+            block = tuple(remaining[start : start + page_size])
+            child = self._tier.host_child(identity, block)
+            if child is None:
+                break
+            try:
+                ticket = self._tier.begin_promotion(child)
+            except TransferBudgetExhausted:
+                break
+            if ticket is None:
+                break
+            started += 1
+            identity = child
+        return started
 
     def privatize_prefix_tail(self, sequence: SequenceHandle) -> bool:
         """Relinquish cache-only sharing when COW cannot fit in resident capacity.
@@ -857,7 +966,13 @@ class RuntimeMemoryManager:
                 break
             chain = self._pruning_chain(leaf, by_identity)
             for position, info in enumerate(chain):
-                ticket = self._tier.begin_eviction(info, release_anchor=position == 0)
+                try:
+                    ticket = self._tier.begin_eviction(info, release_anchor=position == 0)
+                except TransferBudgetExhausted:
+                    # A saturated staging budget is backpressure, never a
+                    # weaker pressure path: stop the cascade and let the
+                    # ordinary drop loop take the remaining capacity.
+                    return submitted
                 if ticket is None:
                     # A partial cascade is safe: whatever the release prunes
                     # without a host copy is simply lost, exactly as it would
@@ -902,6 +1017,48 @@ class RuntimeMemoryManager:
         before = self._kv_prefix_evictions_total
         self.poll_transfers(drain=True)
         return self._kv_prefix_evictions_total - before
+
+    def shutdown_tier(self) -> None:
+        """Drain every tier transfer and settle quarantined destinations.
+
+        Shutdown-only quiescence proof: the copy stream is synchronized, so a
+        failed transfer's partially written destination is safe to reclaim.
+        Called from the logical facade before slab teardown; afterwards the
+        tier snapshot must report no quarantined blocks and the leak report
+        must stay clean.
+        """
+
+        with self._lock:
+            if self._tier is None:
+                return
+            self.poll_transfers(drain=True)
+            self._tier.assert_invariants()
+            snapshot = self._tier.snapshot()
+            if snapshot.quarantined_blocks:
+                raise InvariantViolationError(
+                    f"{snapshot.quarantined_blocks} tier blocks stayed quarantined "
+                    "after shutdown drain"
+                )
+
+    def release_tier(self) -> None:
+        """Shutdown-only teardown of the tier and its host mirror.
+
+        Requires a settled tier (no quarantined blocks): the mirror tensors
+        and the engine are dropped, so the pinned mirror memory is freed
+        deterministically at resource teardown. The allocator keeps every
+        page identity it ever owned; the slab capacity is unchanged.
+        """
+
+        with self._lock:
+            if self._tier is None:
+                return
+            self._tier.assert_invariants()
+            if self._tier.snapshot().quarantined_blocks:
+                raise InvariantViolationError(
+                    "tier still holds quarantined blocks; drain before release"
+                )
+            self._tier = None
+            self.host_storage = None
 
     def _reconcile_tier_locked(self) -> None:
         """Refresh tier placement records from the cache's current contents."""

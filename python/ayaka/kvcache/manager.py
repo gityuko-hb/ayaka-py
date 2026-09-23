@@ -232,6 +232,19 @@ class LogicalKVManager:
         self._require_open()
         return self.backend.reclaim_deferred()
 
+    def shutdown_transfers(self) -> None:
+        """Drain every tier transfer and release quarantined destinations.
+
+        Shutdown-only: the copy stream is synchronized, so a failed transfer's
+        partially written destination can finally be reclaimed. Tiering-off
+        backends are a no-op. Must run before slab teardown; after it, the
+        tier leak report must be clean.
+        """
+        self._require_open()
+        backend = self.backend
+        if isinstance(backend, RuntimeMemoryManager):
+            backend.shutdown_tier()
+
     def evict_prefixes_for_pressure(self, required_pages: int) -> MemoryPressureResult:
         """Release cache-only pages under reservation pressure."""
         self._require_open()
@@ -278,8 +291,9 @@ class LogicalKVManager:
         if len({id(lease.storage) for lease in self.storages.values()}) != len(self.storages):
             raise ValueError("independent group page namespaces cannot share a slab")
         if isinstance(self.backend, RuntimeMemoryManager):
-            if self.backend.tiering_enabled:
-                raise ValueError("P2 requires resident KV; tiering readiness is unsupported")
+            # Homogeneous tiering is certified from R12B: readiness states,
+            # transfer ownership, ledger accounting and quarantine are all
+            # enforced on the backend before any sequence binds pages.
             expected = {"default": self.backend.storage}
         else:
             expected = self.backend.storages
@@ -379,10 +393,15 @@ class LogicalKVManager:
         ownership (after transfers retire) so the leak check can pass. A
         pending transfer refuses the close; retire it first. Callers then
         close the storage leases explicitly.
+
+        With tiering, the drain runs first: a failed transfer keeps its
+        destination owners until the copy stream is proven quiet, and the
+        leak check can only pass once the settlement released them.
         """
         if self.closed:
             return
         if isinstance(self.backend, RuntimeMemoryManager):
+            self.backend.shutdown_tier()
             service = self._prefix_service
             if service is not None and not service.closed and not service.close():
                 raise RuntimeError("prefix service still has active transfers")

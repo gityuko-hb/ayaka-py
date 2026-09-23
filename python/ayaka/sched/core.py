@@ -12,7 +12,6 @@ import time
 from abc import abstractmethod
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ayaka.configs.base import ConfigError
@@ -21,7 +20,8 @@ from ayaka.executor.ticket import ExecutionTicket, TicketId
 from ayaka.handles import SequenceHandle
 from ayaka.plan import SamplingPlan
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
-from ayaka.request.schema import Request, RequestId
+from ayaka.request.parallel import ParentRequestRegistry, expand_parallel_request
+from ayaka.request.schema import Request
 from ayaka.sampling.logprobs import LogprobMode
 from ayaka.sched.base import BaseScheduler
 from ayaka.sched.interfaces import OverloadedError, RequestPreparer, SequenceAllocator, StepRuntime
@@ -93,6 +93,9 @@ class SchedulerCore(BaseScheduler):
         self._sequences: dict[str, SequenceHandle] = {}
         # One observation per request, keyed for O(1) dedup on report.
         self._pending: dict[str, RequestReport] = {}
+        # Parallel-sampling families: parent -> children, with remaining-set
+        # tracking so parent bookkeeping dies with the last settled child.
+        self._parents = ParentRequestRegistry()
 
         # Multiple adopted-but-unsettled tickets may exist at once (pipeline
         # microbatches / overlap). Entries are keyed by ticket id; the union
@@ -121,30 +124,79 @@ class SchedulerCore(BaseScheduler):
     ) -> RequestLifecycle:
         """Validate, bind a sequence, and enqueue the request.
 
-        n > 1 mở rộng tại admission thành n request con độc lập
+        n > 1 expands at admission into n independent children
         ``f"{id}#c{i}"`` — seed riêng, stream RNG riêng, lifecycle riêng
         (nguyên tắc "expand at admission" thay vì fork động giữa chừng).
-        Prompt KV bị NHÂN BẢN cho mỗi child — chưa có prefix sharing (paged
-        runtime là backlog). Trả lifecycle của child đầu; caller thấy token
-        theo child id. ``defer_to_remote_kv`` dừng ở WAITING_REMOTE_KV; một
+        Capacity được pre-reserve cho cả family và rollback toàn bộ nếu
+        admission thất bại giữa chừng (không còn half-admit). Prompt KV bị
+        NHÂN BẢN cho mỗi child — chưa có prefix sharing (paged runtime là
+        backlog). Trả lifecycle của child đầu; caller thấy token theo child
+        id. ``defer_to_remote_kv`` dừng ở WAITING_REMOTE_KV; một
         RemoteKVPending registry phải chủ động cho request đi tiếp.
         """
         if request.sampling.n > 1:
-            first: RequestLifecycle | None = None
-            for index in range(request.sampling.n):
-                child_seed = (
-                    None if request.sampling.seed is None else request.sampling.seed + index
-                )
-                child = Request(
-                    RequestId(f"{request.request_id}#c{index}"),
-                    request.prompt_token_ids,
-                    sampling=replace(request.sampling, n=1, seed=child_seed),
-                    stop=request.stop,
-                )
-                lifecycle = self.add_request(child, defer_to_remote_kv=defer_to_remote_kv)
-                first = first or lifecycle
+            return self._add_parallel(request, defer_to_remote_kv=defer_to_remote_kv)
+        return self._add_single(request, defer_to_remote_kv=defer_to_remote_kv)
+
+    def _add_parallel(self, request: Request, *, defer_to_remote_kv: bool) -> RequestLifecycle:
+        """Admit an n>1 family atomically: pre-check capacity for all children.
+
+        Every child shares the parent's validated features; only the id and
+        seed differ, so feature validation runs once. On any mid-family
+        failure the already-admitted children are rolled back synchronously.
+        """
+        children = expand_parallel_request(request)
+        self._plan.validate_request(children[0])
+        self._validate_request_features(children[0])
+        self._check_parallel_capacity(len(children))
+        parent_id = str(request.request_id)
+        self._parents.register(parent_id, tuple(str(child.request_id) for child in children))
+        admitted: list[str] = []
+        first: RequestLifecycle | None = None
+        try:
+            for child in children:
+                lifecycle = self._add_single(child, defer_to_remote_kv=defer_to_remote_kv)
+                if first is None:
+                    first = lifecycle
+                admitted.append(str(child.request_id))
             assert first is not None
             return first
+        except BaseException:
+            self._parents.unregister(parent_id)
+            self._rollback_children(admitted)
+            raise
+
+    def _check_parallel_capacity(self, count: int) -> None:
+        cap = self._plan.max_num_requests
+        if cap is not None and self._requests.num_active + count > cap:
+            raise OverloadedError(f"max_num_requests={cap} cannot admit {count} children")
+        queued = self._plan.max_queued_requests
+        if queued is not None and len(self._waiting_ids) + count > queued:
+            raise OverloadedError(f"max_queued_requests={queued} cannot admit {count} children")
+
+    def _rollback_children(self, admitted: Sequence[str]) -> None:
+        """Undo fully admitted children of a failed parallel family."""
+        for request_id in admitted:
+            sequence = self._sequences.pop(request_id, None)
+            if sequence is not None:
+                self._allocator.release(sequence)
+            if self._sampling is not None:
+                self._sampling.release(request_id)
+            self._drop(request_id)
+            self._abort_pending.discard(request_id)
+            self._ordinals.pop(request_id, None)
+            self._pending.pop(request_id, None)
+            self._requests.rollback(request_id)
+
+    def children_of(self, parent_id: str) -> tuple[str, ...] | None:
+        """Child ids of a parallel family, or None for a plain request id."""
+        return self._parents.children_of(parent_id)
+
+    def parent_of(self, request_id: str) -> str | None:
+        """Parent id of a parallel-sampling child, or None."""
+        return self._parents.parent_of(request_id)
+
+    def _add_single(self, request: Request, *, defer_to_remote_kv: bool) -> RequestLifecycle:
         self._plan.validate_request(request)
         self._validate_request_features(request)
         self._check_capacity()
@@ -249,12 +301,18 @@ class SchedulerCore(BaseScheduler):
     def abort(self, request_id: str) -> bool:
         """Cancel one request without poisoning unrelated co-batched requests.
 
-        If the request is already in an adopted mixed batch, only its cancellation
-        token is marked.  The whole execution ticket is cancelled only when every
-        request in that ticket is pending abort.  Sequence release/reporting is
-        deferred until the ticket settles, preserving lease and state-version
-        safety.
+        A parallel parent fans out to every child. If the request is already
+        in an adopted mixed batch, only its cancellation token is marked. The
+        whole execution ticket is cancelled only when every request in that
+        ticket is pending abort. Sequence release/reporting is deferred until
+        the ticket settles, preserving lease and state-version safety.
         """
+        children = self._parents.children_of(request_id)
+        if children is not None:
+            did = False
+            for child in children:
+                did = self.abort(child) or did
+            return did
         lifecycle = self._requests.find(request_id)
         if lifecycle is None or lifecycle.is_terminal:
             return False
@@ -339,10 +397,10 @@ class SchedulerCore(BaseScheduler):
         )
         return self._sequences.pop(request_id, None)
 
-    def flush_reports(self) -> bool:
+    def flush_reports(self) -> SchedulerReport | None:
         """Apply accumulated scheduler observations to LifecycleManager."""
         if not self._pending:
-            return False
+            return None
         self._report_step_id += 1
         pending = tuple(self._pending.values())
         report = SchedulerReport(
@@ -357,7 +415,7 @@ class SchedulerCore(BaseScheduler):
         )
         self._pending.clear()
         self._requests.apply(report)
-        return True
+        return report
 
     # ------------------------------------------------------------------
     # Inflight bookkeeping
@@ -541,6 +599,9 @@ class SchedulerCore(BaseScheduler):
         self._prefilling.pop(request_id, None)
         self._running_remove(request_id)
         self._drop_waiting(request_id)
+        parent_id = self._parents.parent_of(request_id)
+        if parent_id is not None and self._parents.child_finished(request_id) is not None:
+            self._parents.unregister(parent_id)
 
     def _seq_cap(self) -> int:
         return min(self._plan.max_num_seqs, self._plan.capabilities.max_num_seqs)

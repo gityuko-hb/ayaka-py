@@ -21,6 +21,7 @@ from ayaka.request.schema import Request
 from ayaka.request.states import RequestState
 from ayaka.serving.errors import EngineUnavailableError, InvalidRequestError, OverloadedError
 from ayaka.serving.events import GenerationFailed, GenerationFinished, ServingEvent, UsageUpdate
+from ayaka.serving.migration import MigrationController
 from ayaka.serving.parsers import OutputParser
 from ayaka.serving.prepare import GenerationSpec
 from ayaka.serving.stats import ServingStats, UsageRecord
@@ -100,6 +101,7 @@ class ServingService:
         stats: ServingStats | None = None,
         controller=None,
         router=None,
+        migration: MigrationController | None = None,
     ):
         self.engine, self.config = engine, config
         self.stats = stats or ServingStats()
@@ -116,6 +118,8 @@ class ServingService:
         self._controller = controller
         #: Optional KV-aware placement decision before admission (route-only).
         self._router = router
+        #: Optional chờ-KV migration: drives parked requests out of the park.
+        self._migration = migration
         runner = engine.executor.runner
         runner.set_request_source(engine.requests.get, constraints=constraints)
         self._thread = threading.Thread(target=self._run, name="ayaka-engine", daemon=True)
@@ -205,10 +209,17 @@ class ServingService:
             decision = self._router.route(request) if self._router is not None else None
             defer = bool(decision is not None and decision.local and decision.needs_remote_kv)
             if decision is not None and not decision.local:
-                # Route-only milestone: a remote placement has no transport
-                # path yet, so the request stays on this node.
+                # Remote placement has no executor path yet: this node keeps
+                # the request (route-only milestone). A local decision with a
+                # remote KV hit stages a chờ-KV fetch instead.
                 _LOG.debug("router picked remote node %s; served locally", decision.node_id)
             self.engine.submit(request, defer_to_remote_kv=defer)
+            if defer and self._migration is not None:
+                self._migration.stage(
+                    str(request.request_id),
+                    decision.node_id,
+                    prefix_tokens=decision.prefix_tokens,
+                )
         except Exception as exc:
             from ayaka.sched.interfaces import OverloadedError as SchedulerOverloaded
 
@@ -337,6 +348,8 @@ class ServingService:
                     self.engine.step()
                     self._collect()
                     self._gauges()
+                    if self._migration is not None:
+                        self._migration.poll()
                 self._signal.wait(0.001 if self._handles else 0.05)
                 self._signal.clear()
         except BaseException as exc:

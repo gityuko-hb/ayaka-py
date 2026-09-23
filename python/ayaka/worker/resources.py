@@ -7,6 +7,7 @@ Borrowed models are accounted for but are not destroyed by this owner.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 
@@ -45,7 +46,9 @@ from ayaka.memory.capacity import (
 from ayaka.memory.ledger import MemoryLedger, Reservation
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.source import TorchDeviceSource, TorchHostByteSource
+from ayaka.memory.tiering import HostKVStorage, TieringConfig, build_transfer_engine
 from ayaka.memory.workspace import WorkspaceManager
+from ayaka.prefix.transfer import TransferCredits
 from ayaka.runner.buffers import RunnerBuffers, RunnerBufferSpec
 from ayaka.types import DType, MemoryOwner, MemoryTier
 from ayaka.utils.torch_memory import device_memory
@@ -75,6 +78,8 @@ class WorkerResourcePlan:
     staging_bytes: int
     # Logical handles for waiting lifecycle; no KV pages until reservation.
     max_num_requests: int | None = None
+    tiering: TieringConfig | None = None
+    max_inflight_bytes: int | None = None
 
     @property
     def lane(self) -> MemoryLane:
@@ -125,12 +130,19 @@ class WorkerResourcePlan:
         require_int(max_sequences, "max_num_requests", minimum=1)
         budget, kv_budget, total = self.budget()
         index = self.device.index or 0
+        # The host mirror is charged once, at its frozen capacity, before the
+        # ledger exists: a pinned mirror must never exceed the HOST_PINNED
+        # account, and a degraded pageable mirror still has a place to charge.
+        tier = self.tiering
+        mirror_bytes = (
+            self.storage_spec.bytes_per_page * tier.host_capacity_pages if tier is not None else 0
+        )
         ledger = MemoryLedger.for_device(
             device_budget_bytes=budget,
             device_total_bytes=total,
-            host_pinned_bytes=self.staging_bytes,
+            host_pinned_bytes=self.staging_bytes + mirror_bytes,
             device_index=index,
-            host_pageable_bytes=budget if self.lane is MemoryLane.CPU else 0,
+            host_pageable_bytes=budget if self.lane is MemoryLane.CPU else mirror_bytes,
             host_total_bytes=total if self.lane is MemoryLane.CPU else 0,
         )
         with ExitStack() as rollback:
@@ -164,12 +176,60 @@ class WorkerResourcePlan:
                 zero_initialize=True,
             )
             rollback.callback(storage.close)
+            tier_release: Callable[[], None] | None = None
+            host_mirror: HostKVStorage | None = None
+            credits: TransferCredits | None = None
+            engine: object | None = None
+            if tier is not None:
+                host_mirror = HostKVStorage(
+                    storage.storage,
+                    capacity_pages=tier.host_capacity_pages,
+                    pin_memory=self.lane is MemoryLane.CUDA,
+                )
+                # The mirror is page-locked host staging for KV content: the
+                # R01 owner table charges it to WORKSPACE on the host tier
+                # exactly like runner-buffer staging, never as a second KV
+                # residency on the device tier.
+                mirror_reservation = Reservation.backed(
+                    MemoryOwner.WORKSPACE,
+                    "serving.kv.tier",
+                    host_mirror.total_bytes,
+                    tier=claim_tier(
+                        MemoryOwner.WORKSPACE,
+                        lane=self.lane,
+                        pinned_host=self.lane is MemoryLane.CUDA,
+                    ),
+                    device_index=index,
+                )
+                ledger.admit(mirror_reservation)
+                rollback.callback(ledger.release, mirror_reservation.label)
+                # One shared in-flight staging budget for every host copy the
+                # tier makes; the mirror capacity is the default ceiling.
+                credits = TransferCredits(
+                    self.max_inflight_bytes
+                    if self.max_inflight_bytes is not None
+                    else host_mirror.total_bytes
+                )
+                engine = build_transfer_engine(host_mirror)
+
+                def _tier_teardown() -> None:
+                    # The mirror tensors and its ledger charge die together,
+                    # after the manager proved a clean, settled tier.
+                    manager.release_tier()
+                    ledger.release(mirror_reservation.label)
+
+                tier_release = _tier_teardown
+
             manager = RuntimeMemoryManager(
                 total_pages=self.storage_spec.capacity_pages,
                 page_size=self.storage_spec.page_size,
                 max_sequences=max_sequences,
                 max_sequence_tokens=self.max_model_len,
                 storage=storage.storage,
+                tiering=tier,
+                host_storage=host_mirror,
+                transfer_engine=engine,
+                transfer_budget=credits,
             )
             kv = LogicalKVManager(manager, {"default": storage})
             rollback.callback(kv.close)
@@ -225,7 +285,7 @@ class WorkerResourcePlan:
                 activation_bytes=allocator.bytes_by_owner().get(MemoryOwner.ACTIVATION, 0),
                 workspace_ceiling_bytes=self.workspace_ceiling_bytes,
                 graph_bytes=self.graph_bytes,
-                staging_bytes=self.staging_bytes,
+                staging_bytes=self.staging_bytes + mirror_bytes,
                 budget_bytes=budget,
                 kv_budget_bytes=kv_budget,
                 weights_bytes=self.weights_bytes,
@@ -235,7 +295,14 @@ class WorkerResourcePlan:
             )
             kv.bind_capacity(capacity)
             resources = WorkerResources(
-                ledger, kv, (storage,), capacity, workspace, allocator, buffers
+                ledger,
+                kv,
+                (storage,),
+                capacity,
+                workspace,
+                allocator,
+                buffers,
+                tier_release=tier_release,
             )
             rollback.pop_all()
             return resources
@@ -257,6 +324,8 @@ class WorkerResources:
         workspace: WorkspaceManager | None = None,
         allocator: CachingAllocator | None = None,
         buffers: RunnerBuffers | None = None,
+        *,
+        tier_release: Callable[[], None] | None = None,
     ) -> None:
         reconcile_actual_usage(ledger, capacity)
         self.ledger = ledger
@@ -266,6 +335,7 @@ class WorkerResources:
         self.workspace = workspace
         self.allocator = allocator
         self.buffers = buffers
+        self.tier_release = tier_release
         self.closed = False
 
     @property
@@ -290,6 +360,8 @@ class WorkerResources:
             self.kv.close()
         for storage in reversed(self.storages):
             storage.close()
+        if self.tier_release is not None:
+            self.tier_release()
         for owner in (MemoryOwner.WEIGHT, MemoryOwner.COMPILE, MemoryOwner.WORKSPACE):
             self.ledger.release_owner(owner)
         if any(self.ledger.committed(tier) for tier in MemoryTier):

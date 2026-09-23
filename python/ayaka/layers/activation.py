@@ -10,6 +10,11 @@ import torch.nn.functional as F
 from ayaka.layers._common import LayerBackend, check_input, check_out, load_kernel, write_output
 from ayaka.layers.base import BaseLayer
 
+#: Quick-GELU sigmoid slope. Torch-safe mirror of
+#: ``ayaka.kernel.triton.activation._QUICK_GELU_ALPHA`` — kept local so this
+#: module stays importable without Triton/CUDA.
+_QUICK_GELU_ALPHA = 1.702
+
 
 class _Activation(BaseLayer):
     _kernel_name: str
@@ -45,7 +50,7 @@ class _Activation(BaseLayer):
             elif self._kernel_name == "gelu_tanh":
                 result = F.gelu(value, approximate="tanh").to(x.dtype)
             else:
-                result = (value * torch.sigmoid(1.702 * value)).to(x.dtype)
+                result = (value * torch.sigmoid(_QUICK_GELU_ALPHA * value)).to(x.dtype)
         else:
             gate, up = x.chunk(2, dim=-1)
             if self._kernel_name == "silu_and_mul":

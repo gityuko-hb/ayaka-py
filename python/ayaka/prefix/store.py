@@ -14,7 +14,12 @@ from ayaka.exceptions import (
 from ayaka.handles import KVPageHandle, PrefixHandle
 from ayaka.memory.allocator import PageAllocator
 from ayaka.memory.sequence import PageTableEntry
-from ayaka.prefix.identity import PrefixCacheContext, build_identities, full_token_blocks
+from ayaka.prefix.identity import (
+    PrefixBlockIdentity,
+    PrefixCacheContext,
+    build_identities,
+    full_token_blocks,
+)
 from ayaka.prefix.interface import CachedBlockInfo, PrefixCacheSnapshot, PrefixMatch, ValidResume
 from ayaka.prefix.ownership import PrefixOwnershipNode, PrefixOwnershipTable
 from ayaka.prefix.radix import PageRadixIndex, RadixPath
@@ -279,6 +284,44 @@ class RadixPagePrefixCache:
             self._ownership.acquire_request_refs(nodes)
             self._ownership.touch(nodes)
             return match.pages
+
+    def chain_identities(self, match: ValidResume) -> tuple[PrefixBlockIdentity, ...] | None:
+        """Validated identity chain of a borrowed resume, or None when stale.
+
+        Read-only tier bookkeeping aid: it revalidates the capability exactly
+        like ``acquire_resume`` but acquires no reference, so the tier can
+        classify readiness before any ownership changes. A stale capability
+        returns None instead of raising so callers fold it into their miss
+        handling.
+        """
+        with self._lock:
+            try:
+                nodes = self._resolve_resume(match)
+            except PrefixCapabilityStaleError:
+                return None
+            return tuple(node.identity for node in nodes)
+
+    def acquire_resume_prefix(
+        self, match: ValidResume, *, pages: int
+    ) -> tuple[PageTableEntry, ...]:
+        """Acquire request refs on only the first ``pages`` blocks of a resume.
+
+        Tiered attachment trims a match to its device-readable boundary; the
+        trimmed prefix is anchored at a whole block, so a later re-lookup or
+        restore can continue the chain from there. Revalidation and the
+        identity checks are identical to ``acquire_resume``: only the ref
+        acquisition and the returned entries are truncated.
+        """
+        if pages < 1:
+            raise ValueError("acquire_resume_prefix requires at least one page")
+        with self._lock:
+            nodes = self._resolve_resume(match)
+            if pages > len(nodes):
+                raise ValueError("resume has fewer blocks than the requested prefix")
+            prefix_nodes = nodes[:pages]
+            self._ownership.acquire_request_refs(prefix_nodes)
+            self._ownership.touch(prefix_nodes)
+            return match.pages[:pages]
 
     def pin_resume(self, match: ValidResume) -> tuple[PageTableEntry, ...]:
         """Keep spill sources alive independently of cache eviction."""

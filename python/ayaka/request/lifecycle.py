@@ -528,6 +528,16 @@ class LifecycleManager:
             raise ValueError("cannot forget an active request")
         self._finished.pop(request_id, None)
 
+    def rollback(self, request_id: str) -> bool:
+        """Remove an admission-in-progress lifecycle; parallel-family rollback.
+
+        Admission-only undo: the scheduler calls this when a mid-family
+        failure left earlier children registered. Never call for a request
+        that has been scheduled or settled — ``forget`` is the consumed-result
+        path, ``abort`` the normal cancellation path.
+        """
+        return self._active.pop(request_id, None) is not None
+
     def reap(self, *, older_than_ns: int = 0) -> tuple[str, ...]:
         """Drop finished entries whose output has been consumed.
 
