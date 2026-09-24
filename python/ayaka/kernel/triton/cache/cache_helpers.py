@@ -57,6 +57,14 @@ _RAW_INT_DTYPE: Final[dict[int, torch.dtype]] = {
 _E4M3_MAX = tl.constexpr(FP8_E4M3_MAX)
 _E5M2_MAX = tl.constexpr(cast(float, DType.FP8_E5M2.max_finite))
 
+_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS_ENV: Final[str] = "KV_OFFLOAD_MAX_BATCH_DESCRIPTORS"
+_ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS: Final[int] = 8192
+_NVFP4_MSG = (
+    "{what} is implemented in a separate CUDA translation unit "
+    "(nvfp4 kernels) that is not part of cache_kernels.cu, so there is "
+    "no Triton port of it here."
+)
+
 
 def normalize_kv_cache_dtype(value: KVCacheDtype | str) -> KVCacheDtype:
     """Normalize a configuration value into a :class:`KVCacheDtype`.
