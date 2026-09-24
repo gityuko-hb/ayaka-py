@@ -649,7 +649,8 @@ class WeightLoadPlan:
                 d = c.destination_slice
                 h.update(
                     (
-                        f"{w.name}\x1f{w.full_shape}\x1f{w.spec.shape}\x1f{w.shard.kind}"
+                        f"{w.name}\x1f{w.full_shape}\x1f{w.spec.shape}\x1f{w.quant.cache_key}"
+                        f"\x1f{w.shard.kind}"
                         f"\x1f{w.shard.dim}\x1f{w.shard.rank}/{w.shard.world_size}"
                         f"\x1f{c.source.source.tensor_key}\x1f{c.source.source_shape}"
                         f"\x1f{[(x.dim, x.start, x.stop) for x in c.source.source_slices]}"
