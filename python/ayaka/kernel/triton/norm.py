@@ -3,16 +3,32 @@ from __future__ import annotations
 from typing import Any, cast
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import (
+    prepare_output,
+    require_contiguous,
+    require_cuda,
+    require_dtype,
+    require_last_dim_stride1,
+    require_tensor,
+)
 from ayaka.kernel.triton.fp8_compat import (
     e4m3_f32_to_u8,
     e4m3_native_cx,
     fp8_kernel_view,
 )
+from ayaka.kernel.triton.reference.norm import (
+    fused_add_rms_norm_ref,
+    gemma_fused_add_rms_norm_ref,
+    gemma_rms_norm_ref,
+    layer_norm_ref,
+    qk_rms_norm_ref,
+    rms_norm_ref,
+)
+from ayaka.utils.math_utils import FP8_E4M3_MAX
 from ayaka.utils.torch_utils import compute_torch_dtypes
 
 _SUPPORTED_INPUT_DTYPES = compute_torch_dtypes()
@@ -103,7 +119,7 @@ def _rms_norm_quant_kernel(
         scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
         weight = tl.load(weight_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
         output = x * rms_rcp * (weight + WEIGHT_BIAS) * scale_inv
-        output = tl.maximum(-448.0, tl.minimum(output, 448.0))
+        output = tl.maximum(-FP8_E4M3_MAX, tl.minimum(output, FP8_E4M3_MAX))
         if e4m3_native_cx():
             tl.store(output_ptr + row * stride_output + lanes, output.to(tl.float8e4nv), mask=mask)
         else:
@@ -130,7 +146,7 @@ def _rms_norm_quant_kernel(
             )
             weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
             output = x * rms_rcp * (weight + WEIGHT_BIAS) * scale_inv
-            output = tl.maximum(-448.0, tl.minimum(output, 448.0))
+            output = tl.maximum(-FP8_E4M3_MAX, tl.minimum(output, FP8_E4M3_MAX))
             if e4m3_native_cx():
                 tl.store(
                     output_ptr + row * stride_output + offsets,
@@ -230,7 +246,7 @@ def _fused_add_rms_norm_kernel(
         if QUANTIZE:
             scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
             normed *= scale_inv
-            normed = tl.maximum(-448.0, tl.minimum(normed, 448.0))
+            normed = tl.maximum(-FP8_E4M3_MAX, tl.minimum(normed, FP8_E4M3_MAX))
             if e4m3_native_cx():
                 tl.store(
                     output_ptr + row * stride_output + lanes, normed.to(tl.float8e4nv), mask=mask
@@ -274,7 +290,7 @@ def _fused_add_rms_norm_kernel(
             normed = x * rms_rcp * (weight + WEIGHT_BIAS)
             if QUANTIZE:
                 normed *= scale_inv
-                normed = tl.maximum(-448.0, tl.minimum(normed, 448.0))
+                normed = tl.maximum(-FP8_E4M3_MAX, tl.minimum(normed, FP8_E4M3_MAX))
                 if e4m3_native_cx():
                     tl.store(
                         output_ptr + row * stride_output + offsets,
@@ -358,18 +374,14 @@ def _layer_norm_kernel(
 
 
 def _validate_input_tensor(tensor: torch.Tensor, name: str) -> None:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if not tensor.is_cuda:
-        raise ValueError(f"{name} must be a CUDA tensor")
-    if tensor.dtype not in _SUPPORTED_INPUT_DTYPES:
-        raise TypeError(f"{name} dtype must be float16, bfloat16, or float32")
+    require_tensor(tensor, name)
+    require_cuda(tensor, name)
+    require_dtype(tensor, name, _SUPPORTED_INPUT_DTYPES)
     if tensor.ndim < 2:
         raise ValueError(f"{name} must have at least two dimensions")
     if tensor.shape[-1] <= 0:
         raise ValueError(f"{name}'s normalized dimension must be non-empty")
-    if tensor.stride(-1) != 1:
-        raise ValueError(f"{name}'s normalized dimension must be contiguous")
+    require_last_dim_stride1(tensor, name)
 
 
 def _row_layout(tensor: torch.Tensor, name: str) -> tuple[int, int, int]:
@@ -393,14 +405,12 @@ def _validate_weight(
     *,
     require_same_dtype: bool = True,
 ) -> None:
-    if not isinstance(weight, torch.Tensor):
-        raise TypeError("weight must be a torch.Tensor")
+    require_tensor(weight, "weight")
     if not weight.is_cuda or weight.device != input.device:
         raise ValueError("weight and input must be on the same CUDA device")
     if weight.ndim != 1 or weight.numel() != d:
         raise ValueError(f"weight must have shape [{d}]")
-    if not weight.is_contiguous():
-        raise ValueError("weight must be contiguous")
+    require_contiguous(weight, "weight")
     if require_same_dtype and weight.dtype != input.dtype:
         raise TypeError("weight must have the same dtype as input")
     if not require_same_dtype and weight.dtype not in _SUPPORTED_INPUT_DTYPES:
@@ -414,37 +424,22 @@ def _prepare_output_like(
     dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, int]:
     output_dtype = input.dtype if dtype is None else dtype
-    if out is None:
-        output = torch.empty(input.shape, device=input.device, dtype=output_dtype)
-    else:
-        if not isinstance(out, torch.Tensor):
-            raise TypeError("out must be a torch.Tensor")
-        if out.device != input.device:
-            raise ValueError("out and input must be on the same CUDA device")
-        if out.dtype != output_dtype:
-            raise TypeError(f"out must have dtype {output_dtype}")
-        if tuple(out.shape) != tuple(input.shape):
-            raise ValueError("out must have the same shape as input")
-        if out.stride(-1) != 1:
-            raise ValueError("out's final dimension must be contiguous")
-        if out.ndim > 2 and not out.is_contiguous():
-            raise ValueError("out with more than two dimensions must be contiguous")
-        output = out
+    output = prepare_output(input, out, dtype=output_dtype)
+    require_last_dim_stride1(output, "out")
+    if output.ndim > 2:
+        require_contiguous(output, "out")
     stride_output = int(output.stride(0)) if output.ndim == 2 else int(output.shape[-1])
     return output, stride_output
 
 
 def _validate_scale(scale: torch.Tensor, input: torch.Tensor) -> None:
-    if not isinstance(scale, torch.Tensor):
-        raise TypeError("scale must be a one-element CUDA tensor")
+    require_tensor(scale, "scale")
     if not scale.is_cuda or scale.device != input.device:
         raise ValueError("scale and input must be on the same CUDA device")
-    if scale.dtype != torch.float32:
-        raise TypeError("scale must have dtype torch.float32")
+    require_dtype(scale, "scale", (torch.float32,))
     if scale.numel() != 1:
         raise ValueError("scale must contain exactly one element")
-    if not scale.is_contiguous():
-        raise ValueError("scale must be contiguous")
+    require_contiguous(scale, "scale")
 
 
 def _quant_output(
@@ -485,39 +480,11 @@ def _launch_rms_norm(
     return output
 
 
-def _rms_norm_ref(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor | None = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    variance = input.float().pow(2).mean(-1, keepdim=True)
-    res = (input.float() * torch.rsqrt(variance + eps) * weight.float()).to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
-def _gemma_rms_norm_ref(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor | None = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    variance = input.float().pow(2).mean(-1, keepdim=True)
-    res = (input.float() * torch.rsqrt(variance + eps) * (weight.float() + 1.0)).to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
 @custom_op(
     namespace="ayaka",
     name="rms_norm",
     out_shape="input",
-    reference=_rms_norm_ref,
+    reference=rms_norm_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )
@@ -535,7 +502,7 @@ def rms_norm(
     namespace="ayaka",
     name="gemma_rms_norm",
     out_shape="input",
-    reference=_gemma_rms_norm_ref,
+    reference=gemma_rms_norm_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )
@@ -586,25 +553,11 @@ def rms_norm_quant(
     return output
 
 
-def _qk_rms_norm_ref(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor | None = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    variance = input.float().pow(2).mean(-1, keepdim=True)
-    res = (input.float() * torch.rsqrt(variance + eps) * weight.float()).to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
 @custom_op(
     namespace="ayaka",
     name="qk_rms_norm",
     out_shape="input",
-    reference=_qk_rms_norm_ref,
+    reference=qk_rms_norm_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )
@@ -722,42 +675,13 @@ def _fused_add_fake(
     return input, residual
 
 
-def _fused_add_rms_norm_ref(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-5,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    summed = input.float() + residual.float()
-    variance = summed.pow(2).mean(-1, keepdim=True)
-    normed = (summed * torch.rsqrt(variance + eps) * weight.float()).to(input.dtype)
-    residual.copy_(summed)
-    input.copy_(normed)
-    return input, residual
-
-
-def _gemma_fused_add_rms_norm_ref(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-5,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    summed = input.float() + residual.float()
-    variance = summed.pow(2).mean(-1, keepdim=True)
-    scale = weight.float() + 1.0
-    normed = (summed * torch.rsqrt(variance + eps) * scale).to(input.dtype)
-    residual.copy_(summed)
-    input.copy_(normed)
-    return input, residual
-
-
 @custom_op(
     namespace="ayaka",
     name="fused_add_rms_norm",
     mutates_args=["input", "residual"],
     returns_aliases=("input", "residual"),
     fake_impl=_fused_add_fake,
-    reference=_fused_add_rms_norm_ref,
+    reference=fused_add_rms_norm_ref,
     dispatch_key="CUDA",
 )
 def fused_add_rms_norm(
@@ -785,7 +709,7 @@ def fused_add_rms_norm(
     mutates_args=["input", "residual"],
     returns_aliases=("input", "residual"),
     fake_impl=_fused_add_fake,
-    reference=_gemma_fused_add_rms_norm_ref,
+    reference=gemma_fused_add_rms_norm_ref,
     dispatch_key="CUDA",
 )
 def gemma_fused_add_rms_norm(
@@ -834,31 +758,11 @@ def fused_add_rms_norm_quant(
     return output
 
 
-def _layer_norm_ref(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    beta: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    res = F.layer_norm(
-        input.float(),
-        (input.shape[-1],),
-        weight=weight.float() if weight is not None else None,
-        bias=beta.float() if beta is not None else None,
-        eps=eps,
-    ).to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
 @custom_op(
     namespace="ayaka",
     name="layer_norm",
     out_shape="input",
-    reference=_layer_norm_ref,
+    reference=layer_norm_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )

@@ -8,13 +8,26 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import (
+    prepare_output,
+    require_cuda,
+    require_device,
+    require_last_dim_stride1,
+    require_ndim,
+    require_tensor,
+)
 from ayaka.kernel.triton.fp8_compat import (
     e4m3_native_cx,
     e4m3_u8_to_f32,
     e5m2_u8_to_f32,
     fp8_kernel_view,
 )
+from ayaka.kernel.triton.reference.attention import (
+    decode_paged_attention_op_ref,
+    paged_attention_op_ref,
+)
 from ayaka.types import DType
+from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.validation import require_int
 
 _QUERY_DTYPES = (DType.FP16.torch_dtype, DType.BF16.torch_dtype)
@@ -28,22 +41,12 @@ def _require_cuda_tensor(
     device: torch.device | None = None,
     ndim: int | tuple[int, ...] | None = None,
 ) -> None:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if not tensor.is_cuda:
-        raise ValueError(f"{name} must be a CUDA tensor")
-    if device is not None and tensor.device != device:
-        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    require_tensor(tensor, name)
+    require_cuda(tensor, name)
+    if device is not None:
+        require_device(tensor, name, device)
     if ndim is not None:
-        allowed = (ndim,) if isinstance(ndim, int) else ndim
-        if tensor.dim() not in allowed:
-            expected = " or ".join(str(rank) for rank in allowed)
-            raise ValueError(f"{name} must have rank {expected}, got {tensor.dim()}")
-
-
-def _require_unit_inner_stride(tensor: torch.Tensor, name: str) -> None:
-    if tensor.dim() == 0 or tensor.stride(-1) != 1:
-        raise ValueError(f"{name} must have stride(-1) == 1")
+        require_ndim(tensor, name, ndim)
 
 
 def _flatten_nhd_cache(cache: torch.Tensor, name: str, device: torch.device) -> torch.Tensor:
@@ -54,7 +57,7 @@ def _flatten_nhd_cache(cache: torch.Tensor, name: str, device: torch.device) -> 
     """
 
     _require_cuda_tensor(cache, name, device=device, ndim=(3, 4))
-    _require_unit_inner_stride(cache, name)
+    require_last_dim_stride1(cache, name)
     if cache.dim() == 3:
         return cache
     if cache.stride(0) != cache.shape[1] * cache.stride(1):
@@ -73,7 +76,7 @@ def _validate_query_and_caches(
     value_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
     _require_cuda_tensor(query, "query", ndim=3)
-    _require_unit_inner_stride(query, "query")
+    require_last_dim_stride1(query, "query")
     if query.dtype not in _QUERY_DTYPES:
         raise TypeError(f"query dtype must be float16 or bfloat16, got {query.dtype}")
 
@@ -208,17 +211,9 @@ def _prepare_fp8_kernel_caches(
 
 
 def _prepare_output(query: torch.Tensor, output: torch.Tensor | None) -> torch.Tensor:
-    if output is None:
-        return torch.empty_like(query)
-    _require_cuda_tensor(output, "output", device=query.device, ndim=3)
-    if output.shape != query.shape:
-        raise ValueError(
-            f"output shape must match query {tuple(query.shape)}, got {tuple(output.shape)}"
-        )
-    if output.dtype != query.dtype:
-        raise TypeError(f"output dtype must match query dtype {query.dtype}, got {output.dtype}")
-    _require_unit_inner_stride(output, "output")
-    return output
+    result = prepare_output(query, output, name="output", like_name="query")
+    require_last_dim_stride1(result, "output")
+    return result
 
 
 @triton.jit
@@ -754,7 +749,7 @@ def compute_max_num_partitions(
     effective_bound = max_context_len_bucket
     if sliding_window_value:
         effective_bound = min(effective_bound, sliding_window_value)
-    return -(-effective_bound // kv_partition_size)  # ceil div
+    return div_ceil(effective_bound, kv_partition_size)
 
 
 def decode_paged_attention(
@@ -812,7 +807,7 @@ def decode_paged_attention(
     _require_cuda_tensor(attn_logits, "attn_logits", device=query.device, ndim=4)
     if attn_logits.dtype != torch.float32:
         raise TypeError(f"attn_logits must have dtype torch.float32, got {attn_logits.dtype}")
-    _require_unit_inner_stride(attn_logits, "attn_logits")
+    require_last_dim_stride1(attn_logits, "attn_logits")
     required_logits_shape = (batch, num_query_heads, max_num_partitions, head_dim)
     if any(
         actual < required
@@ -936,94 +931,11 @@ def decode_paged_attention(
     return o
 
 
-def _reference_attention(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    indptr: torch.Tensor,
-    indices: torch.Tensor,
-    query_to_request: torch.Tensor,
-    query_positions: torch.Tensor,
-    sm_scale: float,
-    sliding_window: int,
-    sinks: torch.Tensor | None,
-    key_scale: torch.Tensor | None,
-    value_scale: torch.Tensor | None,
-) -> torch.Tensor:
-    """Plain-Torch reference used by the custom-op verification path."""
-
-    key = key_cache.reshape(-1, key_cache.shape[-2], key_cache.shape[-1]).float()
-    value = value_cache.reshape(-1, value_cache.shape[-2], value_cache.shape[-1]).float()
-    if key_scale is not None:
-        key = key * key_scale.float()
-    if value_scale is not None:
-        value = value * value_scale.float()
-
-    result = torch.zeros_like(query)
-    group = query.shape[1] // key.shape[1]
-    for token_index in range(query.shape[0]):
-        request_index = int(query_to_request[token_index].item())
-        kv_start = int(indptr[request_index].item())
-        kv_stop = int(indptr[request_index + 1].item())
-        query_position = int(query_positions[token_index].item())
-        visible_stop = min(kv_stop - kv_start, query_position + 1)
-        visible_start = 0
-        if sliding_window > 0:
-            visible_start = max(0, query_position - sliding_window + 1)
-        slots = indices[kv_start + visible_start : kv_start + visible_stop].long()
-
-        for query_head in range(query.shape[1]):
-            kv_head = query_head // group
-            if slots.numel() == 0:
-                continue
-            scores = query[token_index, query_head].float() @ key[slots, kv_head].T
-            scores = scores * sm_scale
-            values = value[slots, kv_head]
-            if sinks is not None:
-                scores = torch.cat((sinks[query_head].float().reshape(1), scores))
-                values = torch.cat((torch.zeros_like(values[:1]), values), dim=0)
-            result[token_index, query_head] = (scores.softmax(dim=0) @ values).to(query.dtype)
-    return result
-
-
-def _paged_attention_op_reference(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    indptr: torch.Tensor,
-    indices: torch.Tensor,
-    query_to_request: torch.Tensor,
-    query_positions: torch.Tensor,
-    sm_scale: float,
-    sliding_window: int,
-    sinks: torch.Tensor | None,
-    key_scale: torch.Tensor | None,
-    value_scale: torch.Tensor | None,
-    out: torch.Tensor,
-) -> None:
-    out.copy_(
-        _reference_attention(
-            query,
-            key_cache,
-            value_cache,
-            indptr,
-            indices,
-            query_to_request,
-            query_positions,
-            sm_scale,
-            sliding_window,
-            sinks,
-            key_scale,
-            value_scale,
-        )
-    )
-
-
 @custom_op(
     namespace="ayaka",
     name="triton_paged_attention",
     mutates_args=["out"],
-    reference=_paged_attention_op_reference,
+    reference=paged_attention_op_ref,
     dispatch_key="CUDA",
 )
 def paged_attention_op(
@@ -1060,80 +972,11 @@ def paged_attention_op(
     )
 
 
-def _decode_paged_attention_op_reference(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    indptr: torch.Tensor,
-    indices: torch.Tensor,
-    query_positions: torch.Tensor,
-    attn_logits: torch.Tensor,
-    attn_lse: torch.Tensor,
-    max_context_len_bucket: int,
-    sm_scale: float,
-    kv_partition_size: int,
-    sliding_window: int,
-    sinks: torch.Tensor | None,
-    key_scale: torch.Tensor | None,
-    value_scale: torch.Tensor | None,
-    out: torch.Tensor,
-) -> None:
-    del max_context_len_bucket
-    key = key_cache.reshape(-1, key_cache.shape[-2], key_cache.shape[-1]).float()
-    value = value_cache.reshape(-1, value_cache.shape[-2], value_cache.shape[-1]).float()
-    if key_scale is not None:
-        key = key * key_scale.float()
-    if value_scale is not None:
-        value = value * value_scale.float()
-
-    group = query.shape[1] // key.shape[1]
-    for request_index in range(query.shape[0]):
-        kv_start = int(indptr[request_index].item())
-        kv_stop = int(indptr[request_index + 1].item())
-        query_position = int(query_positions[request_index].item())
-        visible_stop = min(kv_stop - kv_start, query_position + 1)
-        visible_start = 0
-        if sliding_window > 0:
-            visible_start = max(0, query_position - sliding_window + 1)
-        visible_slots = indices[kv_start + visible_start : kv_start + visible_stop].long()
-
-        for query_head in range(query.shape[1]):
-            kv_head = query_head // group
-            for split_index, split_start in enumerate(
-                range(0, visible_slots.numel(), kv_partition_size)
-            ):
-                slots = visible_slots[split_start : split_start + kv_partition_size]
-                scores = query[request_index, query_head].float() @ key[slots, kv_head].T
-                scores = scores * sm_scale
-                attn_logits[request_index, query_head, split_index].copy_(
-                    scores.softmax(dim=0) @ value[slots, kv_head]
-                )
-                attn_lse[request_index, query_head, split_index].copy_(scores.logsumexp(dim=0))
-
-    request_ids = torch.arange(query.shape[0], dtype=torch.int32, device=query.device)
-    out.copy_(
-        _reference_attention(
-            query,
-            key_cache,
-            value_cache,
-            indptr,
-            indices,
-            request_ids,
-            query_positions,
-            sm_scale,
-            sliding_window,
-            sinks,
-            key_scale,
-            value_scale,
-        )
-    )
-
-
 @custom_op(
     namespace="ayaka",
     name="triton_decode_paged_attention",
     mutates_args=["attn_logits", "attn_lse", "out"],
-    reference=_decode_paged_attention_op_reference,
+    reference=decode_paged_attention_op_ref,
     dispatch_key="CUDA",
 )
 def decode_paged_attention_op(

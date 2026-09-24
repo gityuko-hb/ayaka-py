@@ -21,6 +21,9 @@ from ayaka.utils.torch_utils import compute_torch_dtypes
 
 __all__ = [
     "GATHER_BLOCK_T",
+    "KV_OFFLOAD_MAX_BATCH_DESCRIPTORS_ENV",
+    "NVFP4_MSG",
+    "ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS",
     "as_byte_view",
     "as_int_view",
     "cache_kernel_view",
@@ -57,9 +60,9 @@ _RAW_INT_DTYPE: Final[dict[int, torch.dtype]] = {
 _E4M3_MAX = tl.constexpr(FP8_E4M3_MAX)
 _E5M2_MAX = tl.constexpr(cast(float, DType.FP8_E5M2.max_finite))
 
-_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS_ENV: Final[str] = "KV_OFFLOAD_MAX_BATCH_DESCRIPTORS"
-_ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS: Final[int] = 8192
-_NVFP4_MSG = (
+KV_OFFLOAD_MAX_BATCH_DESCRIPTORS_ENV: Final[str] = "KV_OFFLOAD_MAX_BATCH_DESCRIPTORS"
+ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS: Final[int] = 8192
+NVFP4_MSG = (
     "{what} is implemented in a separate CUDA translation unit "
     "(nvfp4 kernels) that is not part of cache_kernels.cu, so there is "
     "no Triton port of it here."

@@ -9,9 +9,17 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import (
+    fake_output,
+    prepare_output,
+    require_cuda,
+    require_last_dim_stride1,
+)
 from ayaka.kernel.triton.fp8_compat import e4m3_u8_to_f32, e8m0_u8_to_f32
+from ayaka.kernel.triton.gemm._common import validate_w8a16_scale, weight_bytes
+from ayaka.kernel.triton.reference.gemm import fp8_weight_only_gemm_ref
 from ayaka.kernel.triton.swizzle import grouped_pid
-from ayaka.utils.math_utils import div_ceil, require_cuda
+from ayaka.utils.math_utils import div_ceil
 
 __all__ = ["fp8_matmul_channelwise", "fp8_weight_only_gemm"]
 
@@ -112,63 +120,6 @@ def _fp8_w8a16_kernel(
     )
 
 
-def _weight_bytes(weight: torch.Tensor) -> torch.Tensor:
-    if not isinstance(weight, torch.Tensor):
-        raise TypeError("weight must be a torch.Tensor")
-    require_cuda(weight, "weight")
-    if weight.ndim != 2:
-        raise ValueError("weight must be 2-D")
-    if weight.dtype is torch.uint8:
-        byte_view = weight
-    elif _FP8_E4M3 is not None and weight.dtype is _FP8_E4M3:
-        byte_view = weight.view(torch.uint8)
-    else:
-        raise TypeError("weight must have dtype uint8 or torch.float8_e4m3fn")
-    if byte_view.stride(1) != 1:
-        raise ValueError("weight must have stride(1) == 1")
-    return byte_view
-
-
-def _validate_scale(
-    weight_scale: torch.Tensor,
-    reference: torch.Tensor,
-    *,
-    scale_dtype: str,
-    block_size_y: int,
-    scale_row_stride: int,
-    columns: int,
-) -> None:
-    if not isinstance(weight_scale, torch.Tensor):
-        raise TypeError("weight_scale must be a torch.Tensor")
-    if weight_scale.device != reference.device:
-        raise ValueError("weight_scale and input must be on the same CUDA device")
-    expected = torch.uint8 if scale_dtype == "e8m0" else torch.float32
-    if weight_scale.dtype is not expected:
-        raise TypeError(f"{scale_dtype} weight_scale must have dtype {expected}")
-    if weight_scale.numel() < div_ceil(columns, block_size_y) * scale_row_stride:
-        raise ValueError("weight_scale storage is too small for the requested block layout")
-
-
-def _prepare_output(
-    input: torch.Tensor,
-    out: torch.Tensor | None,
-    shape: tuple[int, int],
-) -> torch.Tensor:
-    if out is None:
-        return torch.empty(shape, device=input.device, dtype=input.dtype)
-    if not isinstance(out, torch.Tensor):
-        raise TypeError("out must be a torch.Tensor")
-    if out.device != input.device:
-        raise ValueError("out and input must be on the same CUDA device")
-    if out.dtype is not input.dtype:
-        raise TypeError("out must have the same dtype as input")
-    if tuple(out.shape) != shape:
-        raise ValueError(f"out must have shape {shape}")
-    if out.stride(1) != 1:
-        raise ValueError("out must have stride(1) == 1")
-    return out
-
-
 def _fp8_weight_only_gemm_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -179,56 +130,14 @@ def _fp8_weight_only_gemm_fake(
     scale_dtype: str = "e8m0",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if out is not None:
-        return out
-    return torch.empty((input.shape[0], weight.shape[0]), dtype=input.dtype, device=input.device)
-
-
-def _e8m0_values(storage: torch.Tensor) -> torch.Tensor:
-    """Host-side mirror of ``e8m0_u8_to_f32``: bit trick, ``0xFF`` -> NaN."""
-    values = (storage.to(torch.int32) << 23).view(torch.float32)
-    return torch.where(storage == 0xFF, torch.full_like(values, float("nan")), values)
-
-
-def _fp8_weight_only_gemm_reference(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    scale_row_stride: int | None = None,
-    block_size_y: int = 1,
-    block_size_x: int = 128,
-    scale_dtype: str = "e8m0",
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if _FP8_E4M3 is None:
-        raise RuntimeError("this PyTorch build does not provide torch.float8_e4m3fn")
-    inner = int(input.shape[1])
-    columns = int(weight.shape[0])
-    stride = div_ceil(inner, block_size_x) if scale_row_stride is None else int(scale_row_stride)
-    weight_values = weight.view(_FP8_E4M3).float()
-    if scale_dtype == "e8m0":
-        scale_values = _e8m0_values(weight_scale)
-    else:
-        scale_values = weight_scale.float()
-    row_index = torch.arange(columns, device=input.device) // block_size_y
-    column_index = torch.arange(inner, device=input.device) // block_size_x
-    scale = scale_values.reshape(-1)[row_index[:, None] * stride + column_index[None, :]]
-    # The kernel dequantizes into the activation dtype before the dot, so the
-    # reference has to round there too.
-    dequantized = (weight_values * scale).to(input.dtype)
-    product = input.to(torch.float32) @ dequantized.to(torch.float32).t()
-    result = product.to(out.dtype if out is not None else input.dtype)
-    if out is None:
-        return result
-    out.copy_(result)
-    return out
+    return fake_output(input, out, shape=(input.shape[0], weight.shape[0]))
 
 
 @custom_op(
     namespace="ayaka",
     name="fp8_weight_only_gemm",
     mutates_args=["out"],
-    reference=_fp8_weight_only_gemm_reference,
+    reference=fp8_weight_only_gemm_ref,
     fake_impl=_fp8_weight_only_gemm_fake,
     dispatch_key="CUDA",
 )
@@ -276,10 +185,10 @@ def fp8_weight_only_gemm(
         raise ValueError("input must be 2-D")
     if input.stride(1) != 1:
         raise ValueError("input must have stride(1) == 1")
-    weight_bytes = _weight_bytes(weight)
-    if weight_bytes.shape[1] != input.shape[1]:
+    weight_view = weight_bytes(weight)
+    if weight_view.shape[1] != input.shape[1]:
         raise ValueError("weight must be [N, K] with the same K as input")
-    rows, inner, columns = int(input.shape[0]), int(input.shape[1]), int(weight_bytes.shape[0])
+    rows, inner, columns = int(input.shape[0]), int(input.shape[1]), int(weight_view.shape[0])
     if block_size_x <= 0 or block_size_y <= 0:
         raise ValueError("block sizes must be positive")
     if scale_dtype not in _SCALE_FORMATS:
@@ -288,7 +197,7 @@ def fp8_weight_only_gemm(
         scale_row_stride = div_ceil(inner, block_size_x)
     if scale_row_stride <= 0:
         raise ValueError("scale_row_stride must be positive")
-    _validate_scale(
+    validate_w8a16_scale(
         weight_scale,
         input,
         scale_dtype=scale_dtype,
@@ -296,7 +205,8 @@ def fp8_weight_only_gemm(
         scale_row_stride=scale_row_stride,
         columns=columns,
     )
-    result = _prepare_output(input, out, (rows, columns))
+    result = prepare_output(input, out, shape=(rows, columns), like_name="input")
+    require_last_dim_stride1(result, "out")
     if rows == 0 or columns == 0:
         return result
 
@@ -306,7 +216,7 @@ def fp8_weight_only_gemm(
     with torch.cuda.device(input.device):
         cast(Any, _fp8_w8a16_kernel)[grid](
             input,
-            weight_bytes,
+            weight_view,
             weight_scale,
             result,
             rows,
@@ -314,8 +224,8 @@ def fp8_weight_only_gemm(
             inner,
             input.stride(0),
             input.stride(1),
-            weight_bytes.stride(1),
-            weight_bytes.stride(0),
+            weight_view.stride(1),
+            weight_view.stride(0),
             result.stride(0),
             scale_row_stride,
             BLOCK_SIZE_Y=block_size_y,

@@ -9,33 +9,22 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import fake_output, prepare_output, require_last_dim_stride1
+from ayaka.kernel.triton.gemm._common import (
+    GEMM_CONFIGS,
+    OUTPUT_DTYPES,
+    validate_bias,
+    validate_operand,
+    validate_scale,
+)
+from ayaka.kernel.triton.reference.gemm import int8_scaled_mm_ref
 from ayaka.kernel.triton.swizzle import grouped_pid
-from ayaka.utils.math_utils import require_cuda, validate_output_dtype
+from ayaka.utils.math_utils import validate_output_dtype
 
 __all__ = ["int8_scaled_mm"]
 
-_FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
-_INT8_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8}, num_warps=4, num_stages=3
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8}, num_warps=4, num_stages=4
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8}, num_warps=8, num_stages=4
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8}, num_warps=8, num_stages=4
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8}, num_warps=8, num_stages=4
-    ),
-]
-
-
-@triton.autotune(configs=_INT8_CONFIGS, key=["M", "N", "K"])
+@triton.autotune(configs=GEMM_CONFIGS, key=["M", "N", "K"])
 @triton.jit
 def _int8_scaled_mm_kernel(
     a_ptr,
@@ -100,64 +89,26 @@ def _int8_scaled_mm_kernel(
     )
 
 
-def _validate_operand(tensor: torch.Tensor, name: str, *, allow_transposed: bool) -> None:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if tensor.dtype is not torch.int8:
-        raise TypeError(f"{name} must have dtype torch.int8")
-    require_cuda(tensor, name)
-    if tensor.ndim != 2:
-        raise ValueError(f"{name} must be 2-D")
-    if tensor.stride(1) != 1 and not (allow_transposed and tensor.stride(0) == 1):
-        layout = "stride(1) == 1" if not allow_transposed else "stride(1) == 1 or stride(0) == 1"
-        raise ValueError(f"{name} must have {layout}")
-
-
-def _validate_scale(scale: torch.Tensor, name: str, reference: torch.Tensor, size: int) -> None:
-    if not isinstance(scale, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if scale.device != reference.device:
-        raise ValueError(f"{name} and a must be on the same CUDA device")
-    if scale.dtype is not torch.float32:
-        raise TypeError(f"{name} must have dtype torch.float32")
-    if scale.ndim != 1 or scale.numel() != size:
-        raise ValueError(f"{name} must have shape [{size}]")
-    if scale.stride(0) != 1:
-        raise ValueError(f"{name} must be contiguous")
-
-
-def _validate_bias(bias: torch.Tensor | None, reference: torch.Tensor, size: int) -> None:
-    if bias is None:
-        return
-    if not isinstance(bias, torch.Tensor):
-        raise TypeError("bias must be a torch.Tensor")
-    if bias.device != reference.device:
-        raise ValueError("bias and a must be on the same CUDA device")
-    if bias.dtype not in _FLOAT_DTYPES:
-        raise TypeError("bias must be float16, bfloat16, or float32")
-    if tuple(bias.shape) != (size,):
-        raise ValueError(f"bias must have shape [{size}]")
-
-
-def _prepare_output(
+def _mm_output(
     a: torch.Tensor,
     out: torch.Tensor | None,
-    shape: tuple[int, int],
+    rows: int,
+    columns: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Allocate or validate the ``[rows, columns]`` output."""
     if out is None:
         validate_output_dtype(out_dtype)
-        return torch.empty(shape, device=a.device, dtype=out_dtype)
-    if not isinstance(out, torch.Tensor):
-        raise TypeError("out must be a torch.Tensor")
-    if out.device != a.device:
-        raise ValueError("out and a must be on the same CUDA device")
-    validate_output_dtype(out.dtype)
-    if tuple(out.shape) != shape:
-        raise ValueError(f"out must have shape {shape}")
-    if out.stride(1) != 1:
-        raise ValueError("out must have stride(1) == 1")
-    return out
+    result = prepare_output(
+        a,
+        out,
+        shape=(rows, columns),
+        dtype=out_dtype,
+        dtypes=OUTPUT_DTYPES,
+        like_name="a",
+    )
+    require_last_dim_stride1(result, "out")
+    return result
 
 
 def _int8_scaled_mm_fake(
@@ -169,37 +120,14 @@ def _int8_scaled_mm_fake(
     out: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    if out is not None:
-        return out
-    return torch.empty((a.shape[0], b.shape[1]), dtype=out_dtype, device=a.device)
-
-
-def _int8_scaled_mm_reference(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    product = a.to(torch.float32) @ b.to(torch.float32)
-    product = product * scale_a.to(torch.float32).reshape(-1, 1)
-    product = product * scale_b.to(torch.float32).reshape(1, -1)
-    if bias is not None:
-        product = product + bias.to(torch.float32)
-    result = product.to(out.dtype if out is not None else out_dtype)
-    if out is None:
-        return result
-    out.copy_(result)
-    return out
+    return fake_output(a, out, shape=(a.shape[0], b.shape[1]), dtype=out_dtype)
 
 
 @custom_op(
     namespace="ayaka",
     name="int8_scaled_mm",
     mutates_args=["out"],
-    reference=_int8_scaled_mm_reference,
+    reference=int8_scaled_mm_ref,
     fake_impl=_int8_scaled_mm_fake,
     dispatch_key="CUDA",
 )
@@ -235,8 +163,8 @@ def int8_scaled_mm(
         ValueError: On mismatched shapes, devices, K alignment, or bad ``out``.
     """
 
-    _validate_operand(a, "a", allow_transposed=False)
-    _validate_operand(b, "b", allow_transposed=True)
+    validate_operand(a, "a", dtype=torch.int8, allow_transposed=False)
+    validate_operand(b, "b", dtype=torch.int8, allow_transposed=True)
     if a.shape[1] != b.shape[0]:
         raise ValueError(
             f"inner dimensions do not match: a is {tuple(a.shape)}, b is {tuple(b.shape)}"
@@ -244,10 +172,10 @@ def int8_scaled_mm(
     rows, inner, columns = int(a.shape[0]), int(a.shape[1]), int(b.shape[1])
     if inner % 16:
         raise ValueError("K must be a multiple of 16, matching the CUDA API")
-    _validate_scale(scale_a, "scale_a", a, rows)
-    _validate_scale(scale_b, "scale_b", a, columns)
-    _validate_bias(bias, a, columns)
-    result = _prepare_output(a, out, (rows, columns), out_dtype)
+    validate_scale(scale_a, "scale_a", a, rows, dtypes=(torch.float32,), scalar_ok=False)
+    validate_scale(scale_b, "scale_b", a, columns, dtypes=(torch.float32,), scalar_ok=False)
+    validate_bias(bias, a, columns)
+    result = _mm_output(a, out, rows, columns, out_dtype)
     if rows == 0 or columns == 0:
         return result
 

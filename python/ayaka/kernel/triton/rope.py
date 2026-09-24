@@ -7,6 +7,15 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import (
+    require_contiguous,
+    require_cuda,
+    require_dtype,
+    require_last_dim_stride1,
+    require_same_device,
+    require_tensor,
+)
+from ayaka.kernel.triton.reference.rope import rotary_embedding_inplace_ref
 from ayaka.utils.torch_utils import compute_torch_dtypes
 
 _SUPPORTED_DTYPES = compute_torch_dtypes()
@@ -64,16 +73,12 @@ def _rotary_embedding_kernel(
 
 
 def _validate_positions(positions: torch.Tensor) -> None:
-    if not isinstance(positions, torch.Tensor):
-        raise TypeError("positions must be a torch.Tensor")
-    if not positions.is_cuda:
-        raise ValueError("positions must be a CUDA tensor")
-    if positions.dtype != torch.int64:
-        raise TypeError(f"positions must have dtype torch.int64; got {positions.dtype}")
+    require_tensor(positions, "positions")
+    require_cuda(positions, "positions")
+    require_dtype(positions, "positions", (torch.int64,))
     if positions.ndim not in (1, 2):
         raise ValueError("positions must have shape [num_tokens] or [batch_size, seq_len]")
-    if not positions.is_contiguous():
-        raise ValueError("positions must be contiguous, matching the CUDA linear indexing contract")
+    require_contiguous(positions, "positions")
 
 
 def _tensor_layout(
@@ -89,8 +94,7 @@ def _tensor_layout(
         )
     if tuple(tensor.shape[:positions_ndim]) != tuple(positions.shape):
         raise ValueError(f"{name} and positions must have identical token dimensions")
-    if tensor.stride(-1) != 1:
-        raise ValueError(f"{name}'s final dimension must be contiguous")
+    require_last_dim_stride1(tensor, name)
 
     if tensor.ndim == positions_ndim + 2:
         if tensor.shape[-1] != head_size:
@@ -125,14 +129,10 @@ def _validate_data_tensor(
     head_size: int,
     name: str,
 ) -> tuple[int, int, int]:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if not tensor.is_cuda:
-        raise ValueError(f"{name} must be a CUDA tensor")
-    if tensor.device != positions.device:
-        raise ValueError(f"{name} and positions must be on the same CUDA device")
-    if tensor.dtype not in _SUPPORTED_DTYPES:
-        raise TypeError(f"{name} dtype must be float16, bfloat16, or float32")
+    require_tensor(tensor, name)
+    require_cuda(tensor, name)
+    require_same_device(tensor, name, positions, "positions")
+    require_dtype(tensor, name, _SUPPORTED_DTYPES)
     return _tensor_layout(tensor, positions, head_size, name)
 
 
@@ -167,62 +167,12 @@ def _launch_rotary(
     )
 
 
-def _apply_rotary_ref(
-    tensor: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    head_size: int,
-    is_neox: bool,
-) -> torch.Tensor:
-    rot_dim = cos_sin_cache.shape[1]
-    embed_dim = rot_dim // 2
-    flat_positions = positions.flatten()
-    num_tokens = flat_positions.numel()
-    num_heads = (
-        tensor.shape[-2] if tensor.ndim == positions.ndim + 2 else tensor.shape[-1] // head_size
-    )
-
-    flat_tensor = tensor.view(num_tokens, num_heads, head_size)
-    cache = cos_sin_cache[flat_positions]
-    cos = cache[:, :embed_dim].unsqueeze(1).float()
-    sin = cache[:, embed_dim:rot_dim].unsqueeze(1).float()
-
-    if is_neox:
-        x = flat_tensor[..., :embed_dim].float()
-        y = flat_tensor[..., embed_dim:rot_dim].float()
-        out_x = (x * cos - y * sin).to(tensor.dtype)
-        out_y = (y * cos + x * sin).to(tensor.dtype)
-        flat_tensor[..., :embed_dim] = out_x
-        flat_tensor[..., embed_dim:rot_dim] = out_y
-    else:
-        x = flat_tensor[..., :rot_dim:2].float()
-        y = flat_tensor[..., 1:rot_dim:2].float()
-        out_x = (x * cos - y * sin).to(tensor.dtype)
-        out_y = (y * cos + x * sin).to(tensor.dtype)
-        flat_tensor[..., :rot_dim:2] = out_x
-        flat_tensor[..., 1:rot_dim:2] = out_y
-    return tensor
-
-
-def _rotary_embedding_inplace_ref(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor | None,
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-) -> None:
-    _apply_rotary_ref(query, positions, cos_sin_cache, head_size, is_neox)
-    if key is not None:
-        _apply_rotary_ref(key, positions, cos_sin_cache, head_size, is_neox)
-
-
 @custom_op(
     namespace="ayaka",
     name="rotary_embedding",
     mutates_args=["query", "key"],
     out_shape=None,
-    reference=_rotary_embedding_inplace_ref,
+    reference=rotary_embedding_inplace_ref,
     dispatch_key="CUDA",
 )
 def _rotary_embedding_impl(
@@ -241,16 +191,13 @@ def _rotary_embedding_impl(
 
     if not isinstance(cos_sin_cache, torch.Tensor):
         raise TypeError("cos_sin_cache must be a torch.Tensor")
-    if not cos_sin_cache.is_cuda:
-        raise ValueError("cos_sin_cache must be a CUDA tensor")
-    if cos_sin_cache.device != query.device:
-        raise ValueError("cos_sin_cache and query must be on the same CUDA device")
+    require_cuda(cos_sin_cache, "cos_sin_cache")
+    require_same_device(cos_sin_cache, "cos_sin_cache", query, "query")
     if cos_sin_cache.dtype != query.dtype:
         raise TypeError("cos_sin_cache must have the same dtype as query")
     if cos_sin_cache.ndim != 2:
         raise ValueError("cos_sin_cache must have shape [max_position, rot_dim]")
-    if cos_sin_cache.stride(1) != 1:
-        raise ValueError("cos_sin_cache's rotary dimension must be contiguous")
+    require_last_dim_stride1(cos_sin_cache, "cos_sin_cache")
 
     rot_dim = int(cos_sin_cache.shape[1])
     if rot_dim <= 0 or rot_dim % 2 != 0:

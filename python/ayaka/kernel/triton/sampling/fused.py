@@ -22,6 +22,9 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import fake_tensor
+from ayaka.kernel.triton.reference.sampling import row_logsumexp_ref
+from ayaka.kernel.triton.sampling._common import validate_param_tensor, validate_probs
 
 _HAS_TRITON_FUSED = True
 
@@ -192,26 +195,14 @@ def _row_logsumexp_reduce_kernel(
     tl.store(out_ptr + row, lse)
 
 
-def _row_logsumexp_ref(logits: torch.Tensor, row_gate: torch.Tensor | None) -> torch.Tensor:
-    """Plain-torch reference with identical semantics (CPU-runnable)."""
-    n = logits.size(0)
-    if row_gate is None:
-        return torch.logsumexp(logits.to(torch.float32), dim=-1)
-    gate = row_gate > 0
-    lse = torch.zeros(n, dtype=torch.float32, device=logits.device)
-    if bool(gate.any()):
-        lse[gate] = torch.logsumexp(logits[gate].to(torch.float32), dim=-1)
-    return lse
-
-
 def _row_logsumexp_fake(logits: torch.Tensor, row_gate: torch.Tensor | None) -> torch.Tensor:
     """Meta kernel: fresh fp32 ``[n]`` without touching memory."""
-    return torch.empty(logits.shape[0], dtype=torch.float32, device=logits.device)
+    return fake_tensor(logits, dtype=torch.float32)
 
 
 @custom_op(
     namespace="ayaka",
-    reference=_row_logsumexp_ref,
+    reference=row_logsumexp_ref,
     fake_impl=_row_logsumexp_fake,
     dispatch_key="CUDA",
 )
@@ -233,21 +224,9 @@ def row_logsumexp_gpu(logits: torch.Tensor, row_gate: torch.Tensor | None) -> to
         Reference: ``torch.logsumexp(logits.float(), dim=-1)`` with gated
         rows forced to ``0.0``, suitable for ``verify_against_reference``.
     """
-    if not isinstance(logits, torch.Tensor):
-        raise TypeError("logits must be a torch.Tensor")
-    if not logits.is_cuda:
-        raise ValueError("logits must be a CUDA tensor")
-    if not logits.is_floating_point():
-        raise TypeError(f"logits must be a float dtype; got {logits.dtype}")
-    if logits.dim() != 2:
-        raise ValueError(f"logits must have shape [n, vocab]; got {tuple(logits.shape)}")
+    validate_probs(logits, "logits")
     if row_gate is not None:
-        if not isinstance(row_gate, torch.Tensor):
-            raise TypeError("row_gate must be a torch.Tensor or None")
-        if row_gate.dim() != 1 or row_gate.size(0) != logits.size(0):
-            raise ValueError("row_gate must have shape [n] matching logits rows")
-        if row_gate.device != logits.device:
-            raise ValueError("row_gate and logits must be on the same device")
+        validate_param_tensor(row_gate, "row_gate", logits.size(0), logits.device)
     n, v = logits.shape
     gate = (
         row_gate

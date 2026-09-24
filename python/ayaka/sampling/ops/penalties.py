@@ -67,7 +67,7 @@ def _row_logsumexp_torch(logits: torch.Tensor, row_gate: torch.Tensor | None) ->
     n = logits.size(0)
     if row_gate is None:
         return torch.logsumexp(logits.to(torch.float32), dim=-1)
-    gate = row_gate != 0
+    gate = row_gate > 0
     lse = torch.zeros(n, dtype=torch.float32, device=logits.device)
     if bool(gate.any()):
         lse[gate] = torch.logsumexp(logits[gate].to(torch.float32), dim=-1)

@@ -32,164 +32,21 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton.reference.sampling import (
+    fused_sampling_ref,
+    min_p_sampling_ref,
+    sampling_from_probs_ref,
+    top_p_sampling_ref,
+)
+from ayaka.kernel.triton.sampling._common import (
+    normalize_threshold,
+    prepare_sampling_outputs,
+    sampling_fake,
+    validate_opt_seed_offset,
+    validate_param_tensor,
+    validate_probs,
+)
 from ayaka.kernel.triton.sampling.philox import philox_u01_f32
-from ayaka.sampling.rng import philox4x32_10
-
-
-def _lsr_ref(x: torch.Tensor, k: int) -> torch.Tensor:
-    """Zero-extend a right shift on an int64 tensor.
-
-    Args:
-        x: Int64 input tensor holding unsigned bit patterns.
-        k: Shift distance with ``0 < k < 64``.
-
-    Returns:
-        ``x`` shifted right by ``k`` with zero fill (Triton ``>>`` on an
-        int64 lane behaves the same once masked).
-    """
-    return (x >> k) & ((1 << (64 - k)) - 1)
-
-
-def _philox_u01_f32_ref(seed: torch.Tensor, flat: torch.Tensor) -> torch.Tensor:
-    """Torch mirror of Triton ``philox_u01_f32`` (high 24 bits as float32).
-
-    Args:
-        seed: ``[B]`` int64 Philox keys, one stream per row.
-        flat: ``[B]`` int64 flat stream addresses.
-
-    Returns:
-        Float32 ``[B]`` uniforms in ``[0, 1)`` with 24 bits of precision.
-
-    Note:
-        Exact for non-negative ``seed``/``flat``, which is the
-        counter-based sampling contract (seeds derive via ``derive_seed``,
-        offsets count steps); negative inputs may diverge in sign handling.
-        Uses the public ``philox4x32_10`` from ``ayaka.sampling.rng`` so the
-        two implementations cannot drift apart unnoticed.
-    """
-    counter = flat >> 1
-    odd = flat & 1
-    r0, r1, r2, r3 = philox4x32_10(
-        counter & 0xFFFFFFFF,
-        _lsr_ref(counter, 32),
-        torch.zeros_like(counter),
-        torch.zeros_like(counter),
-        seed & 0xFFFFFFFF,
-        _lsr_ref(seed, 32),
-    )
-    v = torch.where(odd.bool(), (r2 << 32) | r3, (r0 << 32) | r1)
-    return (_lsr_ref(v, 29) & 0x00FFFFFF).to(torch.float32) / 16777216.0
-
-
-def _validate_probs(probs: torch.Tensor, name: str = "probs") -> tuple[int, int]:
-    """Validate a ``[B, V]`` CUDA float batch.
-
-    Args:
-        probs: Candidate probability/logit batch.
-        name: Argument name used in error messages.
-
-    Returns:
-        Tuple ``(batch, vocab)`` of Python ints.
-
-    Raises:
-        TypeError: If ``probs`` is not a tensor or not floating-point.
-        ValueError: If ``probs`` is not CUDA or not 2-D.
-    """
-    if not isinstance(probs, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if not probs.is_cuda:
-        raise ValueError(f"{name} must be a CUDA tensor")
-    if not probs.is_floating_point():
-        raise TypeError(f"{name} must be a float dtype; got {probs.dtype}")
-    if probs.dim() != 2:
-        raise ValueError(f"{name} must have shape [B, V]; got {tuple(probs.shape)}")
-    return probs.size(0), probs.size(1)
-
-
-def _validate_param_tensor(
-    tensor: torch.Tensor, name: str, batch: int, device: torch.device
-) -> None:
-    """Validate a ``[B]`` per-row parameter tensor on the batch device.
-
-    Args:
-        tensor: Candidate per-row parameter (thresholds, seeds, offsets).
-        name: Argument name used in error messages.
-        batch: Expected leading dimension.
-        device: Expected device (the batch device).
-
-    Raises:
-        TypeError: If ``tensor`` is not a tensor.
-        ValueError: If the shape is not ``[B]`` or the device mismatches.
-    """
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if tensor.dim() != 1 or tensor.size(0) != batch:
-        raise ValueError(f"{name} must have shape [B] matching the batch")
-    if tensor.device != device:
-        raise ValueError(f"{name} and probs must be on the same device")
-
-
-def _validate_opt_seed_offset(
-    arr: torch.Tensor | None, name: str, batch: int, device: torch.device
-) -> None:
-    """Validate an optional ``[B]`` int64 seed/offset tensor.
-
-    Args:
-        arr: Seed/offset tensor, or ``None`` for the scalar fallback.
-        name: Argument name used in error messages.
-        batch: Expected leading dimension.
-        device: Expected device (the batch device).
-
-    Raises:
-        TypeError: If ``arr`` is a tensor with dtype other than int64.
-        ValueError: If the shape is not ``[B]`` or the device mismatches.
-    """
-    if arr is None:
-        return
-    _validate_param_tensor(arr, name, batch, device)
-    if arr.dtype != torch.int64:
-        raise TypeError(f"{name} must have dtype torch.int64; got {arr.dtype}")
-
-
-def _resolve_seed_offset(
-    probs: torch.Tensor,
-    arr: torch.Tensor | None,
-    val: int,
-) -> torch.Tensor:
-    """Materialize a ``[B]`` int64 seed/offset stream.
-
-    Args:
-        probs: ``[B, V]`` batch providing the batch size and device.
-        arr: Per-row tensor stream, or ``None`` to broadcast ``val``.
-        val: Scalar fallback used when ``arr`` is ``None``.
-
-    Returns:
-        Int64 ``[B]`` tensor on the batch device.
-    """
-    if arr is not None:
-        return arr
-    return torch.full((probs.size(0),), val, dtype=torch.int64, device=probs.device)
-
-
-def _sampling_fake(
-    probs: torch.Tensor, *args: object, **kwargs: object
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Meta kernel shared by all sampling ops in this module.
-
-    Args:
-        probs: ``[B, V]`` batch providing the batch size and device.
-        *args: Ignored positional launcher arguments.
-        **kwargs: Ignored launcher keyword arguments.
-
-    Returns:
-        Tuple ``(token_ids, valid)`` with uninitialized int32 ``[B]`` and
-        bool ``[B]`` tensors, for shape inference under ``torch.compile``.
-    """
-    batch = probs.shape[0]
-    return (
-        torch.empty(batch, dtype=torch.int32, device=probs.device),
-        torch.empty(batch, dtype=torch.bool, device=probs.device),
-    )
 
 
 # Kernel: Sampling From Probs (Categorical CDF Scan)
@@ -1313,101 +1170,10 @@ def _radix_sampling_from_logits(
     return output, valid
 
 
-def _fused_sampling_ref(
-    logits: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    min_p: torch.Tensor,
-    seed: torch.Tensor,
-    offset: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Plain-torch mirror of the fused threshold + CDF-scan.
-
-    Replicates every kernel pass (top-k count bisection, min-p logit
-    threshold, top-p bisection over the top-k-renormalized mass, survivor
-    sum, CDF scan) with the same iteration counts, so kernel and reference
-    agree up to fp32 summation order and libdevice-vs-torch transcendental
-    rounding.
-
-    Args:
-        logits: ``[B, V]`` float logits.
-        top_k: ``[B]`` integer top-k limits.
-        top_p: ``[B]`` float nucleus targets.
-        min_p: ``[B]`` float relative thresholds.
-        seed: ``[B]`` int64 Philox seeds.
-        offset: ``[B]`` int64 base offsets.
-
-    Returns:
-        Tuple ``(token_ids, valid)`` with int32 ``[B]`` ids and bool ``[B]``
-        flags on the same device as ``logits``.
-    """
-    x = logits.to(torch.float32)
-    batch, vocab = x.shape
-    neg_inf = torch.full((batch,), float("-inf"), dtype=torch.float32, device=x.device)
-    x_max = x.amax(dim=-1)
-    x_min = torch.where(torch.isfinite(x), x, torch.full_like(x, float("inf"))).amin(dim=-1)
-
-    has_top_k = bool(((top_k > 0) & (top_k < vocab)).any())
-    if has_top_k:
-        active = (top_k > 0) & (top_k < vocab)
-        lo = x_min.clone()
-        hi = x_max.clone()
-        for _ in range(16):
-            mid = (lo + hi) * 0.5
-            cnt = (x >= mid.unsqueeze(1)).sum(dim=-1)
-            go_lo = active & (cnt >= top_k)
-            go_hi = active & ~(cnt >= top_k)
-            lo = torch.where(go_lo, mid, lo)
-            hi = torch.where(go_hi, mid, hi)
-        t_k = torch.where(active, lo, neg_inf)
-    else:
-        t_k = neg_inf
-
-    has_min_p = bool((min_p > 0.0).any())
-    if has_min_p:
-        t_minp = torch.where(
-            min_p.to(torch.float32) > 0.0,
-            x_max + torch.log(min_p.to(torch.float32)),
-            neg_inf,
-        )
-    else:
-        t_minp = neg_inf
-
-    has_top_p = bool((top_p < 1.0).any())
-    if has_top_p:
-        active_p = top_p.to(torch.float32) < 1.0
-        mass_p = top_p.to(torch.float32)
-        centered = x - x_max.unsqueeze(1)
-        s_k = torch.where(
-            x >= t_k.unsqueeze(1), torch.exp(centered), torch.zeros_like(centered)
-        ).sum(dim=-1)
-        lo = torch.where(t_k == float("-inf"), x_min, t_k)
-        hi = x_max.clone()
-        for _ in range(12):
-            mid = (lo + hi) * 0.5
-            partial = torch.where(
-                x >= mid.unsqueeze(1), torch.exp(centered), torch.zeros_like(centered)
-            ).sum(dim=-1)
-            go_lo = active_p & (partial >= mass_p * s_k)
-            go_hi = active_p & ~(partial >= mass_p * s_k)
-            lo = torch.where(go_lo, mid, lo)
-            hi = torch.where(go_hi, mid, hi)
-        t_p = torch.where(active_p, lo, neg_inf)
-    else:
-        t_p = neg_inf
-
-    t_final = torch.maximum(torch.maximum(t_k, t_p), t_minp)
-    centered = x - x_max.unsqueeze(1)
-    w = torch.where(x >= t_final.unsqueeze(1), torch.exp(centered), torch.zeros_like(centered))
-    u = _philox_u01_f32_ref(seed, offset)
-    pos = _cdf_first_match(w, u * w.sum(dim=-1), vocab)
-    return pos.to(torch.int32), torch.ones(batch, dtype=torch.bool, device=x.device)
-
-
 @custom_op(
     namespace="ayaka",
-    reference=_fused_sampling_ref,
-    fake_impl=_sampling_fake,
+    reference=fused_sampling_ref,
+    fake_impl=sampling_fake,
     dispatch_key="CUDA",
 )
 def fused_topk_topp_minp_sampling_from_logits(
@@ -1465,7 +1231,7 @@ def fused_topk_topp_minp_sampling_from_logits(
         (seed, "seed"),
         (offset, "offset"),
     ):
-        _validate_param_tensor(tensor, tensor_name, batch_size, logits.device)
+        validate_param_tensor(tensor, tensor_name, batch_size, logits.device)
     if seed.dtype != torch.int64:
         raise TypeError(f"seed must have dtype torch.int64; got {seed.dtype}")
     if offset.dtype != torch.int64:
@@ -1505,58 +1271,10 @@ def fused_topk_topp_minp_sampling_from_logits(
     return output, valid
 
 
-def _prepare_sampling_outputs(probs: torch.Tensor):
-    """Allocate fresh ``(output, valid)`` buffers for a probs batch.
-
-    Args:
-        probs: ``[batch, vocab]`` tensor providing device and batch size.
-
-    Returns:
-        Tuple ``(output, valid)`` with int32 ``[batch]`` indices and bool
-        ``[batch]`` flags on the same device as ``probs``.
-    """
-    batch_size = probs.shape[0]
-    output = torch.empty((batch_size,), device=probs.device, dtype=torch.int32)
-    valid = torch.empty((batch_size,), device=probs.device, dtype=torch.bool)
-    return output, valid
-
-
-def _sampling_from_probs_ref(
-    probs: torch.Tensor,
-    seed_arr: torch.Tensor | None = None,
-    seed_val: int = 42,
-    offset_arr: torch.Tensor | None = None,
-    offset_val: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Plain-torch mirror of the two-pass CDF scan.
-
-    Args:
-        probs: ``[B, V]`` float probabilities.
-        seed_arr: Optional ``[B]`` int64 seeds; ``seed_val`` is used when
-            ``None``.
-        seed_val: Scalar seed fallback.
-        offset_arr: Optional ``[B]`` int64 offsets; ``offset_val`` is used
-            when ``None``.
-        offset_val: Scalar offset fallback.
-
-    Returns:
-        Tuple ``(token_ids, valid)`` with int32 ``[B]`` ids and bool ``[B]``
-        flags on the same device as ``probs``.
-    """
-    batch, vocab = probs.shape
-    seed = _resolve_seed_offset(probs, seed_arr, seed_val)
-    offset = _resolve_seed_offset(probs, offset_arr, offset_val)
-    p = probs.to(torch.float32)
-    u = _philox_u01_f32_ref(seed, offset)
-    target = u * p.sum(dim=-1)
-    pos = (p.cumsum(dim=-1) < target.unsqueeze(1)).sum(dim=-1).clamp(max=vocab - 1)
-    return pos.to(torch.int32), torch.ones(batch, dtype=torch.bool, device=probs.device)
-
-
 @custom_op(
     namespace="ayaka",
-    reference=_sampling_from_probs_ref,
-    fake_impl=_sampling_fake,
+    reference=sampling_from_probs_ref,
+    fake_impl=sampling_fake,
     dispatch_key="CUDA",
 )
 def sampling_from_probs(
@@ -1593,10 +1311,10 @@ def sampling_from_probs(
         fallbacks share one stream. Uses ``BLOCK_SIZE`` of
         ``min(4096, next_power_of_2(V))``, ``grid=(B,)``, ``num_warps=4``.
     """
-    batch_size, vocab_size = _validate_probs(probs)
-    _validate_opt_seed_offset(seed_arr, "seed_arr", batch_size, probs.device)
-    _validate_opt_seed_offset(offset_arr, "offset_arr", batch_size, probs.device)
-    output, valid = _prepare_sampling_outputs(probs)
+    batch_size, vocab_size = validate_probs(probs)
+    validate_opt_seed_offset(seed_arr, "seed_arr", batch_size, probs.device)
+    validate_opt_seed_offset(offset_arr, "offset_arr", batch_size, probs.device)
+    output, valid = prepare_sampling_outputs(probs)
 
     grid = (batch_size,)
     block_size = min(4096, triton.next_power_of_2(vocab_size))
@@ -1620,91 +1338,11 @@ def sampling_from_probs(
     return output, valid
 
 
-def _normalize_threshold(
-    value: torch.Tensor | float, name: str, batch: int, device: torch.device
-) -> torch.Tensor:
-    """Broadcast a scalar threshold to ``[B]`` float32.
-
-    Args:
-        value: Per-row ``[B]`` tensor (validated, cast to float32) or a
-            Python scalar broadcast to the batch.
-        name: Argument name used in error messages.
-        batch: Expected leading dimension.
-        device: Expected device.
-
-    Returns:
-        Float32 ``[B]`` tensor on ``device``.
-
-    Raises:
-        TypeError: If a tensor ``value`` fails validation.
-        ValueError: If a tensor ``value`` has the wrong shape/device.
-    """
-    if isinstance(value, torch.Tensor):
-        _validate_param_tensor(value, name, batch, device)
-        return value.to(torch.float32)
-    return torch.full((batch,), float(value), dtype=torch.float32, device=device)
-
-
-def _cdf_first_match(weights: torch.Tensor, target: torch.Tensor, vocab: int) -> torch.Tensor:
-    """First index with ``w > 0`` and ``cumsum(w) >= target``.
-
-    Args:
-        weights: ``[B, V]`` non-negative filtered weights.
-        target: ``[B]`` CDF thresholds (already scaled by the valid mass).
-        vocab: Vocabulary size, used as the no-match fallback.
-
-    Returns:
-        Int64 ``[B]`` positions; rows with no match yield ``vocab - 1``,
-        mirroring the kernel fallback.
-    """
-    cdf = weights.cumsum(dim=-1)
-    cand = (weights > 0) & (cdf >= target.unsqueeze(1))
-    pos = cand.float().argmax(dim=-1)
-    return torch.where(cand.any(dim=-1), pos, torch.full_like(pos, vocab - 1))
-
-
-def _min_p_sampling_ref(
-    probs: torch.Tensor,
-    min_p: torch.Tensor,
-    seed_arr: torch.Tensor | None = None,
-    seed_val: int = 42,
-    offset_arr: torch.Tensor | None = None,
-    offset_val: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Plain-torch mirror of the fused max/filter/scan.
-
-    Args:
-        probs: ``[B, V]`` float probabilities.
-        min_p: ``[B]`` threshold tensor (scalars are normalized by the
-            caller before reaching the registered op).
-        seed_arr: Optional ``[B]`` int64 seeds; ``seed_val`` is used when
-            ``None``.
-        seed_val: Scalar seed fallback.
-        offset_arr: Optional ``[B]`` int64 offsets; ``offset_val`` is used
-            when ``None``.
-        offset_val: Scalar offset fallback.
-
-    Returns:
-        Tuple ``(token_ids, valid)`` with int32 ``[B]`` ids and bool ``[B]``
-        flags on the same device as ``probs``.
-    """
-    batch, vocab = probs.shape
-    min_p_t = _normalize_threshold(min_p, "min_p", batch, probs.device)
-    p = probs.to(torch.float32)
-    cutoff = p.amax(dim=-1) * min_p_t
-    filt = torch.where(p >= cutoff.unsqueeze(1), p, torch.zeros_like(p))
-    seed = _resolve_seed_offset(probs, seed_arr, seed_val)
-    offset = _resolve_seed_offset(probs, offset_arr, offset_val)
-    u = _philox_u01_f32_ref(seed, offset)
-    pos = _cdf_first_match(filt, u * filt.sum(dim=-1), vocab)
-    return pos.to(torch.int32), torch.ones(batch, dtype=torch.bool, device=probs.device)
-
-
 @custom_op(
     namespace="ayaka",
     name="min_p_sampling_from_probs",
-    reference=_min_p_sampling_ref,
-    fake_impl=_sampling_fake,
+    reference=min_p_sampling_ref,
+    fake_impl=sampling_fake,
     dispatch_key="CUDA",
 )
 def _min_p_sampling_op(
@@ -1726,11 +1364,11 @@ def _min_p_sampling_op(
         ValueError: If ``probs`` is not a CUDA ``[B, V]`` tensor or a
             parameter shape/device mismatches the batch.
     """
-    batch_size, vocab_size = _validate_probs(probs)
-    _validate_param_tensor(min_p, "min_p", batch_size, probs.device)
-    _validate_opt_seed_offset(seed_arr, "seed_arr", batch_size, probs.device)
-    _validate_opt_seed_offset(offset_arr, "offset_arr", batch_size, probs.device)
-    output, valid = _prepare_sampling_outputs(probs)
+    batch_size, vocab_size = validate_probs(probs)
+    validate_param_tensor(min_p, "min_p", batch_size, probs.device)
+    validate_opt_seed_offset(seed_arr, "seed_arr", batch_size, probs.device)
+    validate_opt_seed_offset(offset_arr, "offset_arr", batch_size, probs.device)
+    output, valid = prepare_sampling_outputs(probs)
 
     has_tensor = True
     min_p_val = 0.0
@@ -1800,63 +1438,15 @@ def min_p_sampling_from_probs(
     """
     if probs.dim() != 2:
         raise ValueError(f"probs must have shape [B, V]; got {tuple(probs.shape)}")
-    min_p_t = _normalize_threshold(min_p, "min_p", probs.size(0), probs.device)
+    min_p_t = normalize_threshold(min_p, "min_p", probs.size(0), probs.device)
     return _min_p_sampling_op(probs, min_p_t, seed_arr, seed_val, offset_arr, offset_val)
-
-
-def _top_p_sampling_ref(
-    probs: torch.Tensor,
-    top_p: torch.Tensor,
-    seed_arr: torch.Tensor | None = None,
-    seed_val: int = 42,
-    offset_arr: torch.Tensor | None = None,
-    offset_val: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Plain-torch mirror of bisection threshold plus CDF scan.
-
-    Replicates the 12 bisection iterations over ``[0, 1]`` and the
-    filtered CDF scan with the same arithmetic, so kernel and reference
-    agree up to fp32 summation order.
-
-    Args:
-        probs: ``[B, V]`` float probabilities.
-        top_p: ``[B]`` mass-target tensor (scalars are normalized by the
-            caller before reaching the registered op).
-        seed_arr: Optional ``[B]`` int64 seeds; ``seed_val`` is used when
-            ``None``.
-        seed_val: Scalar seed fallback.
-        offset_arr: Optional ``[B]`` int64 offsets; ``offset_val`` is used
-            when ``None``.
-        offset_val: Scalar offset fallback.
-
-    Returns:
-        Tuple ``(token_ids, valid)`` with int32 ``[B]`` ids and bool ``[B]``
-        flags on the same device as ``probs``.
-    """
-    batch, vocab = probs.shape
-    target_mass = _normalize_threshold(top_p, "top_p", batch, probs.device)
-    p = probs.to(torch.float32)
-    low = torch.zeros(batch, dtype=torch.float32, device=probs.device)
-    high = torch.ones(batch, dtype=torch.float32, device=probs.device)
-    for _ in range(12):
-        mid = (low + high) * 0.5
-        mass = torch.where(p >= mid.unsqueeze(1), p, torch.zeros_like(p)).sum(dim=-1)
-        take_low = mass >= target_mass
-        low = torch.where(take_low, mid, low)
-        high = torch.where(take_low, high, mid)
-    filt = torch.where(p >= low.unsqueeze(1), p, torch.zeros_like(p))
-    seed = _resolve_seed_offset(probs, seed_arr, seed_val)
-    offset = _resolve_seed_offset(probs, offset_arr, offset_val)
-    u = _philox_u01_f32_ref(seed, offset)
-    pos = _cdf_first_match(filt, u * filt.sum(dim=-1), vocab)
-    return pos.to(torch.int32), torch.ones(batch, dtype=torch.bool, device=probs.device)
 
 
 @custom_op(
     namespace="ayaka",
     name="top_p_sampling_from_probs",
-    reference=_top_p_sampling_ref,
-    fake_impl=_sampling_fake,
+    reference=top_p_sampling_ref,
+    fake_impl=sampling_fake,
     dispatch_key="CUDA",
 )
 def _top_p_sampling_op(
@@ -1878,11 +1468,11 @@ def _top_p_sampling_op(
         ValueError: If ``probs`` is not a CUDA ``[B, V]`` tensor or a
             parameter shape/device mismatches the batch.
     """
-    batch_size, vocab_size = _validate_probs(probs)
-    _validate_param_tensor(top_p, "top_p", batch_size, probs.device)
-    _validate_opt_seed_offset(seed_arr, "seed_arr", batch_size, probs.device)
-    _validate_opt_seed_offset(offset_arr, "offset_arr", batch_size, probs.device)
-    output, valid = _prepare_sampling_outputs(probs)
+    batch_size, vocab_size = validate_probs(probs)
+    validate_param_tensor(top_p, "top_p", batch_size, probs.device)
+    validate_opt_seed_offset(seed_arr, "seed_arr", batch_size, probs.device)
+    validate_opt_seed_offset(offset_arr, "offset_arr", batch_size, probs.device)
+    output, valid = prepare_sampling_outputs(probs)
 
     has_tensor = True
     top_p_val = 0.0
@@ -1950,5 +1540,5 @@ def top_p_sampling_from_probs(
     """
     if probs.dim() != 2:
         raise ValueError(f"probs must have shape [B, V]; got {tuple(probs.shape)}")
-    top_p_t = _normalize_threshold(top_p, "top_p", probs.size(0), probs.device)
+    top_p_t = normalize_threshold(top_p, "top_p", probs.size(0), probs.device)
     return _top_p_sampling_op(probs, top_p_t, seed_arr, seed_val, offset_arr, offset_val)

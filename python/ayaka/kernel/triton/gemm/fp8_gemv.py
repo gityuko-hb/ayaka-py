@@ -33,27 +33,38 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import (
+    fake_output,
+    prepare_output,
+    require_cuda,
+    require_dtype,
+    require_last_dim_stride1,
+    require_tensor,
+)
 from ayaka.kernel.triton.fp8_compat import (
     e4m3_kernel_view,
     e4m3_native_cx,
     e4m3_u8_to_f32,
     e8m0_u8_to_f32,
 )
-from ayaka.utils.math_utils import div_ceil, require_cuda
-
-from .fp8_gemm import _validate_bias, _validate_block_scale, _validate_scale
-from .fp8_w8a16_gemm import (
-    _e8m0_values,
-    _weight_bytes,
+from ayaka.kernel.triton.gemm._common import (
+    OUTPUT_DTYPES,
+    validate_bias,
+    validate_block_scale,
+    validate_operand,
+    validate_scale,
+    validate_w8a16_scale,
+    weight_bytes,
 )
-from .fp8_w8a16_gemm import (
-    _validate_scale as _validate_w8a16_scale,
+from ayaka.kernel.triton.reference.gemm import (
+    fp8_blockwise_gemv_ref,
+    fp8_weight_only_gemv_ref,
 )
+from ayaka.utils.math_utils import div_ceil
 
 __all__ = ["fp8_blockwise_gemv", "fp8_weight_only_gemv"]
 
 FP8 = torch.float8_e4m3fn
-_OUTPUT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 _SCALE_FORMATS = ("e8m0", "float32")
 
@@ -264,25 +275,22 @@ def _flatten_vector(x: torch.Tensor, name: str, size: int) -> torch.Tensor:
     return x.reshape(-1)
 
 
-def _prepare_vector_output(
+def _vector_output(
     reference: torch.Tensor,
     out: torch.Tensor | None,
     size: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    if out is None:
-        return torch.empty(size, device=reference.device, dtype=dtype)
-    if not isinstance(out, torch.Tensor):
-        raise TypeError("out must be a torch.Tensor")
-    if out.device != reference.device:
-        raise ValueError("out and input must be on the same CUDA device")
-    if out.dtype is not dtype:
-        raise TypeError(f"out must have dtype {dtype}")
-    if tuple(out.shape) != (size,):
-        raise ValueError(f"out must have shape [{size}]")
-    if out.stride(0) != 1:
-        raise ValueError("out must be contiguous")
-    return out
+    """Allocate or validate a 1-D ``[size]`` output."""
+    result = prepare_output(
+        reference,
+        out,
+        shape=(size,),
+        dtype=dtype,
+        like_name="input",
+    )
+    require_last_dim_stride1(result, "out")
+    return result
 
 
 # ======================================================================================
@@ -298,45 +306,14 @@ def _weight_only_gemv_fake(
     scale_dtype: str = "e8m0",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if out is not None:
-        return out
-    return torch.empty(weight.shape[0], dtype=input.dtype, device=input.device)
-
-
-def _weight_only_gemv_reference(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    scale_row_stride: int | None = None,
-    block_size_y: int = 1,
-    block_size_x: int = 128,
-    scale_dtype: str = "e8m0",
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    inner = int(weight.shape[1])
-    columns = int(weight.shape[0])
-    stride = div_ceil(inner, block_size_x) if scale_row_stride is None else int(scale_row_stride)
-    weight_values = weight.view(FP8).double()
-    if scale_dtype == "e8m0":
-        scale_values = _e8m0_values(weight_scale).double()
-    else:
-        scale_values = weight_scale.double()
-    row_index = torch.arange(columns, device=input.device) // block_size_y
-    column_index = torch.arange(inner, device=input.device) // block_size_x
-    scale = scale_values.reshape(-1)[row_index[:, None] * stride + column_index[None, :]]
-    product = (weight_values * scale) @ input.reshape(-1).double()
-    result = product.float().to(out.dtype if out is not None else input.dtype)
-    if out is None:
-        return result
-    out.copy_(result)
-    return out
+    return fake_output(input, out, shape=(weight.shape[0],))
 
 
 @custom_op(
     namespace="ayaka",
     name="fp8_weight_only_gemv",
     mutates_args=["out"],
-    reference=_weight_only_gemv_reference,
+    reference=fp8_weight_only_gemv_ref,
     fake_impl=_weight_only_gemv_fake,
     dispatch_key="CUDA",
 )
@@ -376,9 +353,9 @@ def fp8_weight_only_gemv(
     if input.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("input must have dtype float16 or bfloat16")
     require_cuda(input, "input")
-    weight_bytes = _weight_bytes(weight)
-    columns = int(weight_bytes.shape[0])
-    inner = int(weight_bytes.shape[1])
+    weight_view = weight_bytes(weight)
+    columns = int(weight_view.shape[0])
+    inner = int(weight_view.shape[1])
     a = _flatten_vector(input, "input", inner)
     if block_size_x <= 0 or block_size_y <= 0:
         raise ValueError("block sizes must be positive")
@@ -388,7 +365,7 @@ def fp8_weight_only_gemv(
         scale_row_stride = div_ceil(inner, block_size_x)
     if scale_row_stride <= 0:
         raise ValueError("scale_row_stride must be positive")
-    _validate_w8a16_scale(
+    validate_w8a16_scale(
         weight_scale,
         input,
         scale_dtype=scale_dtype,
@@ -396,7 +373,7 @@ def fp8_weight_only_gemv(
         scale_row_stride=scale_row_stride,
         columns=columns,
     )
-    result = _prepare_vector_output(input, out, columns, input.dtype)
+    result = _vector_output(input, out, columns, input.dtype)
     if columns == 0:
         return result
 
@@ -404,7 +381,7 @@ def fp8_weight_only_gemv(
     part = torch.empty((split_k, columns), dtype=torch.float32, device=input.device)
     cast(Any, _fp8_weight_only_gemv_splitk_kernel)[(n_tiles, split_k)](
         a,
-        e4m3_kernel_view(weight_bytes.view(FP8)),
+        e4m3_kernel_view(weight_view.view(FP8)),
         weight_scale,
         part,
         columns,
@@ -412,8 +389,8 @@ def fp8_weight_only_gemv(
         n_kb,
         kb_per,
         a.stride(0),
-        weight_bytes.stride(0),
-        weight_bytes.stride(1),
+        weight_view.stride(0),
+        weight_view.stride(1),
         scale_row_stride,
         part.stride(0),
         part.stride(1),
@@ -439,47 +416,14 @@ def _blockwise_gemv_fake(
     bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if out is not None:
-        return out
-    return torch.empty(b.shape[0], dtype=torch.float32, device=a.device)
-
-
-def _blockwise_gemv_reference(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    inner = int(a.numel())
-    columns = int(b.shape[0])
-    scale_k = div_ceil(inner, _BLOCK_K)
-    a_wide = a.reshape(-1).double()
-    b_wide = b.double()
-    sa_wide = scale_a.reshape(-1).double()
-    sb_wide = scale_b.double()
-    product = torch.zeros(columns, dtype=torch.float64, device=a.device)
-    for sk in range(scale_k):
-        start = sk * _BLOCK_K
-        stop = min(start + _BLOCK_K, inner)
-        partial = a_wide[start:stop] @ b_wide[:, start:stop].T
-        sb = sb_wide[:, sk].repeat_interleave(_BLOCK_K)[:columns]
-        product = product + partial * sa_wide[sk] * sb
-    if bias is not None:
-        product = product + bias.double()
-    result = product.float().to(out.dtype if out is not None else torch.float32)
-    if out is None:
-        return result
-    out.copy_(result)
-    return out
+    return fake_output(a, out, shape=(b.shape[0],), dtype=torch.float32)
 
 
 @custom_op(
     namespace="ayaka",
     name="fp8_blockwise_gemv",
     mutates_args=["out"],
-    reference=_blockwise_gemv_reference,
+    reference=fp8_blockwise_gemv_ref,
     fake_impl=_blockwise_gemv_fake,
     dispatch_key="CUDA",
 )
@@ -505,26 +449,20 @@ def fp8_blockwise_gemv(
         The ``[N]`` output tensor, the same object as ``out`` when provided.
     """
 
-    _validate_scale_input(a, "a")
-    if not isinstance(b, torch.Tensor):
-        raise TypeError("b must be a torch.Tensor")
-    if b.dtype is not FP8:
-        raise TypeError("b must have dtype torch.float8_e4m3fn")
-    require_cuda(b, "b")
-    if b.ndim != 2:
-        raise ValueError("b must be 2-D")
-    if b.stride(1) != 1:
-        raise ValueError("b must have stride(1) == 1")
+    require_tensor(a, "a")
+    require_dtype(a, "a", (FP8,))
+    require_cuda(a, "a")
+    validate_operand(b, "b", dtype=FP8, allow_transposed=False)
     columns, inner = int(b.shape[0]), int(b.shape[1])
     a_vec = _flatten_vector(a, "a", inner)
     scale_k = div_ceil(inner, _BLOCK_K)
-    _validate_scale(scale_a, "scale_a", a, scale_k)
-    _validate_block_scale(scale_b, "scale_b", a, (div_ceil(columns, _BLOCK_K), scale_k))
-    _validate_bias(bias, a, columns)
+    validate_scale(scale_a, "scale_a", a, scale_k)
+    validate_block_scale(scale_b, "scale_b", a, (div_ceil(columns, _BLOCK_K), scale_k))
+    validate_bias(bias, a, columns)
     dtype = out.dtype if out is not None else torch.float32
-    if dtype not in _OUTPUT_DTYPES:
+    if dtype not in OUTPUT_DTYPES:
         raise TypeError("out must be float16, bfloat16, or float32")
-    result = _prepare_vector_output(a, out, columns, dtype)
+    result = _vector_output(a, out, columns, dtype)
     if columns == 0:
         return result
 
@@ -553,11 +491,3 @@ def fp8_blockwise_gemv(
     )
     _reduce(part, result, bias, split_k)
     return result
-
-
-def _validate_scale_input(a: torch.Tensor, name: str) -> None:
-    if not isinstance(a, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if a.dtype is not FP8:
-        raise TypeError(f"{name} must have dtype torch.float8_e4m3fn")
-    require_cuda(a, name)

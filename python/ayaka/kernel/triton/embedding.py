@@ -18,6 +18,11 @@ import triton.language as tl
 
 from ayaka.caps import Cap
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import fake_tensor, require_tensor
+from ayaka.kernel.triton.reference.embedding import (
+    embedding_lookup_ref,
+    vocab_parallel_embedding_ref,
+)
 from ayaka.utils.torch_utils import compute_torch_dtypes
 from ayaka.utils.validation import require_int
 
@@ -66,29 +71,6 @@ def _vocab_parallel_embedding_kernel(
     tl.store(output_ptr + token * hidden + cols, row, mask=col_mask)
 
 
-def _reference(
-    input_: torch.Tensor,
-    weight: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
-) -> torch.Tensor:
-    from ayaka.layers.embedding import masked_vocab_input
-
-    masked, invalid = masked_vocab_input(
-        input_,
-        org_vocab_start_index=org_vocab_start_index,
-        org_vocab_end_index=org_vocab_end_index,
-        num_org_vocab_padding=num_org_vocab_padding,
-        added_vocab_start_index=added_vocab_start_index,
-        added_vocab_end_index=added_vocab_end_index,
-    )
-    output = torch.nn.functional.embedding(masked.long(), weight)
-    return output.masked_fill(invalid.unsqueeze(-1), 0)
-
-
 def _fake(
     input_: torch.Tensor,
     weight: torch.Tensor,
@@ -105,7 +87,7 @@ def _fake(
         added_vocab_start_index,
         added_vocab_end_index,
     )
-    return torch.empty((input_.numel(), weight.shape[1]), dtype=weight.dtype, device=weight.device)
+    return fake_tensor(weight, shape=(input_.numel(), weight.shape[1]))
 
 
 def _validate(
@@ -113,8 +95,8 @@ def _validate(
     weight: torch.Tensor,
     *indices: int,
 ) -> None:
-    if not isinstance(input_, torch.Tensor) or not isinstance(weight, torch.Tensor):
-        raise TypeError("input and weight must be torch.Tensors")
+    require_tensor(input_, "input")
+    require_tensor(weight, "weight")
     if input_.dtype not in (torch.int32, torch.int64):
         raise TypeError("input ids must be int32 or int64")
     if input_.ndim != 1 or not input_.is_contiguous():
@@ -131,7 +113,7 @@ def _validate(
     namespace="ayaka",
     name="vocab_parallel_embedding",
     fake_impl=_fake,
-    reference=_reference,
+    reference=vocab_parallel_embedding_ref,
     dispatch_key="CUDA",
     caps=Cap.CUDAGRAPH_SAFE,
 )
@@ -193,38 +175,21 @@ def _simple_embedding_kernel(
     tl.store(output_ptr + token * hidden + cols, row, mask=col_mask)
 
 
-def _simple_reference(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.embedding(input_.long(), weight)
-
-
 def _simple_fake(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return torch.empty((input_.numel(), weight.shape[1]), dtype=weight.dtype, device=weight.device)
-
-
-def _simple_validate(input_: torch.Tensor, weight: torch.Tensor) -> None:
-    if not isinstance(input_, torch.Tensor) or not isinstance(weight, torch.Tensor):
-        raise TypeError("input and weight must be torch.Tensors")
-    if input_.dtype not in (torch.int32, torch.int64):
-        raise TypeError("input ids must be int32 or int64")
-    if input_.ndim != 1 or not input_.is_contiguous():
-        raise ValueError("input ids must be a contiguous 1-D tensor")
-    if weight.ndim != 2 or weight.dtype not in _SUPPORTED_DTYPES or weight.stride(1) != 1:
-        raise ValueError("weight must be a row-contiguous 2-D floating tensor")
-    if input_.device != weight.device:
-        raise ValueError("input and weight must share a device")
+    return fake_tensor(weight, shape=(input_.numel(), weight.shape[1]))
 
 
 @custom_op(
     namespace="ayaka",
     name="embedding_lookup",
     fake_impl=_simple_fake,
-    reference=_simple_reference,
+    reference=embedding_lookup_ref,
     dispatch_key="CUDA",
     caps=Cap.CUDAGRAPH_SAFE,
 )
 def embedding_lookup(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Gather token rows directly without sharding or padding logic."""
-    _simple_validate(input_, weight)
+    _validate(input_, weight)
     num_tokens, hidden = input_.numel(), weight.shape[1]
     output = torch.empty((num_tokens, hidden), dtype=weight.dtype, device=weight.device)
     if num_tokens == 0:

@@ -10,10 +10,10 @@ import torch
 import triton
 import triton.language as tl
 from ayaka.kernel.triton.cache.cache_helpers import (
-    _KV_OFFLOAD_MAX_BATCH_DESCRIPTORS_ENV,
-    _NVFP4_MSG,
-    _ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS,
     GATHER_BLOCK_T,
+    KV_OFFLOAD_MAX_BATCH_DESCRIPTORS_ENV,
+    NVFP4_MSG,
+    ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS,
     as_byte_view,
     as_int_view,
     cache_kernel_view,
@@ -405,13 +405,13 @@ def gather_cache_kernel(
 
 def _resolve_max_batch_desc() -> int:
     """Max descriptors per batched-copy launch (0 = unlimited)."""
-    env = os.environ.get(_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS_ENV)
+    env = os.environ.get(KV_OFFLOAD_MAX_BATCH_DESCRIPTORS_ENV)
     if env:
         m = re.match(r"\s*[+-]?\d+", env)  # atoll semantics
         override = int(m.group()) if m else 0
         if override > 0:
             return override
-    return _ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS if torch.version.hip is not None else 0
+    return ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS if torch.version.hip is not None else 0
 
 
 def _check(condition: bool, *message: object) -> None:
@@ -612,7 +612,7 @@ def reshape_and_cache(
     )
 
     if kv_cache_dtype.startswith("nvfp4"):
-        raise NotImplementedError(_NVFP4_MSG.format(what="nvfp4 reshape_and_cache"))
+        raise NotImplementedError(NVFP4_MSG.format(what="nvfp4 reshape_and_cache"))
 
     kv_dtype, quantized, is_e5m2 = _dtype_flags(kv_cache_dtype)
     if quantized:

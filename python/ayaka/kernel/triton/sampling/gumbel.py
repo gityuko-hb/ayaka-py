@@ -24,8 +24,10 @@ import triton
 import triton.language as tl
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import fake_tensor
+from ayaka.kernel.triton.reference.sampling import fused_gumbel_ref
+from ayaka.kernel.triton.sampling._common import validate_param_tensor, validate_probs
 from ayaka.kernel.triton.sampling.philox import philox_u01
-from ayaka.sampling.rng import counter_uniform_cols
 
 HAS_TRITON_GUMBEL = True
 
@@ -88,34 +90,6 @@ def _gumbel_argmax_kernel(
     tl.store(out_ptr + row, winner_id)
 
 
-def _fused_gumbel_ref(
-    logits: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    min_p: torch.Tensor,
-    seed: torch.Tensor,
-    offset: torch.Tensor,
-    topk_bound: int = 512,
-) -> torch.Tensor:
-    """Plain-torch reference mirroring the Triton truncation and RNG stream."""
-    from ayaka.sampling.ops.sampling import filter_probs
-
-    sp, si = filter_probs(logits, top_k, top_p, min_p)
-    bound = min(topk_bound, sp.size(1))
-    sp = sp[:, :bound]
-    si = si[:, :bound]
-    u = counter_uniform_cols(seed, offset, bound)
-    u = u.clamp(min=1e-12, max=1.0 - 1e-7)
-    gumbel = (-torch.log(-torch.log(u))).to(sp.dtype)
-    log_sp = torch.where(
-        sp > 0,
-        torch.log(sp.clamp_min(torch.finfo(sp.dtype).tiny)),
-        torch.full_like(sp, float("-inf")),
-    )
-    winner = torch.argmax(log_sp + gumbel, dim=-1)
-    return si.gather(1, winner.unsqueeze(1)).squeeze(1)
-
-
 def _fused_gumbel_fake(
     logits: torch.Tensor,
     top_k: torch.Tensor,
@@ -126,12 +100,12 @@ def _fused_gumbel_fake(
     topk_bound: int = 512,
 ) -> torch.Tensor:
     """Meta kernel: fresh int64 ``[B]`` without touching memory."""
-    return torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+    return fake_tensor(logits, dtype=torch.int64)
 
 
 @custom_op(
     namespace="ayaka",
-    reference=_fused_gumbel_ref,
+    reference=fused_gumbel_ref,
     fake_impl=_fused_gumbel_fake,
     dispatch_key="CUDA",
 )
@@ -170,15 +144,7 @@ def fused_gumbel_sample(
         CUDA-graph safe. Reference: ``filter_probs`` followed by a torch
         Gumbel-argmax, suitable for ``verify_against_reference``.
     """
-    if not isinstance(logits, torch.Tensor):
-        raise TypeError("logits must be a torch.Tensor")
-    if not logits.is_cuda:
-        raise ValueError("logits must be a CUDA tensor")
-    if not logits.is_floating_point():
-        raise TypeError(f"logits must be a float dtype; got {logits.dtype}")
-    if logits.dim() != 2:
-        raise ValueError(f"logits must have shape [B, V]; got {tuple(logits.shape)}")
-    batch = logits.size(0)
+    batch, _ = validate_probs(logits, "logits")
     for tensor, tensor_name in (
         (top_k, "top_k"),
         (top_p, "top_p"),
@@ -186,12 +152,7 @@ def fused_gumbel_sample(
         (seed, "seed"),
         (offset, "offset"),
     ):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{tensor_name} must be a torch.Tensor")
-        if tensor.dim() != 1 or tensor.size(0) != batch:
-            raise ValueError(f"{tensor_name} must have shape [B] matching logits batch")
-        if tensor.device != logits.device:
-            raise ValueError(f"{tensor_name} and logits must be on the same device")
+        validate_param_tensor(tensor, tensor_name, batch, logits.device)
     if not isinstance(topk_bound, int) or topk_bound <= 0:
         raise ValueError("topk_bound must be a positive integer")
     from ayaka.sampling.ops.sampling import filter_probs

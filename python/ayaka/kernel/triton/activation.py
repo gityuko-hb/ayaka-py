@@ -3,12 +3,27 @@ from __future__ import annotations
 from typing import Any, cast
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from triton.language.extra.libdevice import tanh as _tanh
 
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import (
+    fake_output,
+    prepare_output,
+    require_contiguous,
+    require_cuda,
+    require_dtype,
+    require_tensor,
+)
+from ayaka.kernel.triton.reference.activation import (
+    gelu_and_mul_ref,
+    gelu_quick_ref,
+    gelu_ref,
+    gelu_tanh_and_mul_ref,
+    gelu_tanh_ref,
+    silu_and_mul_ref,
+)
 from ayaka.utils.torch_utils import compute_torch_dtypes
 
 # Triton's libdevice stubs also describe interpreter-only None results.
@@ -105,36 +120,12 @@ def _gelu_kernel(
 
 
 def _validate_input(input: torch.Tensor) -> None:
-    if not isinstance(input, torch.Tensor):
-        raise TypeError("input must be a torch.Tensor")
-    if not input.is_cuda:
-        raise ValueError("input must be a CUDA tensor")
-    if input.dtype not in _SUPPORTED_DTYPES:
-        raise TypeError(f"input dtype must be float16, bfloat16, or float32; got {input.dtype}")
+    require_tensor(input, "input")
+    require_cuda(input, "input")
+    require_dtype(input, "input", _SUPPORTED_DTYPES)
     if input.ndim == 0:
         raise ValueError("input must have at least one dimension")
-    if not input.is_contiguous():
-        raise ValueError("input must be contiguous")
-
-
-def _prepare_output(
-    input: torch.Tensor,
-    shape: tuple[int, ...],
-    out: torch.Tensor | None,
-) -> torch.Tensor:
-    if out is None:
-        return torch.empty(shape, device=input.device, dtype=input.dtype)
-    if not isinstance(out, torch.Tensor):
-        raise TypeError("out must be a torch.Tensor")
-    if out.device != input.device:
-        raise ValueError("out must be on the same CUDA device as input")
-    if out.dtype != input.dtype:
-        raise TypeError("out must have the same dtype as input")
-    if tuple(out.shape) != shape:
-        raise ValueError(f"out has shape {tuple(out.shape)}, expected {shape}")
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous")
-    return out
+    require_contiguous(input, "input")
 
 
 def _act_and_mul(
@@ -149,7 +140,8 @@ def _act_and_mul(
 
     d = last_dim // 2
     output_shape = (*input.shape[:-1], d)
-    output = _prepare_output(input=input, shape=output_shape, out=out)
+    output = prepare_output(input, out, shape=output_shape)
+    require_contiguous(output, "out")
     if output.numel() == 0:
         return output
 
@@ -173,7 +165,8 @@ def _gelu_impl(
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     _validate_input(input=input)
-    output = _prepare_output(input, tuple(input.shape), out)
+    output = prepare_output(input, out, shape=tuple(input.shape))
+    require_contiguous(output, "out")
     if input.numel() == 0:
         return output
 
@@ -197,95 +190,14 @@ def _act_and_mul_fake(
     input: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    shape = list(input.shape)
-    shape[-1] //= 2
-    return torch.empty(shape, dtype=input.dtype, device=input.device)
-
-
-def _silu_and_mul_ref(
-    input: torch.Tensor,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    last_dim = input.shape[-1]
-    d = last_dim // 2
-    x = input[..., :d].float()
-    gate = input[..., d:].float()
-    res = (F.silu(x).to(input.dtype).float() * gate).to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
-def _gelu_and_mul_ref(
-    input: torch.Tensor,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    last_dim = input.shape[-1]
-    d = last_dim // 2
-    x = input[..., :d].float()
-    gate = input[..., d:].float()
-    res = (F.gelu(x, approximate="none").to(input.dtype).float() * gate).to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
-def _gelu_tanh_and_mul_ref(
-    input: torch.Tensor,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    last_dim = input.shape[-1]
-    d = last_dim // 2
-    x = input[..., :d].float()
-    gate = input[..., d:].float()
-    res = (F.gelu(x, approximate="tanh").to(input.dtype).float() * gate).to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
-def _gelu_quick_ref(
-    input: torch.Tensor,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    x = input.float()
-    res = (x / (1.0 + torch.exp(-_QUICK_GELU_ALPHA.value * x))).to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
-def _gelu_ref(
-    input: torch.Tensor,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    res = F.gelu(input.float(), approximate="none").to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
-
-
-def _gelu_tanh_ref(
-    input: torch.Tensor,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    res = F.gelu(input.float(), approximate="tanh").to(input.dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
+    return fake_output(input, out, shape=(*input.shape[:-1], input.shape[-1] // 2))
 
 
 @custom_op(
     namespace="ayaka",
     name="silu_and_mul",
     fake_impl=_act_and_mul_fake,
-    reference=_silu_and_mul_ref,
+    reference=silu_and_mul_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )
@@ -298,7 +210,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.
     namespace="ayaka",
     name="gelu_and_mul",
     fake_impl=_act_and_mul_fake,
-    reference=_gelu_and_mul_ref,
+    reference=gelu_and_mul_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )
@@ -311,7 +223,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.
     namespace="ayaka",
     name="gelu_tanh_and_mul",
     fake_impl=_act_and_mul_fake,
-    reference=_gelu_tanh_and_mul_ref,
+    reference=gelu_tanh_and_mul_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )
@@ -324,14 +236,15 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> t
     namespace="ayaka",
     name="gelu_quick",
     out_shape="input",
-    reference=_gelu_quick_ref,
+    reference=gelu_quick_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )
 def gelu_quick(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute ``x * sigmoid(1.702 * x)`` without a multiply-gate input."""
     _validate_input(input)
-    output = _prepare_output(input, tuple(input.shape), out)
+    output = prepare_output(input, out, shape=tuple(input.shape))
+    require_contiguous(output, "out")
     if input.numel() == 0:
         return output
 
@@ -351,7 +264,7 @@ def gelu_quick(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Te
     namespace="ayaka",
     name="gelu",
     out_shape="input",
-    reference=_gelu_ref,
+    reference=gelu_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )
@@ -364,7 +277,7 @@ def gelu(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     namespace="ayaka",
     name="gelu_tanh",
     out_shape="input",
-    reference=_gelu_tanh_ref,
+    reference=gelu_tanh_ref,
     dispatch_key="CUDA",
     mutates_args=["out"],
 )

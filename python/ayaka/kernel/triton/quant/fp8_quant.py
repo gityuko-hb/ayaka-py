@@ -30,13 +30,25 @@ import triton.language as tl
 
 from ayaka.caps import Cap
 from ayaka.kernel.ops import custom_op
+from ayaka.kernel.triton._host import (
+    fake_output,
+    fake_tensor,
+    prepare_output,
+    require_cuda,
+    require_dtype,
+    require_tensor,
+)
 from ayaka.kernel.triton.fp8_compat import (
     e4m3_f32_to_u8,
     e4m3_native_cx,
     fp8_kernel_view,
 )
+from ayaka.kernel.triton.reference.quant import (
+    per_token_group_quant_ref,
+    static_quant_ref,
+)
 from ayaka.types import DType
-from ayaka.utils.math_utils import div_ceil, require_cuda
+from ayaka.utils.math_utils import div_ceil
 
 __all__ = ["per_token_group_quant_fp8", "static_quant_fp8"]
 
@@ -88,10 +100,10 @@ def _per_token_group_quant_kernel(
         other=0.0,
     ).to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-10)
-    s = amax / 448.0
+    s = amax / _E4M3_MAX
     y = x / s[:, None]
     if e4m3_native_cx():
-        yq = tl.clamp(y, -448.0, 448.0).to(tl.float8e4nv)
+        yq = tl.clamp(y, -_E4M3_MAX, _E4M3_MAX).to(tl.float8e4nv)
     else:
         yq = e4m3_f32_to_u8(y)
     tl.store(
@@ -114,7 +126,7 @@ def _static_quant_kernel(
     mask = offs < n_elements
     inv = 1.0 / tl.load(s_ptr).to(tl.float32)
     v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32) * inv
-    v = tl.minimum(tl.maximum(v, -448.0), 448.0)
+    v = tl.minimum(tl.maximum(v, -_E4M3_MAX), _E4M3_MAX)
     if e4m3_native_cx():
         yq = v.to(tl.float8e4nv)
     else:
@@ -123,31 +135,11 @@ def _static_quant_kernel(
 
 
 def _validate_input(x: torch.Tensor, name: str) -> None:
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if x.dtype not in _FLOAT_DTYPES:
-        raise TypeError(f"{name} must be float16, bfloat16, or float32")
+    require_tensor(x, name)
+    require_dtype(x, name, _FLOAT_DTYPES)
     require_cuda(x, name)
     if x.ndim < 1:
         raise ValueError(f"{name} must have at least one dimension")
-
-
-def _prepare_output(
-    x: torch.Tensor,
-    out: torch.Tensor | None,
-    shape: tuple[int, ...],
-) -> torch.Tensor:
-    if out is None:
-        return torch.empty(shape, device=x.device, dtype=FP8)
-    if not isinstance(out, torch.Tensor):
-        raise TypeError("out must be a torch.Tensor")
-    if out.device != x.device:
-        raise ValueError("out and x must be on the same CUDA device")
-    if out.dtype is not FP8:
-        raise TypeError("out must have dtype torch.float8_e4m3fn")
-    if tuple(out.shape) != shape:
-        raise ValueError(f"out must have shape {shape}")
-    return out
 
 
 def _per_token_group_quant_fake(
@@ -156,27 +148,15 @@ def _per_token_group_quant_fake(
     *lead, k = x.shape
     rows = math.prod(lead) if lead else 1
     return (
-        torch.empty((rows, k), dtype=FP8, device=x.device),
-        torch.empty((rows, k // group_size), dtype=torch.float32, device=x.device),
+        fake_tensor(x, shape=(rows, k), dtype=FP8),
+        fake_tensor(x, shape=(rows, k // group_size), dtype=torch.float32),
     )
-
-
-def _per_token_group_quant_reference(
-    x: torch.Tensor, group_size: int = _GROUP
-) -> tuple[torch.Tensor, torch.Tensor]:
-    *lead, k = x.shape
-    x2d = x.reshape(-1, k).float()
-    grouped = x2d.reshape(-1, k // group_size, group_size)
-    amax = grouped.abs().amax(dim=-1).clamp_min(_GROUP_FLOOR)
-    scale = amax / _E4M3_MAX
-    quantized = (grouped / scale[..., None]).clamp(-_E4M3_MAX, _E4M3_MAX)
-    return quantized.reshape(-1, k).to(FP8), scale
 
 
 @custom_op(
     namespace="ayaka",
     name="per_token_group_quant_fp8",
-    reference=_per_token_group_quant_reference,
+    reference=per_token_group_quant_ref,
     fake_impl=_per_token_group_quant_fake,
     dispatch_key="CUDA",
 )
@@ -242,26 +222,14 @@ def per_token_group_quant_fp8(
 def _static_quant_fake(
     x: torch.Tensor, scale: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
-    if out is not None:
-        return out
-    return torch.empty_like(x, dtype=FP8)
-
-
-def _static_quant_reference(
-    x: torch.Tensor, scale: torch.Tensor, out: torch.Tensor | None = None
-) -> torch.Tensor:
-    quantized = (x.float() / scale.float().reshape(())).clamp(-_E4M3_MAX, _E4M3_MAX).to(FP8)
-    if out is None:
-        return quantized
-    out.copy_(quantized)
-    return out
+    return fake_output(x, out, dtype=FP8)
 
 
 @custom_op(
     namespace="ayaka",
     name="static_quant_fp8",
     mutates_args=["out"],
-    reference=_static_quant_reference,
+    reference=static_quant_ref,
     fake_impl=_static_quant_fake,
     dispatch_key="CUDA",
     caps=Cap.CUDAGRAPH_SAFE,
@@ -293,7 +261,7 @@ def static_quant_fp8(
     require_cuda(scale, "scale")
     if scale.numel() != 1:
         raise ValueError("scale must contain exactly one element")
-    result = _prepare_output(x, out, tuple(x.shape))
+    result = prepare_output(x, out, dtype=FP8, name="out", like_name="x")
     if x.numel() == 0:
         return result
     x_flat = x.reshape(-1)
