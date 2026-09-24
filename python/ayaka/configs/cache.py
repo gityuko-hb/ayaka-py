@@ -590,8 +590,10 @@ def plan_cache(
 
     * recurrent (Mamba) groups have no storage implementation;
     * MLA requires the ``NLD`` plane layout, and ``NLD`` requires MLA;
-    * prefix reuse is only layout-compatible for a single full-attention MHA
-      group, matching :func:`~ayaka.kvcache.layout.prefix_cache_capability`.
+    * prefix reuse is layout-compatible for MHA/GQA groups; sliding-window
+      groups require ``reuse_mode=per_group`` together with
+      ``allow_sliding_window_reuse``, matching
+      :func:`~ayaka.kvcache.layout.prefix_cache_capability`.
     """
     if tp_size < 1:
         raise ConfigError("parallel.tp_size", "TP_SIZE_INVALID", "tp_size must be >= 1")
@@ -627,12 +629,20 @@ def plan_cache(
                 "NLD_REQUIRES_MLA",
                 "NLD is an MLA-only layout; MHA/GQA groups use NHD or HND",
             )
-    # Layout-level statement only: the grouped manager implements no prefix
-    # lookup, so a report must not promise reuse for hybrid or MLA pools.
+    # Layout-level statement matching prefix_cache_capability: the grouped
+    # cache publishes only all-group restorable boundaries, so a hybrid pool
+    # is reusable only when every group is, with sliding groups opted in.
+    per_group_opt_in = (
+        config.prefix.reuse_mode is PrefixReuseMode.PER_GROUP
+        and config.prefix.allow_sliding_window_reuse
+    )
     prefix_reusable = bool(
         config.prefix.enabled
-        and len(groups) == 1
-        and groups[0].kind is CacheLayerKind.FULL_ATTENTION
+        and all(
+            group.kind is CacheLayerKind.FULL_ATTENTION
+            or (group.kind is CacheLayerKind.SLIDING_WINDOW and per_group_opt_in)
+            for group in groups
+        )
     )
     plans: list[CacheGroupPlan] = []
     for geometry in groups:

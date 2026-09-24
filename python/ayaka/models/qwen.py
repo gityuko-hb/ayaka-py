@@ -355,7 +355,7 @@ class _QwenAttention(nn.Module):
         value = value.view(tokens, self.c_attn.num_kv_heads, self.head_dim)
         self.rotary(positions, query, key)
         output = attention(layer_index, query, key, value)
-        reshaped = output.reshape(tokens, self.num_heads * self.head_dim)
+        reshaped = output.reshape(tokens, self.c_attn.num_heads * self.head_dim)
         projected = self.c_proj(reshaped)
         assert isinstance(projected, torch.Tensor)
         return projected
