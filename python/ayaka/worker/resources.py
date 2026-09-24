@@ -7,7 +7,7 @@ Borrowed models are accounted for but are not destroyed by this owner.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 
@@ -25,6 +25,11 @@ from ayaka.configs.memory import MemoryConfig, MemoryProfile, plan_device_memory
 from ayaka.configs.model import ArchitectureConfig
 from ayaka.configs.parallel import ParallelConfig
 from ayaka.configs.scheduler import SchedulerConfig
+from ayaka.configs.tier_capability import (
+    assess_host_tier_capability,
+    plan_group_host_tiers,
+)
+from ayaka.kvcache.grouped_manager import KVCacheGroupManager
 from ayaka.kvcache.manager import LogicalKVManager
 from ayaka.kvcache.materialize import KVStorageLease, materialize_kv_storage
 from ayaka.kvcache.resize import (
@@ -358,10 +363,10 @@ class WorkerResources:
         if not self.kv.closed:
             self.kv.reclaim_deferred()
             self.kv.close()
-        for storage in reversed(self.storages):
-            storage.close()
         if self.tier_release is not None:
             self.tier_release()
+        for storage in reversed(self.storages):
+            storage.close()
         for owner in (MemoryOwner.WEIGHT, MemoryOwner.COMPILE, MemoryOwner.WORKSPACE):
             self.ledger.release_owner(owner)
         if any(self.ledger.committed(tier) for tier in MemoryTier):
@@ -386,6 +391,8 @@ def build_configured_resources(
     device: str,
     device_index: int,
     zero_initialize: bool,
+    prefix_enabled: bool = False,
+    graph_enabled: bool = False,
 ) -> tuple[ResidentKVPlan, WorkerResources]:
     """Build the config-driven engine's resident owners before scheduler wiring."""
     plan = plan_resident_kv(
@@ -398,12 +405,56 @@ def build_configured_resources(
         parallel=parallel,
         max_model_len=max_model_len,
     )
-    ledger = resident_ledger(
-        plan.memory,
-        device=device,
-        device_total_bytes=device_total_bytes,
-        device_index=device_index,
+    # Tiering changes the supported capability and host accounting. Resolve
+    # both before materializing any device slab.
+    grouped_tiers: Mapping[str, TieringConfig] = {}
+    mirror_bytes = 0
+    tier_policy = cache_config.tiering
+    tier_requested = bool(
+        tier_policy.host_bytes
+        or tier_policy.nvme_bytes
+        or tier_policy.swap_bytes
+        or tier_policy.nvme_path is not None
+        or tier_policy.max_inflight_bytes is not None
     )
+    if tier_requested:
+        assess_host_tier_capability(
+            architecture,
+            cache_config,
+            plan,
+            prefix_enabled=prefix_enabled,
+            graph_enabled=graph_enabled,
+        ).require_supported()
+    if tier_policy.host_bytes:
+        host_tier_plan = plan_group_host_tiers(plan, tier_policy)
+        grouped_tiers = host_tier_plan.configs
+        mirror_bytes = host_tier_plan.charged_bytes
+    lane = MemoryLane.CPU if torch.device(device).type == "cpu" else MemoryLane.CUDA
+    if grouped_tiers:
+        # CUDA mirrors can degrade to pageable memory. Reserve both possible
+        # host accounts at the frozen ceiling; charge only the actual kind.
+        if (
+            lane is MemoryLane.CPU
+            and plan.physical.allocated_bytes + mirror_bytes > plan.memory.policy_budget_bytes
+        ):
+            raise ValueError("cache.tiering.host_bytes exceeds the CPU resident memory budget")
+        ledger = MemoryLedger.for_device(
+            device_budget_bytes=plan.memory.policy_budget_bytes,
+            device_total_bytes=device_total_bytes,
+            host_pinned_bytes=mirror_bytes if lane is MemoryLane.CUDA else 0,
+            host_pageable_bytes=(
+                plan.memory.policy_budget_bytes if lane is MemoryLane.CPU else mirror_bytes
+            ),
+            host_total_bytes=device_total_bytes if lane is MemoryLane.CPU else 0,
+            device_index=device_index,
+        )
+    else:
+        ledger = resident_ledger(
+            plan.memory,
+            device=device,
+            device_total_bytes=device_total_bytes,
+            device_index=device_index,
+        )
     with ExitStack() as rollback:
         leases = materialize_resident_kv(
             plan,
@@ -413,8 +464,74 @@ def build_configured_resources(
         )
         for lease in leases:
             rollback.callback(lease.close)
-        _, kv = bind_resident_kv(plan, leases)
+        tier_release: Callable[[], None] | None = None
+        # ExitStack runs callbacks in reverse order: close KV (and its
+        # canonical host entries) before releasing mirror claims, then slabs.
+        rollback.callback(lambda: tier_release() if tier_release is not None else None)
+        backend, kv = bind_resident_kv(plan, leases)
         rollback.callback(kv.close)
+        mirror_pinned = lane is MemoryLane.CUDA
+        if grouped_tiers:
+            if not isinstance(backend, KVCacheGroupManager):
+                raise TypeError("grouped host tier requires KVCacheGroupManager")
+            by_group = {lease.label: lease for lease in leases}
+            charged_labels: list[str] = []
+            try:
+                mirrors = {
+                    name: HostKVStorage(
+                        by_group[name].storage,
+                        capacity_pages=config.host_capacity_pages,
+                        pin_memory=lane is MemoryLane.CUDA,
+                    )
+                    for name, config in grouped_tiers.items()
+                }
+                if sum(mirror.total_bytes for mirror in mirrors.values()) != mirror_bytes:
+                    raise RuntimeError("grouped host mirror bytes disagree with the resolved plan")
+                pin_kinds = {mirror.pinned for mirror in mirrors.values()}
+                if len(pin_kinds) != 1:
+                    raise RuntimeError("grouped host mirrors must use one host memory tier")
+                mirror_pinned = next(iter(pin_kinds))
+                credits = TransferCredits(cache_config.tiering.max_inflight_bytes or mirror_bytes)
+                for name, mirror in mirrors.items():
+                    label = f"serving.kv.tier.{name}"
+                    ledger.admit(
+                        Reservation.backed(
+                            MemoryOwner.WORKSPACE,
+                            label,
+                            mirror.total_bytes,
+                            tier=claim_tier(
+                                MemoryOwner.WORKSPACE,
+                                lane=lane,
+                                pinned_host=mirror.pinned,
+                            ),
+                            device_index=device_index,
+                        )
+                    )
+                    charged_labels.append(label)
+                    backend.attach_tier(
+                        name,
+                        config=grouped_tiers[name],
+                        host_storage=mirror,
+                        transfer_engine=build_transfer_engine(
+                            mirror,
+                            prefer_async=cache_config.tiering.async_transfers,
+                        ),
+                        transfer_budget=credits,
+                    )
+            except BaseException:
+                backend.shutdown_tier()
+                backend.release_tier()
+                for label in reversed(charged_labels):
+                    ledger.release(label)
+                raise
+
+            def _release_grouped_tier() -> None:
+                backend.shutdown_tier()
+                backend.release_tier()
+                for label in reversed(charged_labels):
+                    ledger.release(label)
+
+            tier_release = _release_grouped_tier
         generation = mint_generation(
             model_id=model_id,
             model_revision=model_revision,
@@ -424,7 +541,7 @@ def build_configured_resources(
         )
         capacity = build_capacity_snapshot(
             generation=generation,
-            lane=MemoryLane.CPU if torch.device(device).type == "cpu" else MemoryLane.CUDA,
+            lane=lane,
             dtype=compute_dtype.label,
             kv_dtype=cache_config.kv_dtype.label,
             page_size=plan.storage_specs[0][1].page_size,
@@ -436,13 +553,14 @@ def build_configured_resources(
             activation_bytes=profile.activation_bytes if profile else 0,
             workspace_ceiling_bytes=profile.kernel_workspace_bytes if profile else 0,
             graph_bytes=profile.graph_pool_bytes if profile else 0,
-            staging_bytes=0,
+            staging_bytes=mirror_bytes,
             budget_bytes=plan.memory.policy_budget_bytes,
             kv_budget_bytes=plan.memory.kv_cache_bytes,
             weights_bytes=profile.weights_bytes if profile else 0,
             ledger=ledger,
+            staging_pinned=mirror_pinned,
         )
         kv.bind_capacity(capacity)
-        resources = WorkerResources(ledger, kv, leases, capacity)
+        resources = WorkerResources(ledger, kv, leases, capacity, tier_release=tier_release)
         rollback.pop_all()
         return plan, resources

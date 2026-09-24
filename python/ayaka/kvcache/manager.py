@@ -242,7 +242,7 @@ class LogicalKVManager:
         """
         self._require_open()
         backend = self.backend
-        if isinstance(backend, RuntimeMemoryManager):
+        if isinstance(backend, (RuntimeMemoryManager, KVCacheGroupManager)):
             backend.shutdown_tier()
 
     def evict_prefixes_for_pressure(self, required_pages: int) -> MemoryPressureResult:
@@ -406,8 +406,10 @@ class LogicalKVManager:
             if service is not None and not service.closed and not service.close():
                 raise RuntimeError("prefix service still has active transfers")
         else:
-            # Grouped prefix entries hold pins; drop them before the leak check
-            # so teardown can return every group page to the free pool.
+            # Drain grouped copies before releasing canonical device pins and
+            # host slots. A failed copy keeps its destination quarantined
+            # until the transfer engine proves quiescence.
+            self.backend.shutdown_tier()
             self.backend.clear_prefix_cache()
             self.backend.reclaim_deferred()
         if not self.backend.leak_report().clean:

@@ -31,14 +31,15 @@ from ayaka.kvcache.storage.dtypes import is_fp8_storage_dtype
 from ayaka.kvcache.storage.errors import KVStorageCompatibilityError
 from ayaka.kvcache.storage.geometry import BaseKVStorageSpec
 from ayaka.types import KVLayoutKind
-from ayaka.utils.torch_utils import has_dtype, torch_available
+from ayaka.utils.torch_utils import fp8_emulation_available, has_dtype, torch_available
 
 #: Compute capability floor for native FP8 arithmetic: sm_89 (Ada) and above.
 #:
 #: Tuple comparison is lexicographic, so sm_86 (Ampere, e.g. RTX 3050/A100)
-#: sorts below and is refused, while sm_90 (Hopper) passes. Below the floor FP8
-#: is still exercisable through the dequantized reference path, which is why
-#: this is a validation issue and not a hard import-time error.
+#: sorts below and falls back to the Triton emulation path, while sm_90
+#: (Hopper) passes natively. Below the floor FP8 is rejected only when that
+#: emulation path is unavailable, which is why this is a validation issue and
+#: not a hard import-time error.
 MINIMUM_NATIVE_FP8_COMPUTE_CAPABILITY: Final[tuple[int, int]] = (8, 9)
 
 #: Layouts with a validated backend, per device class.
@@ -119,8 +120,8 @@ def validate_kv_storage_support(
     """Validate dtype, device, layout and quantization without allocating.
 
     The support matrix: fp32, fp16 and bf16 run anywhere. FP8 needs a CUDA
-    device at compute capability 8.9 or above for native execution; below that
-    it is only exercisable through the dequantized reference path.
+    device; at compute capability 8.9 or above it executes natively, below that
+    it requires the Triton emulation path.
 
     Args:
         spec: Geometry to validate.
@@ -189,13 +190,15 @@ def validate_kv_storage_support(
                 )
             )
         elif compute_capability < MINIMUM_NATIVE_FP8_COMPUTE_CAPABILITY:
-            issues.append(
-                KVStorageCompatibilityIssue(
-                    KVStorageIssueCode.COMPUTE_CAPABILITY,
-                    f"native FP8 KV requires compute capability at least "
-                    f"{MINIMUM_NATIVE_FP8_COMPUTE_CAPABILITY}, got {compute_capability}",
+            if not fp8_emulation_available():
+                issues.append(
+                    KVStorageCompatibilityIssue(
+                        KVStorageIssueCode.COMPUTE_CAPABILITY,
+                        f"native FP8 KV requires compute capability at least "
+                        f"{MINIMUM_NATIVE_FP8_COMPUTE_CAPABILITY}, got {compute_capability}, "
+                        "and the Triton emulation path is unavailable",
+                    )
                 )
-            )
 
     # quantization coherence
     quantization = spec.quantization

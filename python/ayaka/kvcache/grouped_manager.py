@@ -22,6 +22,7 @@ from ayaka.handles import (
     StepMemoryLeaseHandle,
 )
 from ayaka.kvcache.grouped_prefix import GroupedPrefixCache
+from ayaka.kvcache.grouped_tiering import GroupedTierManager
 from ayaka.kvcache.groups import KVCacheGroup
 from ayaka.kvcache.layout import (
     LayoutFeatureCapability,
@@ -50,6 +51,14 @@ from ayaka.memory.state import (
     PageAllocationState,
     ReleaseStatus,
     ReservationFailure,
+)
+from ayaka.memory.tiering import (
+    HostKVStorage,
+    HostTierSnapshot,
+    ReadinessState,
+    TieringConfig,
+    TransferBudget,
+    TransferEngine,
 )
 from ayaka.memory.transaction import (
     GroupedLeaseRecord as _LeaseRecord,
@@ -205,8 +214,96 @@ class KVCacheGroupManager:
         self._prefix_snapshots: dict[int, GroupedPrefixSnapshot] = {}
         self._next_snapshot = 0
         self._prefix_cache: GroupedPrefixCache | None = None
+        self._tier: GroupedTierManager | None = None
         self._pending_prefix_matches: dict[int, GroupedValidResume] = {}
         self._next_prefix_match = 0
+
+    @property
+    def tiering_enabled(self) -> bool:
+        """Whether every cache group has an attached host mirror."""
+        return self._tier is not None and self._tier.enabled
+
+    @property
+    def tier_snapshots(self) -> Mapping[str, HostTierSnapshot]:
+        """Group-qualified host placement and transfer accounting."""
+        return {} if self._tier is None else self._tier.snapshots()
+
+    def attach_tier(
+        self,
+        group_name: str,
+        *,
+        config: TieringConfig,
+        host_storage: HostKVStorage,
+        transfer_engine: TransferEngine,
+        transfer_budget: TransferBudget | None = None,
+    ) -> None:
+        """Bind one group's host mirror before request admission."""
+        with self._lock:
+            if self._sequence_states != [None] * len(self._sequence_states):
+                raise InvalidStateTransitionError("tier must be attached before sequences")
+            if self._tier is None:
+                self._tier = GroupedTierManager(self)
+            self._tier.attach_group(
+                group_name,
+                config=config,
+                host_storage=host_storage,
+                transfer_engine=transfer_engine,
+                transfer_budget=transfer_budget,
+            )
+
+    def tier_entry_device_ready(self, entry_id: int) -> bool:
+        """A borrowed grouped boundary is usable only when every group is ready."""
+        return self._tier is None or self._tier.readiness(entry_id) is ReadinessState.DEVICE_VALID
+
+    def spill_prefix_entry(self, entry_id: int) -> bool:
+        """Begin a bounded all-group spill of one canonical prefix entry."""
+        with self._lock:
+            tier = self._tier
+            if tier is None or not tier.enabled or self._prefix_cache is None:
+                return False
+            entry = self._prefix_cache._entries.get(entry_id)
+            return entry is not None and tier.spill(entry)
+
+    def promote_prefix_entry(self, entry_id: int) -> bool:
+        """Queue a host checkpoint's all-group promotion, if capacity permits."""
+        with self._lock:
+            tier = self._tier
+            if tier is None or not tier.enabled or self._prefix_cache is None:
+                return False
+            entry = self._prefix_cache._entries.get(entry_id)
+            return entry is not None and tier.promote(entry)
+
+    def cancel_tier_entry(self, entry_id: int) -> bool:
+        """Keep both copy owners quarantined until shutdown or an explicit drain."""
+        with self._lock:
+            return self._tier is not None and self._tier.cancel(entry_id)
+
+    def tier_entry_evictable(self, entry_id: int) -> bool:
+        """Pending copies cannot lose their canonical source entry."""
+        return self._tier is None or self._tier.can_forget(entry_id)
+
+    def forget_tier_entry(self, entry_id: int) -> bool:
+        """Release host ownership only after a transfer has settled."""
+        return self._tier is None or self._tier.forget(entry_id)
+
+    def poll_transfers(self, *, drain: bool = False) -> int:
+        """Land completed group transfers before any resumed model read."""
+        with self._lock:
+            return 0 if self._tier is None else self._tier.poll(drain=drain)
+
+    def shutdown_tier(self) -> None:
+        """Synchronize transfers and settle quarantined destinations."""
+        with self._lock:
+            if self._tier is not None:
+                self._tier.shutdown()
+                self._tier.assert_invariants()
+
+    def release_tier(self) -> None:
+        """Drop group mirrors after canonical entries release their host slots."""
+        with self._lock:
+            if self._tier is not None:
+                self._tier.release()
+                self._tier = None
 
     @property
     def current_epoch(self) -> int:
@@ -1219,6 +1316,7 @@ class KVCacheGroupManager:
         with self._lock:
             before = self.snapshot()
             self._pressure_reclaim_attempts_total += 1
+            self.poll_transfers()
             reclaimed = sum(
                 runtime.allocator.reclaim_completed() for runtime in self._group_runtimes
             )
@@ -1259,6 +1357,21 @@ class KVCacheGroupManager:
             evicted = 0
             reclaimed = 0
             if cache is not None and cache.snapshot().terminal_entries:
+                if self.tiering_enabled:
+                    # Begin a bounded copy before dropping an idle canonical
+                    # boundary. Async copies create backpressure until poll
+                    # lands them; source pins remain owned throughout.
+                    for entry in sorted(
+                        cache._entries.values(),
+                        key=lambda value: (value.last_access, value.entry_id),
+                    ):
+                        if self.spill_prefix_entry(entry.entry_id):
+                            self.poll_transfers()
+                            reclaimed += sum(
+                                runtime.allocator.reclaim_completed()
+                                for runtime in self._group_runtimes
+                            )
+                            break
                 total_usable = sum(
                     runtime.allocator.snapshot().usable_pages for runtime in self._group_runtimes
                 )
@@ -1319,7 +1432,10 @@ class KVCacheGroupManager:
             existing = cache.find_exact(tokens, context=context)
             if existing is not None:
                 self.unpin_prefix(snapshot)
-                return existing
+                # A host-only entry remains the canonical token identity, but
+                # it cannot advertise a device-readable resume until the
+                # all-group promotion has published.
+                return existing if self.tier_entry_device_ready(existing.entry_id) else None
             try:
                 return cache.register(tokens, context=context, snapshot=snapshot)
             except BaseException:
@@ -1548,7 +1664,9 @@ class KVCacheGroupManager:
                         "group page request refs disagree with sequence ownership"
                     )
 
-            # Reservation accounting must match reserved pages per group.
+            # Reservation accounting includes destinations held during tier promotion.
+            if self._tier is not None:
+                self._tier.assert_invariants()
             for runtime in self._group_runtimes:
                 reserved = {
                     page
@@ -1558,6 +1676,13 @@ class KVCacheGroupManager:
                     if plan.group_name == runtime.descriptor.name
                     for page in plan.allocated_pages
                 }
+                if self._tier is not None:
+                    tier_reserved = set(self._tier.reserved_pages(runtime.descriptor.name))
+                    if reserved & tier_reserved:
+                        raise InvariantViolationError(
+                            f"group {runtime.descriptor.name} tier reservation overlaps a step"
+                        )
+                    reserved.update(tier_reserved)
                 if len(reserved) != runtime.allocator.snapshot().reserved_pages:
                     raise InvariantViolationError(
                         f"group {runtime.descriptor.name} reservation accounting differs"

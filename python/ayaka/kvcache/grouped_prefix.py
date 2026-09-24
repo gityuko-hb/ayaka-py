@@ -51,7 +51,7 @@ class GroupedPrefixEntry:
     entry_id: int
     context: PrefixCacheContext
     token_ids: tuple[int, ...]
-    snapshot: GroupedPrefixSnapshot
+    snapshot: GroupedPrefixSnapshot | None
     page_count: int
     last_access: int = 0
 
@@ -340,8 +340,34 @@ class GroupedPrefixCache:
         tokens = tuple(token_ids)
         if not tokens:
             return None
-        digests, partial_tokens = self._path(tokens, context)
         with self._lock:
+            if self._manager.tiering_enabled:
+                # A host entry keeps the canonical token identity, but its
+                # pages cannot back a borrowed resume until every group has
+                # promoted and published. Queue a bounded promotion while
+                # selecting the deepest currently device-readable boundary.
+                candidates = sorted(
+                    (
+                        entry
+                        for entry in self._entries.values()
+                        if entry.context == context
+                        and len(entry.token_ids) <= len(tokens)
+                        and tokens[: len(entry.token_ids)] == entry.token_ids
+                    ),
+                    key=lambda entry: (-entry.logical_position, entry.entry_id),
+                )
+                for entry in candidates:
+                    if entry.snapshot is None:
+                        self._manager.promote_prefix_entry(entry.entry_id)
+                        continue
+                    if not self._manager.tier_entry_device_ready(entry.entry_id):
+                        continue
+                    self._touch(entry)
+                    return GroupedValidResume(
+                        self.cache_id, entry.entry_id, entry.context, entry.token_ids
+                    )
+                return None
+            digests, _partial_tokens = self._path(tokens, context)
             found = self._index.match(context, digests, tokens, self._index_block)
             if found is None:
                 return None
@@ -361,10 +387,19 @@ class GroupedPrefixCache:
         self, token_ids: Sequence[int], *, context: PrefixCacheContext
     ) -> GroupedValidResume | None:
         """Return the entry for exactly these tokens, or None."""
-        match = self.match_resume(token_ids, context=context)
-        if match is None or match.logical_position != len(token_ids):
-            return None
-        return match
+        tokens = tuple(token_ids)
+        with self._lock:
+            entry = next(
+                (
+                    value
+                    for value in self._entries.values()
+                    if value.context == context and value.token_ids == tokens
+                ),
+                None,
+            )
+            if entry is None:
+                return None
+            return GroupedValidResume(self.cache_id, entry.entry_id, context, tokens)
 
     def register(
         self,
@@ -431,6 +466,8 @@ class GroupedPrefixCache:
                 or entry.logical_position != match.logical_position
             ):
                 raise PrefixCapabilityStaleError("grouped resume identity changed")
+            if entry.snapshot is None or not self._manager.tier_entry_device_ready(entry.entry_id):
+                raise PrefixCapabilityStaleError("grouped resume is not device-readable")
             self._touch(entry)
             return entry.snapshot
 
@@ -440,15 +477,18 @@ class GroupedPrefixCache:
             entry = self._select(entry_id)
             if entry is None:
                 return False
+            if not self._manager.forget_tier_entry(entry.entry_id):
+                return False
             digests, partial_tokens = self._path(entry.token_ids, entry.context)
             self._index.remove(entry.context, digests, partial_tokens, entry.entry_id)
             del self._entries[entry.entry_id]
             self._evicted_entries_total += 1
-            self._evicted_pages_total += entry.page_count
             snapshot = entry.snapshot
+            self._evicted_pages_total += entry.page_count if snapshot is not None else 0
         # Pins release outside the cache lock; the manager lock is reentrant on
         # the engine thread and the entry is already unreachable.
-        self._manager.unpin_prefix(snapshot)
+        if snapshot is not None:
+            self._manager.unpin_prefix(snapshot)
         return True
 
     def evict(self, target_pages: int, *, safe_epoch: int) -> int:
@@ -461,7 +501,7 @@ class GroupedPrefixCache:
                 entry = self._select(None)
                 if entry is None:
                     break
-                pages = entry.page_count
+                pages = entry.page_count if entry.snapshot is not None else 0
                 if not self.evict_entry(entry.entry_id, safe_epoch=safe_epoch):
                     break
                 released += pages
@@ -475,11 +515,12 @@ class GroupedPrefixCache:
                 entry = self._select(None)
                 if entry is None:
                     break
-                pages = entry.page_count
+                pages = entry.page_count if entry.snapshot is not None else 0
                 if not self.evict_entry(entry.entry_id, safe_epoch=safe_epoch):
                     break
                 released += pages
-            self._index.clear()
+            if not self._entries:
+                self._index.clear()
             return released
 
     def snapshot(self) -> PrefixCacheSnapshot:
@@ -487,7 +528,9 @@ class GroupedPrefixCache:
         with self._lock:
             entries = sorted(self._entries.values(), key=lambda item: item.entry_id)
             return PrefixCacheSnapshot(
-                cached_blocks=sum(entry.page_count for entry in entries),
+                cached_blocks=sum(
+                    entry.page_count for entry in entries if entry.snapshot is not None
+                ),
                 terminal_entries=len(entries),
                 cached_tokens=sum(entry.logical_position for entry in entries),
                 handles=tuple(PrefixHandle(entry.entry_id, 1) for entry in entries),
@@ -509,10 +552,13 @@ class GroupedPrefixCache:
                 if key in seen_tokens:
                     raise InvariantViolationError("duplicate grouped prefix entry identity")
                 seen_tokens.add(key)
-                if entry.snapshot.logical_position != entry.logical_position:
-                    raise InvariantViolationError("grouped prefix snapshot boundary drifted")
-                if entry.snapshot.manager_id != id(self._manager):
-                    raise InvariantViolationError("grouped prefix snapshot owner drifted")
+                if entry.snapshot is not None:
+                    if entry.snapshot.logical_position != entry.logical_position:
+                        raise InvariantViolationError("grouped prefix snapshot boundary drifted")
+                    if entry.snapshot.manager_id != id(self._manager):
+                        raise InvariantViolationError("grouped prefix snapshot owner drifted")
+                elif self._manager.tier_entry_device_ready(entry.entry_id):
+                    raise InvariantViolationError("host grouped prefix entry is device-ready")
                 digests, partial_tokens = self._path(entry.token_ids, entry.context)
                 found = self._index.match(
                     entry.context, digests, entry.token_ids, self._index_block
@@ -554,4 +600,9 @@ class GroupedPrefixCache:
             return self._entries.get(entry_id)
         if not self._entries:
             return None
-        return min(self._entries.values(), key=lambda item: (item.last_access, item.entry_id))
+        candidates = (
+            entry
+            for entry in self._entries.values()
+            if self._manager.tier_entry_evictable(entry.entry_id)
+        )
+        return min(candidates, key=lambda item: (item.last_access, item.entry_id), default=None)

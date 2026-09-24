@@ -281,13 +281,6 @@ class ResidentKVEngine(Engine):
         """
         resolved_scheduler = scheduler_config or SchedulerConfig()
         parallel = parallel_config or ParallelConfig()
-        if cache_config.tiering.host_bytes:
-            # R12B certifies the homogeneous serving-runtime tier only; the
-            # grouped resident path combines both features in R12C.
-            raise ValueError(
-                "cache.tiering.host_bytes requires the homogeneous serving runtime; "
-                "the grouped resident path stays tier-free until R12C"
-            )
         kv_plan, resources = build_configured_resources(
             architecture,
             cache_config,
@@ -304,6 +297,8 @@ class ResidentKVEngine(Engine):
             device=device,
             device_index=device_index,
             zero_initialize=zero_initialize,
+            prefix_enabled=prefix_context is not None,
+            graph_enabled=getattr(runner, "graph_pool", None) is not None,
         )
         kv, ledger = resources.kv, resources.ledger
         if worker_factory is not None:
