@@ -20,6 +20,7 @@ from ayaka.attention.metadata import (
     CommonAttentionMetadata,
 )
 from ayaka.attention.spec import AttentionGroupSpec
+from ayaka.kernel.triton.cache.cache_ops import write_kv
 from ayaka.kvcache.build import MHAStorage
 from ayaka.kvcache.manager import LogicalKVManager
 from ayaka.kvcache.storage.ports import KVStorage
@@ -77,12 +78,17 @@ class StoragePagedKVCache:
         return None
 
     def store_kv(self, key, value, slot_mapping, layer_id: int) -> None:
-        # Slots are host-validated by the lease owner before enqueue.
-        for cache, source in (
-            (self.key_cache(layer_id), key),
-            (self.value_cache(layer_id), value),
-        ):
-            cache.flatten(0, 1).index_copy_(0, slot_mapping.to(torch.long), source)
+        # Slots are host-validated by the lease owner before enqueue. The
+        # semantic op declares both mutations and remains capture-safe.
+        write_kv(
+            key,
+            value,
+            self.key_cache(layer_id),
+            self.value_cache(layer_id),
+            slot_mapping.to(torch.long),
+            1.0,
+            1.0,
+        )
 
 
 @dataclass

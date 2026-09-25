@@ -194,6 +194,9 @@ def quantize_if_fp8(x, scale, QUANT: tl.constexpr, IS_E5M2: tl.constexpr):
                 out = y.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
             else:
                 out = e4m3_f32_to_u8(scaled)
+        # Match torch casts for signed NaNs on both native and emulated paths.
+        nan_bits = ((scaled.to(tl.uint32, bitcast=True) >> 24) & 0x80) | 0x7F
+        out = tl.where(scaled != scaled, nan_bits.to(tl.uint8), out)
     else:
         out = x
     return out

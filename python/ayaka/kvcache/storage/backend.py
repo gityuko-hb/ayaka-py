@@ -10,9 +10,7 @@ from ayaka.kvcache.storage.errors import KVQuantizationError, StorageClosedError
 from ayaka.kvcache.storage.geometry import BaseKVStorageSpec
 from ayaka.kvcache.storage.index import (
     SlotIndex,
-    index_copy_storage,
     index_fill_storage,
-    index_select_storage,
     page_index,
     slot_index,
     validated_page_ids,
@@ -442,19 +440,23 @@ class PagedKVStorage:
             expected_count=token_count,
         )
 
-        quantization = self._quantization
-        for position, (plane, tensor) in enumerate(zip(self._layout.planes, values, strict=True)):
-            payload = tensor
-            if quantization.is_quantized:
-                _, inverse = self._require_scale(layer_index, position)
-                # Scale, then clamp to the representable range, then let
-                # index_copy_storage cast. Without the clamp an out-of-range
-                # value saturates inside the cast with no diagnostic.
-                limit = quantization.storage_dtype_max
-                payload = tensor.float().mul(inverse).clamp_(-limit, limit)
-            destination = self._flat(self._planes[layer_index][position], plane.tail)
-            index_copy_storage(torch, destination, index.tensor, payload)
-            self._written.add((layer_index, position))
+        # Validate every scale before mutating either plane. A missing V scale
+        # must not leave K partially updated.
+        inverses = tuple(
+            self._require_scale(layer_index, position)[1]
+            if self._quantization.is_quantized
+            else 1.0
+            for position in range(len(self._layout))
+        )
+        from ayaka.kernel.triton.cache.cache_ops import scatter_cache, write_kv
+
+        planes = self._planes[layer_index]
+        if self.plane_names == ("key", "value") and planes[0].shape == planes[1].shape:
+            write_kv(values[0], values[1], planes[0], planes[1], index.tensor, *inverses)
+        else:
+            for tensor, plane, inverse in zip(values, planes, inverses, strict=True):
+                scatter_cache(tensor, plane, index.tensor, inverse)
+        self._written.update((layer_index, position) for position in range(len(self._layout)))
 
     def write_planes(self, layer_index: int, slots: Any, /, **values: Any) -> None:
         """Scatter planes addressed by name rather than by position.
@@ -500,18 +502,22 @@ class PagedKVStorage:
             require_unique=require_unique,
         )
 
+        from ayaka.kernel.triton.cache.cache_ops import gather_cache
+
+        dequantize = quantization.is_quantized and not raw
+        scales = tuple(
+            self._require_scale(layer_index, position)[0] if dequantize else 1.0
+            for position in range(len(self._layout))
+        )
         outputs: list[Any] = []
         for position, plane in enumerate(self._layout.planes):
-            source = self._flat(self._planes[layer_index][position], plane.tail)
-            gathered = index_select_storage(torch, source, index.tensor)
-            if quantization.is_quantized and not raw:
-                # Dequantize in fp32 first, then cast. Casting first would run
-                # the multiply in the target dtype, where a large scale can
-                # overflow fp16 even though the real value fits.
-                scale, _ = self._require_scale(layer_index, position)
-                gathered = gathered.float().mul(scale)
-            if dtype is not None:
-                gathered = gathered.to(dtype=dtype)
+            source = self._planes[layer_index][position]
+            gathered = torch.empty(
+                (index.count, *plane.tail),
+                device=self._device,
+                dtype=source.dtype if dtype is None else dtype,
+            )
+            gather_cache(source, index.tensor, gathered, scales[position], dequantize)
             outputs.append(gathered)
         return tuple(outputs)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from typing import Any, cast
@@ -161,6 +162,8 @@ def reshape_and_cache_flash_kernel(
     HEADS_PER_PROG: tl.constexpr,
     KV_QUANTIZED: tl.constexpr,
     IS_E5M2: tl.constexpr,
+    SCALAR_SCALES: tl.constexpr,
+    INVERSE_SCALES: tl.constexpr,
 ):
     """Write K/V into ``[block, token, head, dim]`` cache views."""
     token = tl.program_id(0).to(tl.int64)
@@ -188,12 +191,21 @@ def reshape_and_cache_flash_kernel(
     )
 
     if KV_QUANTIZED:
-        k_scale = tl.load(k_scale_ptr + h * kv_scale_stride, mask=hmask, other=1.0)[:, None]
-        v_scale = tl.load(v_scale_ptr + h * kv_scale_stride, mask=hmask, other=1.0)[:, None]
+        if SCALAR_SCALES:
+            k_scale = k_scale_ptr
+            v_scale = v_scale_ptr
+        else:
+            k_scale = tl.load(k_scale_ptr + h * kv_scale_stride, mask=hmask, other=1.0)[:, None]
+            v_scale = tl.load(v_scale_ptr + h * kv_scale_stride, mask=hmask, other=1.0)[:, None]
     else:
         k_scale = 1.0
         v_scale = 1.0
 
+    if KV_QUANTIZED and INVERSE_SCALES:
+        k = k.to(tl.float32) * k_scale
+        v = v.to(tl.float32) * v_scale
+        k_scale = 1.0
+        v_scale = 1.0
     k_out = quantize_if_fp8(k, k_scale, KV_QUANTIZED, IS_E5M2)
     v_out = quantize_if_fp8(v, v_scale, KV_QUANTIZED, IS_E5M2)
 
@@ -365,33 +377,43 @@ def gather_cache_kernel(
     KV_QUANTIZED: tl.constexpr,
     IS_E5M2: tl.constexpr,
     HAS_SEQ_STARTS: tl.constexpr,
+    DIRECT_SLOTS: tl.constexpr,
+    SCALAR_SCALE: tl.constexpr,
 ):
     """Gather paged cache entries and optionally dequantize FP8."""
     tok = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
-    ok, req, pos = resolve_token_locations(
-        tok,
-        num_tokens,
-        cu_seq_lens_ptr,
-        seq_starts_ptr,
-        num_reqs,
-        num_iters,
-        HAS_SEQ_STARTS,
-        True,
-    )
-
-    logical = pos // block_size
-    in_block = pos - logical * block_size
-    ok = ok & (logical < block_table_cols)
-    phys = tl.load(
-        block_table_ptr + req.to(tl.int64) * block_table_stride + logical,
-        mask=ok,
-        other=0,
-    ).to(tl.int64)
+    if DIRECT_SLOTS:
+        ok = tok < num_tokens
+        slot = tl.load(block_table_ptr + tok, mask=ok, other=0).to(tl.int64)
+        phys = slot // block_size
+        in_block = slot % block_size
+    else:
+        ok, req, pos = resolve_token_locations(
+            tok,
+            num_tokens,
+            cu_seq_lens_ptr,
+            seq_starts_ptr,
+            num_reqs,
+            num_iters,
+            HAS_SEQ_STARTS,
+            True,
+        )
+        logical = pos // block_size
+        in_block = pos - logical * block_size
+        ok = ok & (logical < block_table_cols)
+        phys = tl.load(
+            block_table_ptr + req.to(tl.int64) * block_table_stride + logical,
+            mask=ok,
+            other=0,
+        ).to(tl.int64)
 
     src_row = src_cache_ptr + phys * cache_block_stride + in_block.to(tl.int64) * cache_entry_stride
     dst_row = dst_ptr + tok.to(tl.int64) * dst_entry_stride
     if KV_QUANTIZED:
-        scale = tl.load(scale_ptr)
+        if SCALAR_SCALE:
+            scale = scale_ptr
+        else:
+            scale = tl.load(scale_ptr)
     else:
         scale = 1.0
 
@@ -400,6 +422,9 @@ def gather_cache_kernel(
         m = ok[:, None] & (e < ENTRY_SIZE)[None, :]
         x = tl.load(src_row[:, None] + e[None, :], mask=m, other=0)
         y = dequantize_if_fp8(x, scale, KV_QUANTIZED, IS_E5M2)
+        if DIRECT_SLOTS and KV_QUANTIZED and not IS_E5M2:
+            # Public storage reads preserve E4M3 NaN codes as PyTorch does.
+            y = tl.where((x & 0x7F) == 0x7F, float("nan"), y)
         tl.store(dst_row[:, None] + e[None, :], y.to(dst_ptr.dtype.element_ty), mask=m)
 
 
@@ -677,10 +702,17 @@ def reshape_and_cache_flash(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens] int64
     kv_cache_dtype: str,
-    k_scale: torch.Tensor,  # float32 [1] or [num_heads]
-    v_scale: torch.Tensor,
+    k_scale: torch.Tensor | float,  # float32 [1] or [num_heads]
+    v_scale: torch.Tensor | float,
+    *,
+    inverse_scales: bool = False,
 ) -> None:
-    """Write K/V into a FlashAttention-friendly paged cache view."""
+    """Write K/V to NHD/HND views; optionally use host scalar inverse scales.
+
+    ``inverse_scales=True`` preserves storage's fp32 ``x * (1/scale)``
+    rounding. Host scalars require no extra device allocation or synchronization.
+    Slot bounds and uniqueness must have been checked by the caller.
+    """
     _check(key.is_cuda and value.is_cuda, "key and value must be CUDA tensors")
     _same_device(
         key,
@@ -717,10 +749,21 @@ def reshape_and_cache_flash(
         key_cache.stride() == value_cache.stride(),
         "key_cache and value_cache must have identical strides",
     )
-    _check(
-        tuple(k_scale.shape) == tuple(v_scale.shape), "k_scale and v_scale must have the same shape"
-    )
-    _check(k_scale.numel() in (1, num_heads), "scales must contain either 1 or num_heads values")
+    scalar_scales = isinstance(k_scale, (int, float)) and isinstance(v_scale, (int, float))
+    if scalar_scales:
+        _check(
+            all(math.isfinite(float(s)) and float(s) > 0 for s in (k_scale, v_scale)),
+            "scalar scales must be finite and positive",
+        )
+    else:
+        _check(
+            isinstance(k_scale, torch.Tensor) and isinstance(v_scale, torch.Tensor),
+            "scales must both be tensors or both be scalars",
+        )
+        k_scale = cast(torch.Tensor, k_scale)
+        v_scale = cast(torch.Tensor, v_scale)
+        _check(k_scale.shape == v_scale.shape, "k_scale and v_scale must have the same shape")
+        _check(k_scale.numel() in (1, num_heads), "scales must contain 1 or num_heads values")
 
     kv_dtype, quantized, is_e5m2 = _dtype_flags(kv_cache_dtype)
     if quantized:
@@ -728,7 +771,13 @@ def reshape_and_cache_flash(
             key_cache.element_size() == 1 and value_cache.element_size() == 1,
             "quantized caches must use 1-byte storage",
         )
-        _validate_quant_scales(True, key, k_scale=k_scale, v_scale=v_scale)
+        if not scalar_scales:
+            _validate_quant_scales(
+                True,
+                key,
+                k_scale=cast(torch.Tensor, k_scale),
+                v_scale=cast(torch.Tensor, v_scale),
+            )
     else:
         _check(
             key_cache.dtype == key.dtype and value_cache.dtype == key.dtype,
@@ -742,7 +791,7 @@ def reshape_and_cache_flash(
     vc = cache_kernel_view(value_cache, kv_dtype)
     k_scale_ptr = k_scale if quantized else slot_mapping
     v_scale_ptr = v_scale if quantized else slot_mapping
-    scale_stride = 1 if k_scale.numel() > 1 else 0
+    scale_stride = 0 if scalar_scales else int(cast(torch.Tensor, k_scale).numel() > 1)
     block_d = triton.next_power_of_2(head_size)
     heads_per_prog = min(triton.next_power_of_2(num_heads), max(1, 1024 // block_d))
 
@@ -772,6 +821,8 @@ def reshape_and_cache_flash(
                 HEADS_PER_PROG=heads_per_prog,
                 KV_QUANTIZED=quantized,
                 IS_E5M2=is_e5m2,
+                SCALAR_SCALES=scalar_scales,
+                INVERSE_SCALES=inverse_scales,
                 num_warps=warps_for_tile(block_d * heads_per_prog),
             ),
         )
@@ -891,6 +942,8 @@ def _gather_launch(
                 KV_QUANTIZED=quantized,
                 IS_E5M2=is_e5m2,
                 HAS_SEQ_STARTS=seq_starts is not None,
+                DIRECT_SLOTS=False,
+                SCALAR_SCALE=False,
                 num_warps=4,
             ),
         )
@@ -1159,4 +1212,109 @@ def cp_gather_indexer_k_quant_cache(
                 BLOCK_S=triton.next_power_of_2(num_qblocks),
                 num_warps=4,
             ),
+        )
+
+
+@triton.jit
+def scatter_cache_slots_kernel(
+    src_ptr,
+    dst_ptr,
+    slots_ptr,
+    inverse_scale,
+    src_stride,
+    dst_stride,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+    QUANT: tl.constexpr,
+    IS_E5M2: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(slots_ptr + row)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(src_ptr + row * src_stride + col, mask=col < WIDTH, other=0)
+    if QUANT:
+        x = x.to(tl.float32) * inverse_scale
+    y = quantize_if_fp8(x, 1.0, QUANT, IS_E5M2)
+    tl.store(dst_ptr + slot * dst_stride + col, y, mask=col < WIDTH)
+
+
+def scatter_cache_slots(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    slots: torch.Tensor,
+    inverse_scale: float,
+    kv_cache_dtype: str,
+) -> None:
+    """Scatter contiguous row payloads using caller-validated unique slots.
+
+    Used for planes with different widths (MLA), and dtype-converting writes.
+    Inputs are flat ``[rows, width]`` views on one GPU.
+    """
+    kv_dtype, quantized, is_e5m2 = _dtype_flags(kv_cache_dtype)
+    if slots.numel() == 0 or dst.size(1) == 0:
+        return
+    dst_view = cache_kernel_view(dst, kv_dtype)
+    with torch.cuda.device(src.device):
+        cast(Any, scatter_cache_slots_kernel)[(slots.numel(), triton.cdiv(dst.size(1), 256))](
+            src,
+            dst_view,
+            slots,
+            inverse_scale,
+            src.stride(0),
+            dst_view.stride(0),
+            WIDTH=dst.size(1),
+            BLOCK=256,
+            QUANT=quantized,
+            IS_E5M2=is_e5m2,
+            num_warps=4,
+        )
+
+
+def gather_cache_slots(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    slots: torch.Tensor,
+    scale: float,
+    kv_cache_dtype: str,
+) -> None:
+    """Gather prevalidated slots without constructing synthetic block tables.
+
+    ``src`` is a contiguous ``[pages, page_size, width]`` view; ``dst`` is
+    ``[tokens, width]``. AUTO copies same-dtype payloads bit-for-bit, including
+    FP8 codes; explicit FP8 dtype dequantizes in fp32 before the output cast.
+    Repeated slots are allowed. Bounds remain the storage/lease owner's job.
+    """
+    kv_dtype, quantized, is_e5m2 = _dtype_flags(kv_cache_dtype)
+    if slots.numel() == 0 or dst.size(1) == 0:
+        return
+    source = cache_kernel_view(src, kv_dtype)
+    output = dst
+    if not quantized and src.dtype == dst.dtype:
+        source, output = as_int_view(src), as_int_view(dst)
+    with torch.cuda.device(src.device):
+        cast(Any, gather_cache_kernel)[(triton.cdiv(slots.numel(), GATHER_BLOCK_T),)](
+            source,
+            output,
+            slots,
+            slots,
+            slots,
+            scale,
+            0,
+            slots.numel(),
+            src.size(1),
+            0,
+            0,
+            0,
+            source.stride(0),
+            source.stride(1),
+            output.stride(0),
+            ENTRY_SIZE=dst.size(1),
+            BLOCK_T=GATHER_BLOCK_T,
+            BLOCK_E=min(256, triton.next_power_of_2(dst.size(1))),
+            KV_QUANTIZED=quantized,
+            IS_E5M2=is_e5m2,
+            HAS_SEQ_STARTS=False,
+            DIRECT_SLOTS=True,
+            SCALAR_SCALE=True,
+            num_warps=4,
         )

@@ -328,17 +328,29 @@ class HostKVStorage:
 
     def copy_device_to_host(self, *, device_page: int, host_slot: int) -> None:
         """Copy one whole page out of every device buffer into the mirror."""
+        from ayaka.kernel.triton.cache.cache_ops import copy_cache
+
         self._validate(device_page=device_page, host_slot=host_slot)
         device_first, device_second = self._device_storage.buffers()
-        for host, device in self._pairs(device_first, device_second):
-            host[host_slot].copy_(device[device_page], non_blocking=self._pinned)
+        pairs = tuple(self._pairs(device_first, device_second))
+        copy_cache(
+            [device[device_page] for host, device in pairs],
+            [host[host_slot] for host, device in pairs],
+            self._pinned,
+        )
 
     def copy_host_to_device(self, *, host_slot: int, device_page: int) -> None:
         """Copy one whole page from the mirror back into every device buffer."""
+        from ayaka.kernel.triton.cache.cache_ops import copy_cache
+
         self._validate(device_page=device_page, host_slot=host_slot)
         device_first, device_second = self._device_storage.buffers()
-        for host, device in self._pairs(device_first, device_second):
-            device[device_page].copy_(host[host_slot], non_blocking=self._pinned)
+        pairs = tuple(self._pairs(device_first, device_second))
+        copy_cache(
+            [host[host_slot] for host, device in pairs],
+            [device[device_page] for host, device in pairs],
+            self._pinned,
+        )
 
     def synchronize(self) -> None:
         """Block until every copy issued from this mirror has actually landed.

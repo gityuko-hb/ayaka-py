@@ -344,18 +344,22 @@ class LocalWorker(StepWorker):
             self._pool = None
 
     def _copy_pages(self, step: WorkerStep) -> None:
+        from ayaka.kernel.triton.cache.cache_ops import copy_cache
+
+        sources, destinations = [], []
         for copy in step.prepared.memory_view.copies:
             source = self.kv.physical_page(copy.group_name, copy.source)
             destination = self.kv.physical_page(copy.group_name, copy.destination)
             storage = self.kv.storages[copy.group_name].storage
             if not 0 < copy.valid_tokens <= storage.page_size:
                 raise ValueError("invalid COW copy length")
-            # Copy the physical representation bit-for-bit, including quantized planes.
+            # Slice valid tokens only; never overwrite a destination's tail.
             for family in storage.buffers():
                 for tensor in family:
-                    tensor[destination, : copy.valid_tokens].copy_(
-                        tensor[source, : copy.valid_tokens]
-                    )
+                    sources.append(tensor[source, : copy.valid_tokens])
+                    destinations.append(tensor[destination, : copy.valid_tokens])
+        if sources:
+            copy_cache(sources, destinations, False)
 
     def _apply_cow(self, step: WorkerStep) -> None:
         """Run lease-owned KV copies on the transfer stream at the batch boundary."""
