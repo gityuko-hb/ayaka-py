@@ -25,6 +25,33 @@ def silu_and_mul_ref(
     return res
 
 
+def swigluoai_and_mul_ref(
+    input: torch.Tensor,
+    out: torch.Tensor | None = None,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+    limit: float = 7.0,
+) -> torch.Tensor:
+    """Clamped, parameterized SwiGLU over packed [gate, up] halves."""
+    gate, up = input.float().chunk(2, dim=-1)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    result = (gate * torch.sigmoid(alpha * gate) * (up + beta)).to(input.dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def relu2_ref(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Squared ReLU with one output cast."""
+    result = torch.relu(input.float()).square().to(input.dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
 def gelu_and_mul_ref(
     input: torch.Tensor,
     out: torch.Tensor | None = None,

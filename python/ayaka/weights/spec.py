@@ -183,6 +183,7 @@ class FP8ActivationScheme(enum.StrEnum):
 
 class FP8ScaleFormat(enum.StrEnum):
     FP32 = "float32"
+    BF16 = "bfloat16"
     UE8M0 = "ue8m0"
 
 
@@ -260,9 +261,7 @@ class FP8RecipeSpec:
             object.__setattr__(self, name, value.strip())
 
         if self.zero_policy is FP8ZeroPolicy.AMAX_FLOOR:
-            if isinstance(self.amax_floor, bool) or not isinstance(
-                self.amax_floor, (int, float)
-            ):
+            if isinstance(self.amax_floor, bool) or not isinstance(self.amax_floor, (int, float)):
                 raise TypeError("amax_floor must be a finite positive number for dynamic recipes")
             try:
                 floor = float(self.amax_floor)
@@ -292,10 +291,14 @@ class FP8RecipeSpec:
         if self.version < 1:
             raise ValueError("version must be >= 1")
 
-        uses_checkpoint_calibration = self.activation_scheme in (
-            FP8ActivationScheme.STATIC,
-            FP8ActivationScheme.CALIBRATED,
-        ) or self.recipe is FP8Recipe.W8A16
+        uses_checkpoint_calibration = (
+            self.activation_scheme
+            in (
+                FP8ActivationScheme.STATIC,
+                FP8ActivationScheme.CALIBRATED,
+            )
+            or self.recipe is FP8Recipe.W8A16
+        )
         if uses_checkpoint_calibration and self.calibration_source is None:
             raise ValueError("static, calibrated, and W8A16 recipes require calibration_source")
 
@@ -328,23 +331,38 @@ class FP8RecipeSpec:
             ],
         ] = {
             FP8Recipe.W8A8_STATIC_PER_TENSOR: (
-                FP8ActivationScheme.STATIC, None, None, FP8ScaleFormat.FP32,
+                FP8ActivationScheme.STATIC,
+                None,
+                None,
+                FP8ScaleFormat.FP32,
                 FP8ZeroPolicy.CHECKPOINT_SCALE,
             ),
             FP8Recipe.W8A8_DYNAMIC_PER_TENSOR: (
-                FP8ActivationScheme.DYNAMIC, None, None, FP8ScaleFormat.FP32,
+                FP8ActivationScheme.DYNAMIC,
+                None,
+                None,
+                FP8ScaleFormat.FP32,
                 FP8ZeroPolicy.AMAX_FLOOR,
             ),
             FP8Recipe.W8A8_ROWWISE: (
-                FP8ActivationScheme.DYNAMIC, None, None, FP8ScaleFormat.FP32,
+                FP8ActivationScheme.DYNAMIC,
+                None,
+                None,
+                FP8ScaleFormat.FP32,
                 FP8ZeroPolicy.AMAX_FLOOR,
             ),
             FP8Recipe.W8A8_BLOCK128: (
-                FP8ActivationScheme.DYNAMIC, (1, 128), (128, 128), FP8ScaleFormat.FP32,
+                FP8ActivationScheme.DYNAMIC,
+                (1, 128),
+                (128, 128),
+                FP8ScaleFormat.FP32,
                 FP8ZeroPolicy.AMAX_FLOOR,
             ),
             FP8Recipe.MXFP8: (
-                FP8ActivationScheme.DYNAMIC, (1, 32), (1, 32), FP8ScaleFormat.UE8M0,
+                FP8ActivationScheme.DYNAMIC,
+                (1, 32),
+                (1, 32),
+                FP8ScaleFormat.UE8M0,
                 FP8ZeroPolicy.AMAX_FLOOR,
             ),
         }
@@ -360,6 +378,8 @@ class FP8RecipeSpec:
         activation_scheme, activation_block, weight_block, scale_format, zero_policy = expected[
             recipe
         ]
+        if recipe is FP8Recipe.W8A8_BLOCK128 and self.scale_format is FP8ScaleFormat.BF16:
+            scale_format = FP8ScaleFormat.BF16
         actual = (
             self.activation_scheme,
             self.activation_block,
@@ -445,11 +465,11 @@ class QuantSpec:
             raise ValueError("FP8 weight recipes in QuantSpec require E4M3 storage")
         if self.weight_dtype is not DType.FP8_E4M3:
             raise ValueError("FP8 weight recipes require weight_dtype=FP8_E4M3")
-        expected_scale_dtype = (
-            DType.UINT8
-            if self.fp8_recipe.scale_format is FP8ScaleFormat.UE8M0
-            else DType.FP32
-        )
+        expected_scale_dtype = {
+            FP8ScaleFormat.UE8M0: DType.UINT8,
+            FP8ScaleFormat.BF16: DType.BF16,
+            FP8ScaleFormat.FP32: DType.FP32,
+        }[self.fp8_recipe.scale_format]
         if self.scale_dtype is not expected_scale_dtype:
             raise ValueError(
                 f"{self.fp8_recipe.scale_format.value} scales require "
@@ -525,10 +545,7 @@ class WeightSpec:
     optional: bool = False
 
     def __post_init__(self) -> None:
-        if (
-            self.quant.fp8_recipe is not None
-            and self.spec.dtype is not self.quant.weight_dtype
-        ):
+        if self.quant.fp8_recipe is not None and self.spec.dtype is not self.quant.weight_dtype:
             raise ValueError(
                 f"{self.name}: tensor storage dtype {self.spec.dtype.label} does not match "
                 f"FP8 recipe dtype {self.quant.weight_dtype.label}"

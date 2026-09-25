@@ -188,7 +188,9 @@ def validate_w8a16_scale(
     """
     require_tensor(weight_scale, "weight_scale")
     require_same_device(weight_scale, "weight_scale", reference, reference_name)
-    expected = torch.uint8 if scale_dtype == "e8m0" else torch.float32
+    expected = {"e8m0": torch.uint8, "float32": torch.float32, "bfloat16": torch.bfloat16}[
+        scale_dtype
+    ]
     if weight_scale.dtype is not expected:
         raise TypeError(f"{scale_dtype} weight_scale must have dtype {expected}")
     if weight_scale.numel() < div_ceil(columns, block_size_y) * scale_row_stride:

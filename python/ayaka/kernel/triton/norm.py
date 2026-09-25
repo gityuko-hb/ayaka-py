@@ -217,26 +217,31 @@ def _fused_add_rms_norm_kernel(
     scale_ptr,
     d,
     stride_input,
+    stride_input_head,
     stride_residual,
+    stride_residual_head,
     stride_output,
+    stride_output_head,
     eps,
+    HEADS: tl.constexpr,
     WEIGHT_BIAS: tl.constexpr,
     QUANTIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(axis=0).to(tl.int64)
+    batch = row // HEADS
+    head = row % HEADS
+    input_base = batch * stride_input + head * stride_input_head
+    residual_base = batch * stride_residual + head * stride_residual_head
+    output_base = batch * stride_output + head * stride_output_head
     lanes = tl.arange(0, BLOCK_SIZE)
 
     if d <= BLOCK_SIZE:
         mask = lanes < d
-        in_val = tl.load(input_ptr + row * stride_input + lanes, mask=mask, other=0.0).to(
-            tl.float32
-        )
-        res_val = tl.load(residual_ptr + row * stride_residual + lanes, mask=mask, other=0.0).to(
-            tl.float32
-        )
+        in_val = tl.load(input_ptr + input_base + lanes, mask=mask, other=0.0).to(tl.float32)
+        res_val = tl.load(residual_ptr + residual_base + lanes, mask=mask, other=0.0).to(tl.float32)
         x = in_val + res_val
-        tl.store(residual_ptr + row * stride_residual + lanes, x, mask=mask)
+        tl.store(residual_ptr + residual_base + lanes, x, mask=mask)
 
         sum_sq = tl.sum(tl.where(mask, x * x, 0.0), axis=0)
         rms_rcp = tl.rsqrt(sum_sq / d + eps)
@@ -248,29 +253,23 @@ def _fused_add_rms_norm_kernel(
             normed *= scale_inv
             normed = tl.maximum(-FP8_E4M3_MAX, tl.minimum(normed, FP8_E4M3_MAX))
             if e4m3_native_cx():
-                tl.store(
-                    output_ptr + row * stride_output + lanes, normed.to(tl.float8e4nv), mask=mask
-                )
+                tl.store(output_ptr + output_base + lanes, normed.to(tl.float8e4nv), mask=mask)
             else:
-                tl.store(
-                    output_ptr + row * stride_output + lanes, e4m3_f32_to_u8(normed), mask=mask
-                )
+                tl.store(output_ptr + output_base + lanes, e4m3_f32_to_u8(normed), mask=mask)
         else:
-            tl.store(output_ptr + row * stride_output + lanes, normed, mask=mask)
+            tl.store(output_ptr + output_base + lanes, normed, mask=mask)
     else:
         sum_sq_lanes = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
         for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
             offsets = start + lanes
             mask = offsets < d
-            in_val = tl.load(input_ptr + row * stride_input + offsets, mask=mask, other=0.0).to(
+            in_val = tl.load(input_ptr + input_base + offsets, mask=mask, other=0.0).to(tl.float32)
+            res_val = tl.load(residual_ptr + residual_base + offsets, mask=mask, other=0.0).to(
                 tl.float32
             )
-            res_val = tl.load(
-                residual_ptr + row * stride_residual + offsets, mask=mask, other=0.0
-            ).to(tl.float32)
             x = in_val + res_val
             sum_sq_lanes += x * x
-            tl.store(residual_ptr + row * stride_residual + offsets, x, mask=mask)
+            tl.store(residual_ptr + residual_base + offsets, x, mask=mask)
 
         sum_sq = tl.sum(sum_sq_lanes, axis=0)
         rms_rcp = tl.rsqrt(sum_sq / d + eps)
@@ -283,9 +282,7 @@ def _fused_add_rms_norm_kernel(
         for start in tl.range(0, d, BLOCK_SIZE):  # type: ignore
             offsets = start + lanes
             mask = offsets < d
-            x = tl.load(residual_ptr + row * stride_residual + offsets, mask=mask, other=0.0).to(
-                tl.float32
-            )
+            x = tl.load(residual_ptr + residual_base + offsets, mask=mask, other=0.0).to(tl.float32)
             weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
             normed = x * rms_rcp * (weight + WEIGHT_BIAS)
             if QUANTIZE:
@@ -293,18 +290,18 @@ def _fused_add_rms_norm_kernel(
                 normed = tl.maximum(-FP8_E4M3_MAX, tl.minimum(normed, FP8_E4M3_MAX))
                 if e4m3_native_cx():
                     tl.store(
-                        output_ptr + row * stride_output + offsets,
+                        output_ptr + output_base + offsets,
                         normed.to(tl.float8e4nv),
                         mask=mask,
                     )
                 else:
                     tl.store(
-                        output_ptr + row * stride_output + offsets,
+                        output_ptr + output_base + offsets,
                         e4m3_f32_to_u8(normed),
                         mask=mask,
                     )
             else:
-                tl.store(output_ptr + row * stride_output + offsets, normed, mask=mask)
+                tl.store(output_ptr + output_base + offsets, normed, mask=mask)
 
 
 @triton.jit
@@ -599,23 +596,48 @@ def qk_rms_norm(
     return output
 
 
+def _fused_row_layout(tensor: torch.Tensor, name: str) -> tuple[int, int, int, int, int]:
+    if tensor.ndim == 3:
+        _validate_input_tensor(tensor, name)
+        span = 1
+        for size, stride in sorted(
+            zip(tensor.shape, tensor.stride(), strict=True), key=lambda x: x[1]
+        ):
+            if size > 1:
+                if stride < span:
+                    raise ValueError(f"{name} must not have overlapping rows")
+                span += (size - 1) * stride
+        d = int(tensor.shape[-1])
+        return (
+            tensor.numel() // d,
+            d,
+            int(tensor.stride(0)),
+            int(tensor.stride(1)),
+            int(tensor.shape[1]),
+        )
+    rows, d, stride = _row_layout(tensor, name)
+    return rows, d, stride, 0, 1
+
+
 def _validate_fused_inputs(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-) -> tuple[int, int, int, int]:
-    rows, d, stride_input = _row_layout(input, "input")
-    residual_rows, residual_d, stride_residual = _row_layout(residual, "residual")
+) -> tuple[int, int, int, int, int, int, int]:
+    rows, d, stride_input, stride_input_head, heads = _fused_row_layout(input, "input")
+    residual_rows, residual_d, stride_residual, stride_residual_head, residual_heads = (
+        _fused_row_layout(residual, "residual")
+    )
     if residual.device != input.device or residual.dtype != input.dtype:
         raise ValueError("residual must have the same device and dtype as input")
     if tuple(residual.shape) != tuple(input.shape):
         raise ValueError("residual must have the same shape as input")
-    if residual_rows != rows or residual_d != d:
+    if residual_rows != rows or residual_d != d or residual_heads != heads:
         raise ValueError("residual row layout must match input")
     if residual.data_ptr() == input.data_ptr():
         raise ValueError("input and residual must not alias")
     _validate_weight(weight, input, d)
-    return rows, d, stride_input, stride_residual
+    return rows, d, stride_input, stride_input_head, stride_residual, stride_residual_head, heads
 
 
 def _fused_add_impl(
@@ -628,7 +650,9 @@ def _fused_add_impl(
     quant_scale: torch.Tensor | None,
     out: torch.Tensor | None,
 ) -> torch.Tensor | None:
-    rows, d, stride_input, stride_residual = _validate_fused_inputs(input, residual, weight)
+    (rows, d, stride_input, stride_input_head, stride_residual, stride_residual_head, heads) = (
+        _validate_fused_inputs(input, residual, weight)
+    )
     quantize = quant_scale is not None
     if quantize:
         assert quant_scale is not None
@@ -639,6 +663,10 @@ def _fused_add_impl(
             raise ValueError("non-quant fused add writes in place to input; out must alias input")
         output = input
         stride_output = stride_input
+
+    stride_output_head = int(output.stride(1)) if input.ndim == 3 else 0
+    if input.ndim == 3:
+        stride_output = int(output.stride(0))
 
     if rows == 0:
         return output if quantize else None
@@ -655,9 +683,13 @@ def _fused_add_impl(
             scale_ptr,
             d,
             stride_input,
+            stride_input_head,
             stride_residual,
+            stride_residual_head,
             stride_output,
+            stride_output_head,
             float(eps),
+            HEADS=heads,
             WEIGHT_BIAS=float(weight_bias),
             QUANTIZE=quantize,
             BLOCK_SIZE=block_size,

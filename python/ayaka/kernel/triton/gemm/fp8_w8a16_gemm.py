@@ -24,7 +24,7 @@ from ayaka.utils.math_utils import div_ceil
 __all__ = ["fp8_matmul_channelwise", "fp8_weight_only_gemm"]
 
 _FP8_E4M3 = getattr(torch, "float8_e4m3fn", None)
-_SCALE_FORMATS = ("e8m0", "float32")
+_SCALE_FORMATS = ("e8m0", "float32", "bfloat16")
 
 _W8A16_CONFIGS = [
     triton.Config(
@@ -164,7 +164,7 @@ def fp8_weight_only_gemm(
             ``ceil(K / block_size_x)``, which packs rows without padding.
         block_size_y: Output rows sharing one scale value. Must be positive.
         block_size_x: K columns sharing one scale value. Must be positive.
-        scale_dtype: ``"e8m0"`` or ``"float32"``.
+        scale_dtype: ``"e8m0"``, ``"float32"``, or ``"bfloat16"``.
         out: Optional ``[M, N]`` output buffer with the same dtype as ``input``.
             A new buffer is allocated when omitted.
 
@@ -192,7 +192,7 @@ def fp8_weight_only_gemm(
     if block_size_x <= 0 or block_size_y <= 0:
         raise ValueError("block sizes must be positive")
     if scale_dtype not in _SCALE_FORMATS:
-        raise ValueError("scale_dtype must be 'e8m0' or 'float32'")
+        raise ValueError("scale_dtype must be 'e8m0', 'float32', or 'bfloat16'")
     if scale_row_stride is None:
         scale_row_stride = div_ceil(inner, block_size_x)
     if scale_row_stride <= 0:

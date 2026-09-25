@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, cast
 
 import torch
@@ -22,7 +23,9 @@ from ayaka.kernel.triton.reference.activation import (
     gelu_ref,
     gelu_tanh_and_mul_ref,
     gelu_tanh_ref,
+    relu2_ref,
     silu_and_mul_ref,
+    swigluoai_and_mul_ref,
 )
 from ayaka.utils.torch_utils import compute_torch_dtypes
 
@@ -93,6 +96,38 @@ def _gelu_quick_kernel(
     x_f32 = x.to(tl.float32)
     activated_f32 = x_f32 / (1.0 + tl.exp(-_QUICK_GELU_ALPHA * x_f32))
     tl.store(output_ptr + offsets, activated_f32.to(x.dtype), mask=mask)
+
+
+@triton.jit
+def _swigluoai_kernel(
+    input_ptr,
+    output_ptr,
+    d,
+    alpha,
+    beta,
+    limit,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1).to(tl.int64)
+    offsets = tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < d
+    input_row = input_ptr + row * (2 * d)
+    gate = tl.load(input_row + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(input_row + d + offsets, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.minimum(gate, limit)
+    up = tl.minimum(tl.maximum(up, -limit), limit)
+    value = gate / (1.0 + tl.exp(-alpha * gate)) * (up + beta)
+    tl.store(output_ptr + row * d + offsets, value, mask=mask)
+
+
+@triton.jit
+def _relu2_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    value = tl.maximum(x, 0.0)
+    tl.store(output_ptr + offsets, value * value, mask=mask)
 
 
 @triton.jit
@@ -230,6 +265,77 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute tanh-approximate GELU on the first half and multiply by the second."""
     return _act_and_mul(input, _ACT_GELU_TANH, out)
+
+
+def _swigluoai_fake(
+    input: torch.Tensor,
+    out: torch.Tensor | None = None,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+    limit: float = 7.0,
+) -> torch.Tensor:
+    del alpha, beta, limit
+    return _act_and_mul_fake(input, out)
+
+
+@custom_op(
+    namespace="ayaka",
+    name="swigluoai_and_mul",
+    fake_impl=_swigluoai_fake,
+    reference=swigluoai_and_mul_ref,
+    dispatch_key="CUDA",
+    mutates_args=["out"],
+)
+def swigluoai_and_mul(
+    input: torch.Tensor,
+    out: torch.Tensor | None = None,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+    limit: float = 7.0,
+) -> torch.Tensor:
+    """Compute clamped SwiGLU-OAI over packed [gate, up] halves."""
+    for value, name in ((alpha, "alpha"), (beta, "beta"), (limit, "limit")):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+    if alpha <= 0 or limit <= 0:
+        raise ValueError("alpha and limit must be positive")
+    _validate_input(input)
+    width = input.shape[-1]
+    if width % 2:
+        raise ValueError(f"input.shape[-1] must be even; got {width}")
+    d = width // 2
+    output = prepare_output(input, out, shape=(*input.shape[:-1], d))
+    require_contiguous(output, "out")
+    if output.numel() == 0:
+        return output
+    grid = (input.numel() // width, triton.cdiv(d, _BLOCK_SIZE))
+    with torch.cuda.device(input.device):
+        cast(Any, _swigluoai_kernel)[grid](
+            input, output, d, alpha, beta, limit, BLOCK_SIZE=_BLOCK_SIZE, num_warps=_NUM_WARPS
+        )
+    return output
+
+
+@custom_op(
+    namespace="ayaka",
+    name="relu2",
+    out_shape="input",
+    reference=relu2_ref,
+    dispatch_key="CUDA",
+    mutates_args=["out"],
+)
+def relu2(input: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Compute squared ReLU without changing the input shape."""
+    _validate_input(input)
+    output = prepare_output(input, out, shape=tuple(input.shape))
+    require_contiguous(output, "out")
+    if input.numel():
+        grid = (triton.cdiv(input.numel(), _BLOCK_SIZE),)
+        with torch.cuda.device(input.device):
+            cast(Any, _relu2_kernel)[grid](
+                input, output, input.numel(), BLOCK_SIZE=_BLOCK_SIZE, num_warps=_NUM_WARPS
+            )
+    return output
 
 
 @custom_op(

@@ -18,6 +18,8 @@ def paged_attention_ref(
     sinks: torch.Tensor | None,
     key_scale: torch.Tensor | None,
     value_scale: torch.Tensor | None,
+    logits_soft_cap: float = 0.0,
+    causal: bool = True,
 ) -> torch.Tensor:
     """Single-token-per-row paged attention over the flattened cache."""
     key = key_cache.reshape(-1, key_cache.shape[-2], key_cache.shape[-1]).float()
@@ -34,7 +36,7 @@ def paged_attention_ref(
         kv_start = int(indptr[request_index].item())
         kv_stop = int(indptr[request_index + 1].item())
         query_position = int(query_positions[token_index].item())
-        visible_stop = min(kv_stop - kv_start, query_position + 1)
+        visible_stop = min(kv_stop - kv_start, query_position + 1) if causal else kv_stop - kv_start
         visible_start = 0
         if sliding_window > 0:
             visible_start = max(0, query_position - sliding_window + 1)
@@ -46,6 +48,8 @@ def paged_attention_ref(
                 continue
             scores = query[token_index, query_head].float() @ key[slots, kv_head].T
             scores = scores * sm_scale
+            if logits_soft_cap > 0.0:
+                scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
             values = value[slots, kv_head]
             if sinks is not None:
                 scores = torch.cat((sinks[query_head].float().reshape(1), scores))
@@ -68,6 +72,7 @@ def paged_attention_op_ref(
     key_scale: torch.Tensor | None,
     value_scale: torch.Tensor | None,
     out: torch.Tensor,
+    logits_soft_cap: float = 0.0,
 ) -> None:
     """``out = paged_attention_ref(...)`` for the mutating custom op."""
     out.copy_(
@@ -84,6 +89,7 @@ def paged_attention_op_ref(
             sinks,
             key_scale,
             value_scale,
+            logits_soft_cap,
         )
     )
 
@@ -105,6 +111,7 @@ def decode_paged_attention_op_ref(
     key_scale: torch.Tensor | None,
     value_scale: torch.Tensor | None,
     out: torch.Tensor,
+    logits_soft_cap: float = 0.0,
 ) -> None:
     """Decode path: fills the split-KV scratch and ``out``."""
     del max_context_len_bucket
@@ -134,6 +141,8 @@ def decode_paged_attention_op_ref(
                 slots = visible_slots[split_start : split_start + kv_partition_size]
                 scores = query[request_index, query_head].float() @ key[slots, kv_head].T
                 scores = scores * sm_scale
+                if logits_soft_cap > 0.0:
+                    scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
                 attn_logits[request_index, query_head, split_index].copy_(
                     scores.softmax(dim=0) @ value[slots, kv_head]
                 )
@@ -154,5 +163,51 @@ def decode_paged_attention_op_ref(
             sinks,
             key_scale,
             value_scale,
+            logits_soft_cap,
+        )
+    )
+
+
+def prefill_paged_attention_op_ref(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query_indptr: torch.Tensor,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    query_positions: torch.Tensor,
+    max_query_len: int,
+    sm_scale: float,
+    sliding_window: int,
+    sinks: torch.Tensor | None,
+    key_scale: torch.Tensor | None,
+    value_scale: torch.Tensor | None,
+    out: torch.Tensor,
+    logits_soft_cap: float = 0.0,
+    causal: bool = True,
+) -> None:
+    """Independent FP32 oracle for packed, per-request tiled prefill."""
+    del max_query_len
+    query_to_request = torch.repeat_interleave(
+        torch.arange(query_indptr.numel() - 1, device=query.device, dtype=torch.int32),
+        query_indptr[1:] - query_indptr[:-1],
+        output_size=query.shape[0],
+    )
+    out.copy_(
+        paged_attention_ref(
+            query,
+            key_cache,
+            value_cache,
+            indptr,
+            indices,
+            query_to_request,
+            query_positions,
+            sm_scale,
+            sliding_window,
+            sinks,
+            key_scale,
+            value_scale,
+            logits_soft_cap,
+            causal,
         )
     )

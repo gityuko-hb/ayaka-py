@@ -271,7 +271,8 @@ class PackedColumnParallelLinear(LinearBase):
             if not isinstance(parameter, nn.Parameter):
                 raise KeyError(f"{type(self).__name__} has no parameter {name!r}")
             shard_id = getattr(loaded_weight, "shard_id", None)
-            self.weight_loader(parameter, loaded_weight, shard_id)
+            loader = getattr(parameter, "weight_loader", self.weight_loader)
+            loader(parameter, loaded_weight, shard_id)
             yield name
 
     def extra_repr(self) -> str:

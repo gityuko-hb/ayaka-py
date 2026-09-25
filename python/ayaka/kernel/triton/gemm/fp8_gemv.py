@@ -66,7 +66,7 @@ __all__ = ["fp8_blockwise_gemv", "fp8_weight_only_gemv"]
 
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
-_SCALE_FORMATS = ("e8m0", "float32")
+_SCALE_FORMATS = ("e8m0", "float32", "bfloat16")
 
 #: One weight scale block: BLOCK_K == 128 so a program's K iteration is exactly
 #: one weight-scale block.
@@ -341,7 +341,7 @@ def fp8_weight_only_gemv(
             ``ceil(K / block_size_x)``.
         block_size_y: Output rows sharing one scale value.
         block_size_x: K columns sharing one scale value.
-        scale_dtype: ``"e8m0"`` or ``"float32"``.
+        scale_dtype: ``"e8m0"``, ``"float32"``, or ``"bfloat16"``.
         out: Optional ``[N]`` buffer with the same dtype as ``input``.
 
     Returns:
@@ -360,7 +360,7 @@ def fp8_weight_only_gemv(
     if block_size_x <= 0 or block_size_y <= 0:
         raise ValueError("block sizes must be positive")
     if scale_dtype not in _SCALE_FORMATS:
-        raise ValueError("scale_dtype must be 'e8m0' or 'float32'")
+        raise ValueError("scale_dtype must be 'e8m0', 'float32', or 'bfloat16'")
     if scale_row_stride is None:
         scale_row_stride = div_ceil(inner, block_size_x)
     if scale_row_stride <= 0:

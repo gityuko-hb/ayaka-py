@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+import math
+from typing import Any, Literal, cast
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +12,7 @@ from ayaka.layers._common import LayerBackend, check_input, check_out, load_kern
 from ayaka.layers.base import BaseLayer
 
 #: Quick-GELU sigmoid slope. Torch-safe mirror of
-#: ``ayaka.kernel.triton.activation._QUICK_GELU_ALPHA`` — kept local so this
+#: ``ayaka.kernel.triton.activation._QUICK_GELU_ALPHA`` â€” kept local so this
 #: module stays importable without Triton/CUDA.
 _QUICK_GELU_ALPHA = 1.702
 
@@ -26,6 +27,9 @@ class _Activation(BaseLayer):
             raise ValueError("activation layers do not support quant_config")
         self.backend: LayerBackend = backend
         self.op = load_kernel(backend, "activation", self._kernel_name)
+
+    def _kernel_kwargs(self) -> dict[str, float]:
+        return {}
 
     def forward(self, x: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
         """Return a new tensor or the supplied contiguous ``out`` buffer.
@@ -42,17 +46,29 @@ class _Activation(BaseLayer):
         shape = (*x.shape[:-1], x.shape[-1] // 2) if self._gated else tuple(x.shape)
         check_out(out, x, shape)
         if self.op is not None:
-            return self.run_kernel(self.op, x, out=out)
+            return self.run_kernel(self.op, x, out=out, **self._kernel_kwargs())
         if not self._gated:
             value = x.float()
             if self._kernel_name == "gelu":
                 result = F.gelu(value, approximate="none").to(x.dtype)
             elif self._kernel_name == "gelu_tanh":
                 result = F.gelu(value, approximate="tanh").to(x.dtype)
+            elif self._kernel_name == "relu2":
+                result = torch.relu(value).square().to(x.dtype)
             else:
                 result = (value * torch.sigmoid(_QUICK_GELU_ALPHA * value)).to(x.dtype)
         else:
             gate, up = x.chunk(2, dim=-1)
+            if self._kernel_name == "swigluoai_and_mul":
+                limit = cast(float, self.limit)
+                alpha = cast(float, self.alpha)
+                beta = cast(float, self.beta)
+                clipped_gate = gate.float().clamp(max=limit)
+                clipped_up = up.float().clamp(min=-limit, max=limit)
+                result = (
+                    clipped_gate * torch.sigmoid(alpha * clipped_gate) * (clipped_up + beta)
+                ).to(x.dtype)
+                return write_output(result, out)
             if self._kernel_name == "silu_and_mul":
                 activated = F.silu(gate.float())
             else:
@@ -70,6 +86,37 @@ class SiluAndMul(_Activation):
     """SwiGLU: ``silu(x[..., :d]) * x[..., d:]`` for packed [gate, up]."""
 
     _kernel_name = "silu_and_mul"
+
+
+class SwiGLUOAI(_Activation):
+    """Clamped SwiGLU-OAI over packed [gate, up] halves."""
+
+    _kernel_name = "swigluoai_and_mul"
+
+    def __init__(
+        self,
+        *,
+        alpha: float = 1.702,
+        beta: float = 1.0,
+        limit: float = 7.0,
+        backend: LayerBackend = "triton",
+        **runtime: Any,
+    ) -> None:
+        for value, name in ((alpha, "alpha"), (beta, "beta"), (limit, "limit")):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        if alpha <= 0 or limit <= 0:
+            raise ValueError("alpha and limit must be positive")
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.limit = float(limit)
+        super().__init__(backend=backend, **runtime)
+
+    def _kernel_kwargs(self) -> dict[str, float]:
+        return {"alpha": self.alpha, "beta": self.beta, "limit": self.limit}
+
+    def extra_repr(self) -> str:
+        return f"alpha={self.alpha}, beta={self.beta}, limit={self.limit}, {super().extra_repr()}"
 
 
 class GeluAndMul(_Activation):
@@ -125,6 +172,13 @@ class QuickGELU(_Activation):
     _gated = False
 
 
+class ReLU2(_Activation):
+    """Squared ReLU, preserving the input shape."""
+
+    _kernel_name = "relu2"
+    _gated = False
+
+
 def get_act_fn(name: str, *, backend: LayerBackend = "triton", **runtime: Any) -> BaseLayer:
     """Build a fresh layer for a semantic activation name; unknown names raise.
 
@@ -134,6 +188,10 @@ def get_act_fn(name: str, *, backend: LayerBackend = "triton", **runtime: Any) -
     """
     if name == "silu_and_mul":
         return SiluAndMul(backend=backend, **runtime)
+    if name in ("swigluoai", "swigluoai_and_mul"):
+        return SwiGLUOAI(backend=backend, **runtime)
+    if name == "relu2":
+        return ReLU2(backend=backend, **runtime)
     if name in ("gelu_and_mul", "gelu_tanh_and_mul"):
         approximate = "tanh" if name == "gelu_tanh_and_mul" else "none"
         return GeluAndMul(approximate, backend=backend, **runtime)
