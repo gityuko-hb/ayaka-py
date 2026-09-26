@@ -1,7 +1,7 @@
 CompileFlags:
-    Add:
-        - --no-cuda-version-check
+    CompilationDatabase: build
 
+---
 # C/C++ files: define CUDA qualifiers away
 If:
     PathMatch: .*\.(c|h|cpp|cc|hpp)$
@@ -16,6 +16,7 @@ If:
                 -D__forceinline__=,
             ]
 
+---
 # CUDA files: enable CUDA language
 If:
     PathMatch: .*\.(cu|cuh)$
@@ -23,18 +24,21 @@ If:
         Add:
             [
                 -x=cuda,
+                --no-cuda-version-check,
                 -Wno-unknown-cuda-version,
                 -Xclang=-fcuda-allow-variadic-functions,
             ]
     Index:
         Background: Build
 
+---
 # Skip heavy third-party CUDA template libraries
 If:
     PathMatch: .*/third_party/(cutlass|cccl|nccl)/.*
     Index:
         Background: None
 
+---
 # CUDA Toolkit headers (read-only, no need to index).
 If:
     PathMatch: .*/CUDA/.*\.h$

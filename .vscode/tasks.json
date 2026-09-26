@@ -1,0 +1,88 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "sync-cuda-env",
+            "type": "process",
+            "command": "uv",
+            "args": ["sync", "--group", "dev", "--extra", "cuda"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "sync-cpu-env",
+            "type": "process",
+            "command": "uv",
+            "args": ["sync", "--group", "dev", "--extra", "cpu"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "gen-compile-db",
+            "type": "process",
+            "command": "uv",
+            "args": ["run", "--no-sync", "python", "tools/gen_compile_db.py"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "silent"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "probe-ipc-jit",
+            "type": "process",
+            // Builds the extension on supported Linux hosts; reports False elsewhere.
+            "command": "uv",
+            "args": [
+                "run", "--no-sync", "python", "-c",
+                "from ayaka.kernel import ipc; print('ipc_available =', ipc.ipc_available())"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONPATH": "${workspaceFolder}/python",
+                    "AYAKA_IPC_VERBOSE": "1"
+                }
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "pytest-ipc-cpu",
+            "type": "process",
+            "command": "uv",
+            "args": ["run", "--no-sync", "pytest", "-q", "tests/test_ipc_csrc.py", "-m", "not gpu"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "test",
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "pytest-ipc-gpu",
+            "type": "process",
+            // Linux + real CUDA/HIP device only.
+            "command": "uv",
+            "args": ["run", "--no-sync", "pytest", "-q", "-m", "gpu", "tests/test_ipc_csrc.py"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "test",
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

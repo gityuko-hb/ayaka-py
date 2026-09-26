@@ -1,0 +1,72 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: current file",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/python"
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "pytest ipc (CPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "-q",
+                "tests/test_ipc_csrc.py",
+                "-m",
+                "not gpu"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/python"
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "pytest ipc (GPU)",
+            // Linux + real CUDA/HIP device only.
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "-q",
+                "-m",
+                "gpu",
+                "tests/test_ipc_csrc.py"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/python",
+                "AYAKA_IPC_VERBOSE": "1",
+                "CUDA_LAUNCH_BLOCKING": "1"
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "attach C++ (lldb)",
+            // C++ breakpoints in csrc/*.cpp: start one of the configs above,
+            // then attach to its PID. Linux-first; on Windows use cppvsdbg.
+            "type": "lldb",
+            "request": "attach",
+            "pid": "${command:pickProcess}",
+            "sourceLanguages": [
+                "cpp"
+            ]
+        },
+        {
+            "name": "attach C++ (Windows cppvsdbg)",
+            // C++ breakpoints in csrc/*.cpp on Windows: start one of the configs above,
+            // then attach to its PID via Visual Studio Windows debugger engine.
+            "type": "cppvsdbg",
+            "request": "attach",
+            "processId": "${command:pickProcess}"
+        }
+    ]
+}

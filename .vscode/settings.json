@@ -1,14 +1,9 @@
 {
-    "cmake.buildDirectory": "${workspaceFolder}/build",
-    "cmake.configureArgs": [
-        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-        "-DAYAKA_ENABLE_CUDA=${env:AYAKA_ENABLE_CUDA:-OFF}"
-    ],
-    "cmake.sourceDirectory": "${workspaceFolder}",
     "C_Cpp.intelliSenseEngine": "disabled",
     "clangd.arguments": [
         "--background-index",
-        "--clang-tidy"
+        "--clang-tidy",
+        "--completion-style=detailed"
     ],
     "rust-analyzer.checkOnSave": true,
     "rust-analyzer.cargo.buildScripts.enable": true,
@@ -24,6 +19,9 @@
     },
     "[rust]": {
         "editor.defaultFormatter": "rust-lang.rust-analyzer"
+    },
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff"
     },
     "files.associations": {
         "*.cu": "cuda-cpp",

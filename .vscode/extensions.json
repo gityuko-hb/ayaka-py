@@ -1,8 +1,10 @@
 {
     "recommendations": [
         "llvm-vs-code-extensions.vscode-clangd",
-        "ms-vscode.cmake-tools",
         "vadimcn.vscode-lldb",
+        "ms-python.python",
+        "ms-python.debugpy",
+        "charliermarsh.ruff"
     ],
     "unwantedRecommendations": [
         "ms-dotnettools.cpptools"
