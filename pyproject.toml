@@ -136,4 +136,11 @@ dev = [
 test = ["psutil>=7.2.2"]
 
 [tool.setuptools.package-data]
+"ayaka.kernel" = [
+    "csrc/**/*.cpp",
+    "csrc/**/*.cu",
+    "csrc/**/*.cuh",
+    "csrc/**/*.h",
+    "csrc/**/*.hpp",
+]
 "ayaka.serving" = ["*.proto", "*.md"]

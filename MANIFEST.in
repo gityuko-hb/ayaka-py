@@ -1,0 +1,3 @@
+# Native sources are JIT-built at runtime by ayaka.kernel.ipc; they must ship
+# in both the sdist and the wheel (see tool.setuptools.package-data).
+recursive-include python/ayaka/kernel/csrc *.cpp *.cu *.cuh *.h *.hpp
