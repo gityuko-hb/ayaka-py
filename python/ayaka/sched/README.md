@@ -107,8 +107,8 @@ window of at most `ayaka.sched.core.HOT_WINDOW_SIZE` (128) entries. Policy
 ranking (`rank_waiting`) and bounded-starvation aging (`order`) run only over
 that window, so per-step queue cost is O(K log K) regardless of backlog depth.
 Ranking hints (`cache_hint_tokens`) are refreshed when entries enter the
-window, not every step. EagerScheduler keeps global ranking over
-`_iter_waiting()` as the deterministic reference.
+window and again for eligible LPM candidates. EagerScheduler keeps global
+ranking over `_iter_waiting()` as the deterministic reference.
 
 `policy.rank_waiting` supports `fcfs`, `priority`, `lpm`/`longest_prefix`/
 `cache_affinity`, `lof`/`longest_output`, and `routing_key`; `order()` layers
@@ -121,6 +121,24 @@ lowest-priority, newest request, and `DisabledPreemptionController` /
 `CallbackPreemptionController` adapt the physical mode (`recompute` or `swap`).
 Admission advisors (`AlwaysAdmit`, `CallbackAdmissionAdvisor`,
 `CompositeAdmissionAdvisor`) are advisory only; `prepare` remains the oracle.
+
+The continuous scheduler advances its decode cursor only after a ticket is
+adopted. Removing a running request keeps the cursor attached to the next
+runnable identity, even when dense-ring removal moves the tail. For N runnable
+decodes and D available decode slots per serviceable round, a stable-capacity
+trace selects each request within `ceil(N / D)` rounds. Aging uses adopted
+service rounds, so repeated failed prepare attempts do not silently boost a
+waiting request. Pending tickets and physical resource refusals do not count
+as serviceable rounds. The bound is about scheduling rounds, not wall-clock
+latency or GPU completion time.
+
+When chunking is enabled, transient physical prepare refusals halve the
+effective per-request chunk cap down to one token. Four adopted steps without
+another refusal double it, at most to the resolved cap. `stats` reports the
+effective cap and the last adjustment reason. Recompute preemption counters
+separate newly discarded forward work (`wasted_compute_tokens`) from successful
+forward tokens replayed below a preemption boundary (`recomputed_tokens`).
+Neither counter changes the normal forward-token formula.
 
 ## Reports and abort semantics
 
