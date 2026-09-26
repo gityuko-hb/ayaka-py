@@ -18,6 +18,7 @@ from ayaka.configs.base import ConfigError
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
 from ayaka.executor.ticket import ExecutionTicket, TicketId
 from ayaka.handles import SequenceHandle
+from ayaka.obs import runtime_event
 from ayaka.plan import SamplingPlan
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.parallel import ParentRequestRegistry, expand_parallel_request
@@ -175,7 +176,7 @@ class SchedulerCore(BaseScheduler):
             raise OverloadedError(f"max_queued_requests={queued} cannot admit {count} children")
 
     def _rollback_children(self, admitted: Sequence[str]) -> None:
-        """Undo fully admitted children of a failed parallel family."""
+        """Undo newly owned children, including a partially admitted child."""
         for request_id in admitted:
             sequence = self._sequences.pop(request_id, None)
             if sequence is not None:
@@ -220,26 +221,32 @@ class SchedulerCore(BaseScheduler):
             if self._sampling is not None:
                 self._sampling.release(str(request.request_id))
             raise
+        request_id = str(request.request_id)
+        self._sequences[request_id] = sequence
         try:
             lifecycle = self._requests.create(request)
             self._requests.advance_to_queue(
                 lifecycle.request_id,
                 defer_to_remote_kv=defer_to_remote_kv,
             )
-        except BaseException:
-            self._allocator.release(sequence)
-            if self._sampling is not None:
-                self._sampling.release(str(request.request_id))
-            raise
-        lifecycle.bind_sequence(sequence, state_version=0, computed_tokens=0)
-        self._sequences[lifecycle.request_id] = sequence
-        self._waiting_add(self._new_queue_entry(lifecycle, sequence))
-        self._queue_report(
-            RequestReport(
-                lifecycle.request_id,
-                RequestOutcome.ADMITTED,
-                lifecycle.sequence_epoch,
+            lifecycle.bind_sequence(sequence, state_version=0, computed_tokens=0)
+            self._waiting_add(self._new_queue_entry(lifecycle, sequence))
+            self._queue_report(
+                RequestReport(
+                    lifecycle.request_id,
+                    RequestOutcome.ADMITTED,
+                    lifecycle.sequence_epoch,
+                )
             )
+        except BaseException as exc:
+            self._rollback_children((request_id,))
+            runtime_event("admission_rollback", request_id=request_id, detail=str(exc))
+            raise
+        runtime_event(
+            "admit",
+            request_id=request_id,
+            sequence_epoch=lifecycle.sequence_epoch,
+            sequence=sequence,
         )
         return lifecycle
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import logging
 from itertools import count
 
 from ayaka.executor.ticket import (
@@ -18,7 +19,7 @@ from ayaka.executor.ticket import (
     WorkState,
 )
 from ayaka.memory.ledger import MemoryLedger
-from ayaka.obs import RuntimeMetrics, RuntimeSnapshot
+from ayaka.obs import RuntimeMetrics, RuntimeSnapshot, runtime_event
 from ayaka.sched.plan import PreparedStep
 from ayaka.utils.validation import require_int
 
@@ -229,6 +230,21 @@ class Executor(abc.ABC):
         ticket._host_failure |= host_failure
         self._transition(ticket, TicketState.QUARANTINED)
         ticket._needs_drain = not ticket._host_failure
+        worker = getattr(self, "worker", None)
+        for value in ticket.prepared.step.inputs:
+            runtime_event(
+                "quarantine",
+                request_id=value.request_id,
+                sequence_epoch=value.sequence_epoch,
+                sequence=value.sequence,
+                step_id=ticket.prepared.step.step_id,
+                ticket_id=ticket.id,
+                worker_incarnation=getattr(worker, "incarnation", None),
+                resource_generation=getattr(ticket._resources, "generation", None),
+                status=ticket.state.value,
+                detail=error,
+                level=logging.ERROR,
+            )
 
     def drain(self, ticket: ExecutionTicket) -> None:
         """Start a nonblocking recovery proof if completion became uncertain.

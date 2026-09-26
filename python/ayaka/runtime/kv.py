@@ -15,6 +15,7 @@ from ayaka.memory.capacity import ResourceGeneration
 from ayaka.memory.pressure import PreemptionStatus
 from ayaka.memory.state import ReservationFailure
 from ayaka.memory.workspace import WorkspaceLease, WorkspaceManager
+from ayaka.obs import runtime_event
 from ayaka.plan import (
     EMPTY_COMMUNICATION_PLAN,
     EMPTY_GRAPH_PLAN,
@@ -298,6 +299,14 @@ class KVRequestPreparer:
             tokens = value.known_tokens[: value.prompt_tokens]
             result = self.prefix.publish(value.sequence, tokens, context=context)
             self.telemetry.observe_publish(scheduled.request_id, published=result is not None)
+            runtime_event(
+                "prefix_publish",
+                request_id=scheduled.request_id,
+                sequence_epoch=scheduled.sequence_epoch,
+                sequence=value.sequence,
+                step_id=prepared.step.step_id,
+                status="published" if result is not None else "skipped",
+            )
 
     def forget(self, sequence: SequenceHandle) -> None:
         self._contexts.pop(sequence, None)
@@ -548,6 +557,15 @@ class KVStepRuntime:
                 workspace=self.workspace,
             )
             self._pending[step.step_id] = resources
+            for value in step.inputs:
+                runtime_event(
+                    "prepare",
+                    request_id=value.request_id,
+                    sequence_epoch=value.sequence_epoch,
+                    sequence=value.sequence,
+                    step_id=step.step_id,
+                    resource_generation=kv.generation,
+                )
             return prepared
         except BaseException:
             if buffer_lease is not None:

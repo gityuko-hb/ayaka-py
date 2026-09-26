@@ -27,6 +27,7 @@ from ayaka.memory.tiering import (
     TransferState,
     TransferTicket,
 )
+from ayaka.obs import runtime_event
 
 if TYPE_CHECKING:
     from ayaka.kvcache.grouped_manager import GroupedPrefixSnapshot, KVCacheGroupManager
@@ -257,8 +258,23 @@ class GroupedTierManager:
                     progress = True
                     if outcome.state is TransferState.COMPLETED:
                         move.completed = True
+                        runtime_event(
+                            "migrate",
+                            owner_id=entry_id,
+                            transfer_id=f"{name}:{outcome.ticket.ticket_id}",
+                            resource_generation=move.device_page.generation,
+                            status="copy_complete",
+                        )
                     else:
                         placement.quarantined = True
+                        runtime_event(
+                            "migrate",
+                            owner_id=entry_id,
+                            transfer_id=f"{name}:{outcome.ticket.ticket_id}",
+                            resource_generation=move.device_page.generation,
+                            status="quarantined",
+                            detail=outcome.error,
+                        )
             for placement in tuple(self._placements.values()):
                 if not placement.quarantined:
                     progress |= self._issue_available(placement)
@@ -436,6 +452,15 @@ class GroupedTierManager:
                 move,
             )
             place.submitted += 1
+            runtime_event(
+                "migrate",
+                owner_id=place.entry.entry_id,
+                transfer_id=f"{move.host_page.group_name}:{ticket.ticket_id}",
+                resource_generation=move.device_page.generation,
+                status="eviction_submitted"
+                if direction is TransferDirection.DEVICE_TO_HOST
+                else "promotion_submitted",
+            )
             progressed = True
         return progressed
 
@@ -454,6 +479,7 @@ class GroupedTierManager:
         place.moves.clear()
         place.state = TierState.HOST
         self._spills += 1
+        runtime_event("migrate", owner_id=place.entry.entry_id, status="host_published")
 
     def _finish_promotion(self, place: _Placement) -> None:
         from ayaka.kvcache.grouped_manager import GroupedPrefixSnapshot
@@ -497,6 +523,7 @@ class GroupedTierManager:
         self._release_slots(place.host_pages)
         del self._placements[place.entry.entry_id]
         self._promotions += 1
+        runtime_event("migrate", owner_id=place.entry.entry_id, status="device_published")
 
     def _settle_quarantine(self, place: _Placement) -> None:
         if place.state is TierState.EVICTING:

@@ -95,13 +95,15 @@ class Engine:
             if defer_to_remote_kv and self._remote_kv is not None:
                 self._remote_kv.park(str(request.request_id))
             return lifecycle
-        for index, child in enumerate(children):
-            self._output.register(child, child_index=index)
+        registered: list[str] = []
         try:
+            for index, child in enumerate(children):
+                self._output.register(child, child_index=index)
+                registered.append(str(child.request_id))
             lifecycle = self._scheduler.add_request(request, defer_to_remote_kv=defer_to_remote_kv)
         except BaseException:
-            for child in children:
-                self._output.forget(str(child.request_id))
+            for request_id in registered:
+                self._output.forget(request_id)
             raise
         if defer_to_remote_kv and self._remote_kv is not None:
             for child in children:

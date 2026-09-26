@@ -7,11 +7,64 @@ shared monotonic Clock domain and measure host-observed completion, not GPU time
 
 from __future__ import annotations
 
+import logging
 from collections import Counter, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ayaka.utils.timing import Clock
+
+_RUNTIME_EVENTS = logging.getLogger("ayaka.runtime.events")
+
+
+def runtime_event(
+    event: str,
+    *,
+    request_id: str | None = None,
+    sequence_epoch: int | None = None,
+    sequence: object | None = None,
+    step_id: int | None = None,
+    ticket_id: object | None = None,
+    owner_id: object | None = None,
+    transfer_id: object | None = None,
+    worker_incarnation: int | None = None,
+    resource_generation: object | None = None,
+    status: str | None = None,
+    detail: str | None = None,
+    level: int = logging.DEBUG,
+) -> None:
+    """Emit a diagnostic ownership event without changing runtime settlement.
+
+    Ayaka's JSONFormatter exports ``ayaka_*`` extras as structured fields.
+    Identifiers stay in logs, never metric labels. Logging is optional, and a
+    broken handler cannot turn a committed or quarantined step into a retry.
+    """
+    if not _RUNTIME_EVENTS.isEnabledFor(level):
+        return
+    fields = {
+        "event": event,
+        "request_id": request_id,
+        "sequence_epoch": sequence_epoch,
+        "sequence": sequence,
+        "step_id": step_id,
+        "ticket_id": ticket_id,
+        "owner_id": owner_id,
+        "transfer_id": transfer_id,
+        "worker_incarnation": worker_incarnation,
+        "resource_generation": resource_generation,
+        "status": status,
+        "detail": detail[:240] if detail is not None else None,
+    }
+    try:
+        _RUNTIME_EVENTS.log(
+            level,
+            "runtime %s",
+            event,
+            extra={f"ayaka_{key}": value for key, value in fields.items() if value is not None},
+        )
+    except Exception:
+        pass
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -19,15 +72,7 @@ if TYPE_CHECKING:
     from ayaka.executor.ticket import ExecutionTicket
     from ayaka.memory.ledger import MemoryLedger
 
-_LIMITS_NS = (
-    1_000,
-    10_000,
-    100_000,
-    1_000_000,
-    10_000_000,
-    100_000_000,
-    1_000_000_000
-)
+_LIMITS_NS = (1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000, 1_000_000_000)
 
 
 @dataclass(frozen=True, slots=True)

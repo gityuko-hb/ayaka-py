@@ -42,6 +42,7 @@ from ayaka.memory.ledger import MemoryLedger
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.tiering import TieringConfig
 from ayaka.memory.workspace import WorkspaceManager
+from ayaka.obs import runtime_event
 from ayaka.plan import ComputePlan, ExecutionPlan, GraphMode, MemoryPlan
 from ayaka.prefix.identity import build_prefix_context
 from ayaka.runner.buffers import RunnerBuffers, RunnerBufferSpec
@@ -768,30 +769,51 @@ class ServingRuntime:
         restores the previous capacity if the new materialization fails.
         """
         self._require_live()
+        runtime_event(
+            "resize",
+            owner_id="default",
+            resource_generation=getattr(self.kv, "generation", None),
+            status="requested",
+            detail=f"pages={pages}",
+        )
         engine = self.engine
         assert engine is not None
         if engine.has_unfinished or engine.executor.pending_completion or engine.executor.tickets:
+            runtime_event("resize", owner_id="default", status="rejected_busy")
             raise CacheRebuildRejected(
                 "engine is busy; resize requires an idle server; old cache kept",
                 reason=ResizeRejectionReason.BUSY,
                 requested_pages=pages,
             )
-        plan = self.plan_resize(pages)
+        try:
+            plan = self.plan_resize(pages)
+        except CacheRebuildRejected as exc:
+            runtime_event("resize", owner_id="default", status="rejected", detail=str(exc))
+            raise
         if plan.pages == plan.current_pages:
+            runtime_event("resize", owner_id="default", status="unchanged")
             return self.cache_status()
         if plan.mode is CacheResizeMode.SWAP:
             tail = self._build_tail(plan.pages)
             try:
                 self._teardown_tail()
-            except BaseException:
+            except BaseException as exc:
                 self._bind_tail(tail)
+                runtime_event("resize", owner_id="default", status="failed", detail=str(exc))
                 raise
             self._bind_tail(tail)
+            runtime_event(
+                "resize",
+                owner_id="default",
+                resource_generation=getattr(self.kv, "generation", None),
+                status="applied_swap",
+            )
             return self.cache_status()
 
         try:
             self._teardown_tail()
         except BaseException as exc:
+            runtime_event("resize", owner_id="default", status="fatal", detail=str(exc))
             raise CacheResizeFatal(
                 "cache teardown failed before the rebuild; engine must restart"
             ) from exc
@@ -802,11 +824,13 @@ class ServingRuntime:
             try:
                 restored = self._build_tail(plan.current_pages)
             except BaseException as restore_exc:
+                runtime_event("resize", owner_id="default", status="fatal", detail=str(restore_exc))
                 raise CacheResizeFatal(
                     f"cache resize to {plan.pages} pages failed and the "
                     f"{plan.current_pages}-page cache could not be restored; engine must restart"
                 ) from restore_exc
             self._bind_tail(restored)
+            runtime_event("resize", owner_id="default", status="rejected_restored", detail=str(exc))
             raise CacheRebuildRejected(
                 f"cache allocation for {plan.pages} pages failed after the old slab was "
                 f"freed; {plan.current_pages}-page cache restored",
@@ -817,6 +841,12 @@ class ServingRuntime:
                 old_bytes=plan.old_bytes,
             ) from exc
         self._bind_tail(tail)
+        runtime_event(
+            "resize",
+            owner_id="default",
+            resource_generation=getattr(self.kv, "generation", None),
+            status="applied_rebuild",
+        )
         return self.cache_status()
 
     # ------------------------------------------------------------------

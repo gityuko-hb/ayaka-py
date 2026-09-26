@@ -13,6 +13,7 @@ from ayaka.executor.ticket import (
     TicketId,
     TicketState,
 )
+from ayaka.obs import runtime_event
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.sampling.logprobs import LogprobResult, TokenLogprob
 from ayaka.sampling.ops.sampling import SamplingSupportStatus
@@ -264,6 +265,29 @@ class CompletionCoordinator:
         self.requests = requests
         self._bindings: dict[TicketId, tuple[tuple[RequestLifecycle, ScheduledSlice], ...]] = {}
 
+    def _trace(
+        self,
+        event: str,
+        ticket: ExecutionTicket,
+        *,
+        status: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        worker = getattr(self.executor, "worker", None)
+        for value in ticket.prepared.step.inputs:
+            runtime_event(
+                event,
+                request_id=value.request_id,
+                sequence_epoch=value.sequence_epoch,
+                sequence=value.sequence,
+                step_id=ticket.prepared.step.step_id,
+                ticket_id=ticket.id,
+                worker_incarnation=getattr(worker, "incarnation", None),
+                resource_generation=getattr(ticket._resources, "generation", None),
+                status=status,
+                detail=detail,
+            )
+
     def adopt(
         self,
         prepared: PreparedStep,
@@ -287,6 +311,7 @@ class CompletionCoordinator:
                 raise ValueError("prepared input snapshot is stale")
         ticket = self.executor.adopt(prepared, resources)
         self._bindings[ticket.id] = bindings
+        self._trace("adopt", ticket)
         try:
             for request, scheduled in bindings:
                 if request.token.is_cancelled:
@@ -323,6 +348,7 @@ class CompletionCoordinator:
             self.executor.cancel(ticket, "all requests invalidated before launch")
             return
         self.executor.launch(ticket)
+        self._trace("submit", ticket, status=ticket.state.value)
 
     def _discard(
         self,
@@ -364,6 +390,7 @@ class CompletionCoordinator:
             self.executor.quarantine(ticket, "missing request bindings", host_failure=True)
             return None
         ticket._settling = True
+        self._trace("complete", ticket, status=outcome.status.value, detail=outcome.error)
         published: list[PublishedSample] = []
         ignored: list[str] = []
         prompt_logprobs: list[PromptLogprobChunk] = []
@@ -395,6 +422,7 @@ class CompletionCoordinator:
                     require_int(version, "committed KV version")
                 if versions != expected:
                     raise ValueError("resource commit returned unexpected KV versions")
+                self._trace("commit", ticket, status=outcome.status.value)
                 # Publication boundary: the single host materialization of the
                 # step's device-resident sampling results. Everything upstream
                 # (sampler, coordinator, ticket) keeps tensors; everything
@@ -442,6 +470,15 @@ class CompletionCoordinator:
                         # resource-accounting fault.
                         if sample is not None and request.accepts_completion(step_id, scheduled):
                             request.publish_sample(step_id, scheduled, sample)
+                            runtime_event(
+                                "publish",
+                                request_id=request.request_id,
+                                sequence_epoch=scheduled.sequence_epoch,
+                                sequence=ticket.prepared.step.inputs[slice_index].sequence,
+                                step_id=step_id,
+                                ticket_id=ticket.id,
+                                status=outcome.status.value,
+                            )
                             merged = _merge_ids_logprobs(
                                 report_by_row.get(sample_index - 1),
                                 ids_by_row.get(sample_index - 1),
@@ -498,11 +535,13 @@ class CompletionCoordinator:
             )
             ticket._retirement_complete = True
             self.executor.acknowledge_retired(ticket)
+            self._trace("retire", ticket, status=outcome.status.value)
             del self._bindings[ticket.id]
         except BaseException as exc:
             self.executor.quarantine(
                 ticket, f"completion settlement failed: {exc}", host_failure=True
             )
+            self._trace("settlement_failed", ticket, detail=str(exc))
             if not isinstance(exc, Exception):
                 raise
             return None

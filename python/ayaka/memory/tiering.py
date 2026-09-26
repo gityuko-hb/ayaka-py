@@ -36,6 +36,7 @@ from ayaka.exceptions import (
 from ayaka.handles import KVPageHandle, PrefixHandle
 from ayaka.memory.allocator import PageAllocator
 from ayaka.memory.state import PageAllocationState
+from ayaka.obs import runtime_event
 from ayaka.prefix.identity import PrefixBlockIdentity, PrefixCacheContext
 from ayaka.prefix.interface import CachedBlockInfo
 from ayaka.utils.torch_utils import require_torch
@@ -1132,6 +1133,13 @@ class TierManager:
                 raise
             record.ticket = ticket
             self._by_ticket[ticket.ticket_id] = record.identity
+            runtime_event(
+                "migrate",
+                owner_id=record.identity,
+                transfer_id=ticket.ticket_id,
+                resource_generation=info.page.generation,
+                status="eviction_submitted",
+            )
             return ticket
 
     def begin_promotion(self, identity: PrefixBlockIdentity) -> TransferTicket | None:
@@ -1179,6 +1187,13 @@ class TierManager:
                 raise
             record.ticket = ticket
             self._by_ticket[ticket.ticket_id] = record.identity
+            runtime_event(
+                "migrate",
+                owner_id=record.identity,
+                transfer_id=ticket.ticket_id,
+                resource_generation=page.generation,
+                status="promotion_submitted",
+            )
             return ticket
 
     def poll(
@@ -1212,12 +1227,32 @@ class TierManager:
                     # an unproven quiescence means nobody may assume the copy
                     # is dead: hold every destination owner in quarantine.
                     self._quarantine(record)
+                    runtime_event(
+                        "migrate",
+                        owner_id=identity,
+                        transfer_id=outcome.ticket.ticket_id,
+                        resource_generation=record.device_page.generation
+                        if record.device_page is not None
+                        else None,
+                        status="quarantined",
+                        detail=outcome.error,
+                    )
                     continue
+                runtime_event(
+                    "migrate",
+                    owner_id=identity,
+                    transfer_id=outcome.ticket.ticket_id,
+                    resource_generation=record.device_page.generation
+                    if record.device_page is not None
+                    else None,
+                    status="copy_complete",
+                )
                 self._release_budget(record)
                 if record.state is TierState.EVICTING:
                     settled = self._settle_eviction(record, by_identity)
                     if settled is not None:
                         evicted.append(settled)
+                        runtime_event("migrate", owner_id=identity, status="host_published")
                 elif record.state is TierState.PROMOTING:
                     record.copy_landed = True
 
@@ -1292,6 +1327,12 @@ class TierManager:
             record.copy_landed = False
             record.promotions += 1
             self._promotions_total += 1
+            runtime_event(
+                "migrate",
+                owner_id=identity,
+                resource_generation=device_page.generation,
+                status="promotion_published",
+            )
 
     def abort_promotion(self, identity: PrefixBlockIdentity) -> None:
         """Roll a promotion back to ``HOST`` when publication is impossible.
