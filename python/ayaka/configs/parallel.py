@@ -11,6 +11,7 @@ from ayaka.utils.import_utils import CapabilityError, has_module
 __all__ = [
     "AllToAllBackend",
     "AxisRanks",
+    "CollectivePolicy",
     "ParallelConfig",
     "ResolvedParallelPlan",
 ]
@@ -92,6 +93,27 @@ class AllToAllBackend(enum.StrEnum):
             if probe(backend):
                 return backend
         return cls.NCCL
+
+
+class CollectivePolicy(enum.StrEnum):
+    """User-facing selection policy for the tensor-parallel collective backend.
+
+    ``torch`` is the compatible default and the operational rollback. ``auto``
+    is allowed to fall to Torch when the group cannot agree on a custom backend
+    *before* any data launch. ``custom_required`` refuses the step instead of
+    silently changing the decision. The policy itself is DC3 metadata; the
+    physical process-group backend lives in ``CollectiveBackend``.
+    """
+
+    TORCH = "torch"
+    """Only the Torch/NCCL reference backend; no custom communicator is built."""
+
+    AUTO = "auto"
+    """Use an agreed custom backend when the whole group proved the capability,
+    otherwise delegate every unsupported call to Torch before launch."""
+
+    CUSTOM_REQUIRED = "custom_required"
+    """Refuse any case the agreed custom backend cannot serve; never fall back."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +214,7 @@ class ParallelConfig(ConfigMixin):
     enable_sequence_parallel: bool = False
     enable_dp_attention: bool = False
     all_to_all_backend: AllToAllBackend = AllToAllBackend.AUTO
+    collective_policy: CollectivePolicy = CollectivePolicy.TORCH
     pipeline_microbatches: int = 1
     pipeline_layer_ranges: tuple[tuple[int, int], ...] = ()
     expert_redundancy: int = 0
@@ -203,6 +226,12 @@ class ParallelConfig(ConfigMixin):
                 raise ConfigError(
                     f"parallel.{name}", "PARALLEL_SIZE_INVALID", f"{name} must be >= 1"
                 )
+        if not isinstance(self.collective_policy, CollectivePolicy):
+            raise ConfigError(
+                "parallel.collective_policy",
+                "COLLECTIVE_POLICY_INVALID",
+                "collective policy must be one of CollectivePolicy",
+            )
         if self.enable_sequence_parallel and self.tp_size == 1:
             raise ConfigError(
                 "parallel.enable_sequence_parallel",
@@ -315,6 +344,7 @@ class ParallelConfig(ConfigMixin):
             ),
             expert_redundancy=self.expert_redundancy,
             expert_load_balancing=self.enable_expert_load_balancing,
+            collective_policy=self.collective_policy,
         )
 
 
@@ -334,8 +364,15 @@ class ResolvedParallelPlan(ConfigMixin):
     pipeline_layer_ranges: tuple[tuple[int, int], ...]
     expert_redundancy: int
     expert_load_balancing: bool
+    collective_policy: CollectivePolicy = CollectivePolicy.TORCH
 
     def __post_init__(self) -> None:
+        if not isinstance(self.collective_policy, CollectivePolicy):
+            raise ConfigError(
+                "parallel.collective_policy",
+                "RESOLVED_COLLECTIVE_POLICY_INVALID",
+                "resolved collective policy must be one of CollectivePolicy",
+            )
         if len(self.pipeline_layer_ranges) != self.pp_size:
             raise ConfigError(
                 "parallel.pipeline_layer_ranges",

@@ -79,6 +79,29 @@ class Executor(abc.ABC):
     def get_ticket(self, ticket_id: TicketId) -> ExecutionTicket | None:
         return self._tickets.get(ticket_id)
 
+    @property
+    def quarantined(self) -> tuple[ExecutionTicket, ...]:
+        """Tickets whose device completion is unknown and resources are retained."""
+        return tuple(
+            ticket for ticket in self._tickets.values() if ticket.state is TicketState.QUARANTINED
+        )
+
+    @property
+    def accepting_work(self) -> bool:
+        """Admission state for readiness, without the transient capacity ceiling.
+
+        Unlike :meth:`has_submission_capacity`, this does not fail merely because
+        ``max_inflight`` is currently reached (normal backpressure). It is False
+        once the executor stops or any ticket is quarantined, because an
+        ambiguous device failure must never accept new work.
+        """
+        return (
+            self._initialized
+            and not self._stopping
+            and not self._closed
+            and not any(t.state is TicketState.QUARANTINED for t in self._tickets.values())
+        )
+
     def has_submission_capacity(self) -> bool:
         return (
             self._initialized

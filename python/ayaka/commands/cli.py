@@ -25,6 +25,14 @@ def main(argv=None) -> None:
     serve.add_argument("--kv-pages", type=int, default=1024)
     serve.add_argument("--page-size", type=int, default=16)
     serve.add_argument("--max-requests", type=int, default=32)
+    serve.add_argument(
+        "--max-admitted-requests",
+        type=int,
+        default=0,
+        help="service handle ceiling; 0 derives no extra bound beyond the scheduler",
+    )
+    serve.add_argument("--max-model-len", type=int, default=None)
+    serve.add_argument("--default-request-timeout", type=float, default=None)
     serve.add_argument("--batch-tokens", type=int, default=256)
     serve.add_argument("--prefill-chunk", type=int, default=128)
     serve.add_argument("--max-concurrent-requests", type=int, default=0)
@@ -119,6 +127,8 @@ def main(argv=None) -> None:
             model=args.served_model_name,
             api_keys=tuple(k.strip() for k in keys.split(",") if k.strip()),
             max_concurrent_requests=args.max_concurrent_requests,
+            max_admitted_requests=args.max_admitted_requests,
+            default_request_timeout_seconds=args.default_request_timeout,
             reasoning_parser=args.reasoning_parser,
             tool_parser=args.tool_parser,
             structured_outputs=not args.disable_structured_outputs,
@@ -130,6 +140,7 @@ def main(argv=None) -> None:
         max_requests=args.max_requests,
         batch_tokens=args.batch_tokens,
         prefill_chunk=args.prefill_chunk,
+        max_model_len=args.max_model_len,
         backend=args.backend,
         graph_pool_bytes=args.graph_pool_bytes,
     )
