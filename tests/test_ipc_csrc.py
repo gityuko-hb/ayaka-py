@@ -26,8 +26,8 @@ from pathlib import Path
 
 import pytest
 import torch
-from ayaka.distributed.ipc import IpcRegionDescriptor, IpcRegionRegistry
 from ayaka.kernel import ipc as ipc_mod
+from ayaka.runtime.ipc_engine import IpcRegionDescriptor, IpcRegionRegistry
 from ayaka.utils.import_utils import CapabilityError
 from ayaka.utils.torch_utils import cuda_available
 

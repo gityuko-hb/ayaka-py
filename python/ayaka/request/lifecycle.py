@@ -315,6 +315,7 @@ class RequestLifecycle:
         if len(self._output_token_ids) >= self.request.stop.max_tokens:
             raise ValueError("output token budget is exhausted")
         self.machine.on_token_generated(1)
+        self.machine.mark_published()
         self._output_token_ids.append(token_id)
         self._known_tokens += (token_id,)
         self._clear_slice()
@@ -502,6 +503,8 @@ class LifecycleManager:
             m.on_finished(now_ns=now_ns)
         elif outcome is RequestOutcome.ABORTED:
             lc.token.cancel(entry.detail or "aborted by scheduler")
+            if entry.finish_reason is not None:
+                lc.finish_reason = entry.finish_reason
             m.on_cancelled(now_ns=now_ns)
         elif outcome is RequestOutcome.FAILED:
             m.on_failed(entry.detail or "scheduler reported failure", now_ns=now_ns)

@@ -145,8 +145,6 @@ class RequestStateMachine:
         # not report the second prefill as its TTFT.
         if dst in (RequestState.PREFILL, RequestState.DECODING) and not self.first_scheduled_ns:
             self.timing.mark_scheduled(ts)
-        if dst is RequestState.STREAMING:
-            self.timing.mark_streamed(ts)
         if dst in TERMINAL_STATES:
             self.timing.mark_finished(ts)
 
@@ -270,6 +268,16 @@ class RequestStateMachine:
         if self.num_computed_tokens != self.num_prompt_tokens + self.num_generated_tokens:
             raise ValueError("sampling requires the completed known-token boundary")
         self.timing.num_output_tokens += count
+
+    def mark_published(self, *, now_ns: int | None = None) -> None:
+        """Record one token publication for TTFT/ITL timing.
+
+        Publication is the model-side boundary (``RequestLifecycle``
+        ``publish_sample``); the stream/socket boundary is timed separately by
+        the serving layer.
+        """
+        ts = now_ns if now_ns is not None else self.clock.now().as_nanos()
+        self.timing.mark_streamed(ts)
 
     def on_streamed(self, *, now_ns: int | None = None) -> None:
         ts = now_ns if now_ns is not None else self.clock.now().as_nanos()
