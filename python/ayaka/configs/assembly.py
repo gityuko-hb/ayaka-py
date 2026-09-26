@@ -48,7 +48,7 @@ from ayaka.configs.memory import (
     plan_device_memory,
 )
 from ayaka.configs.model import ArchitectureConfig
-from ayaka.configs.parallel import ParallelConfig, ResolvedParallelPlan
+from ayaka.configs.parallel import CollectivePolicy, ParallelConfig, ResolvedParallelPlan
 from ayaka.distributed import env as distributed_env
 from ayaka.distributed.device import CommunicationBackend, DeviceGroup, DeviceRef
 from ayaka.kvcache.groups import KVCacheGroup
@@ -65,6 +65,7 @@ from ayaka.utils.import_utils import CapabilityError
 from ayaka.utils.math_utils import div_ceil
 
 if TYPE_CHECKING:
+    from ayaka.distributed.collective_backend import CollectiveSetup
     from ayaka.distributed.parallel import ParallelContext
     from ayaka.kvcache.grouped_manager import KVCacheGroupManager
     from ayaka.kvcache.storage.ports import KVStorage
@@ -562,6 +563,15 @@ def plan_resident_kv(
             "PHYSICAL_CACHE_LIMIT_INVALID",
             "max_model_len must be positive",
         )
+    if max_model_len is not None and max_model_len > architecture.max_context_len:
+        # The RoPE-effective context is the checkpoint ceiling; an override may
+        # reserve less, never promise more than the model can position.
+        raise ConfigError(
+            "cache.physical.max_model_len",
+            "CONTEXT_EXCEEDS_MODEL",
+            f"max_model_len={max_model_len} exceeds the model context "
+            f"{architecture.max_context_len}",
+        )
     placeholder_specs = build_storage_specs(
         architecture, cache_config, cache_plan, tp_size=effective_tp
     )
@@ -850,6 +860,7 @@ class ParallelRuntime:
     ep_group: DeviceGroup | None
     communication: CommunicationBackend | None
     context: ParallelContext
+    collective_policy: CollectivePolicy = CollectivePolicy.TORCH
 
     def layer_kwargs(self) -> dict[str, Any]:
         """Keyword arguments accepted by the layer ``**runtime`` seam."""
@@ -910,6 +921,7 @@ def build_parallel_runtime(
     world_rank: int | None = None,
     devices: Sequence[DeviceRef] | None = None,
     communication: CommunicationBackend | None = None,
+    collective_setup: CollectiveSetup | None = None,
     device_kind: DeviceKind = DeviceKind.CUDA,
 ) -> ParallelRuntime:
     """Build the rank-local parallel runtime from the two resolved plans.
@@ -919,6 +931,12 @@ def build_parallel_runtime(
     execution requires an explicit distributed config and a non-MPI collective
     backend. A missing communication backend is deferred to collective time,
     so construction itself needs no device stack.
+
+    ``collective_setup`` is the runtime owner's opt-in to group agreement:
+    when supplied for a non-torch policy the source rank's profile is exchanged
+    once and the returned dispatcher is installed as ``communication``. Under
+    ``custom_required`` a multi-rank build without a setup is refused before
+    launch instead of silently running Torch.
     """
 
     resolved_distributed = _resolve_distributed(parallel, distributed)
@@ -951,6 +969,33 @@ def build_parallel_runtime(
         else None
     )
 
+    policy = parallel.collective_policy
+    if collective_setup is not None:
+        if policy is CollectivePolicy.TORCH:
+            raise ConfigError(
+                "parallel.collective_policy",
+                "COLLECTIVE_SETUP_ON_TORCH_POLICY",
+                "a collective setup cannot be supplied while the policy is torch",
+            )
+        if tp_group is not None:
+            from ayaka.distributed.collective_backend import setup_collective_backend
+
+            communication = setup_collective_backend(
+                policy=policy,
+                group=tp_group,
+                control=collective_setup.control,
+                fallback=communication,
+                capability=collective_setup.capability,
+                custom_factory=collective_setup.custom_factory,
+                timeout_s=collective_setup.timeout_s,
+            )
+    elif policy is CollectivePolicy.CUSTOM_REQUIRED and tp_group is not None:
+        raise ConfigError(
+            "parallel.collective_policy",
+            "COLLECTIVE_SETUP_REQUIRED",
+            "custom_required needs a probed collective setup before launch",
+        )
+
     from ayaka.distributed.parallel import LocalParallelContext, RuntimeParallelContext
 
     context = (
@@ -967,4 +1012,5 @@ def build_parallel_runtime(
         ep_group=ep_group,
         communication=communication,
         context=context,
+        collective_policy=policy,
     )
