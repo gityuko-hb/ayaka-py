@@ -8,23 +8,38 @@ from ayaka.configs.base import ConfigError, ConfigMixin
 
 __all__ = [
     "DeviceMemoryPlan",
-    "HostMemoryPolicy",
-    "HostMemoryPlan",
+    "HostMemoryLimits",
     "MemoryConfig",
     "MemoryProfile",
     "plan_device_memory",
-    "plan_host_memory",
 ]
 
 
 @dataclass(frozen=True, slots=True)
-class HostMemoryPolicy(ConfigMixin):
+class HostMemoryLimits(ConfigMixin):
+    """Operator ceilings for pinned host memory, resolved by machine facts.
+
+    Config-time numbers only: the effective limit also depends on cgroup,
+    ``MemAvailable``, PSI and NUMA facts that are only knowable at bootstrap.
+    :class:`ayaka.memory.host.host_policy.HostMemoryPolicy` is the single
+    authority that combines both.
+    """
+
     pinned_max_bytes: int | None = None
     pinned_max_ratio: float = 0.25
     min_available_bytes: int = 4 << 30
     min_available_ratio: float = 0.10
+    #: Whether a refused pinned host mirror may degrade to pageable memory.
+    #: ``False`` turns the pin ceiling into a hard startup refusal.
+    allow_pageable_fallback: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.allow_pageable_fallback, bool):
+            raise ConfigError(
+                "memory.host.allow_pageable_fallback",
+                "HOST_FALLBACK_INVALID",
+                "allow_pageable_fallback must be a bool",
+            )
         if self.pinned_max_bytes is not None and self.pinned_max_bytes < 0:
             raise ConfigError(
                 "memory.host.pinned_max_bytes",
@@ -44,18 +59,6 @@ class HostMemoryPolicy(ConfigMixin):
                 "host reserve bytes must be non-negative and ratio must be in [0, 1)",
             )
 
-    def effective_pinned_limit(self, scope_bytes: int) -> int:
-        if scope_bytes < 0:
-            raise ConfigError(
-                "memory.host.scope_bytes", "HOST_SCOPE_NEGATIVE", "scope bytes must be non-negative"
-            )
-        reserve = max(self.min_available_bytes, int(scope_bytes * self.min_available_ratio))
-        ratio_limit = int(scope_bytes * self.pinned_max_ratio)
-        candidates = [ratio_limit, max(0, scope_bytes - reserve)]
-        if self.pinned_max_bytes is not None:
-            candidates.append(self.pinned_max_bytes)
-        return max(0, min(candidates))
-
 
 @dataclass(frozen=True, slots=True)
 class MemoryConfig(ConfigMixin):
@@ -63,7 +66,7 @@ class MemoryConfig(ConfigMixin):
     kv_cache_memory_bytes: int | None = None
     gpu_reserved_bytes: int = 0
     activation_reserve_bytes: int = 0
-    host: HostMemoryPolicy = field(default_factory=HostMemoryPolicy)
+    host: HostMemoryLimits = field(default_factory=HostMemoryLimits)
 
     def __post_init__(self) -> None:
         if not 0 < self.gpu_memory_utilization <= 1:
@@ -152,14 +155,6 @@ class DeviceMemoryPlan(ConfigMixin):
         return not self.measured
 
 
-@dataclass(frozen=True, slots=True)
-class HostMemoryPlan(ConfigMixin):
-    scope_bytes: int
-    pinned_limit_bytes: int
-    cache_tier_bytes: int
-    remaining_pinned_bytes: int
-
-
 def plan_device_memory(
     total_bytes: int,
     config: MemoryConfig,
@@ -195,31 +190,4 @@ def plan_device_memory(
         fixed_reserve_bytes=fixed_reserve,
         kv_cache_bytes=kv_bytes,
         measured=profile.measured,
-    )
-
-
-def plan_host_memory(
-    scope_bytes: int,
-    policy: HostMemoryPolicy,
-    cache_tier_bytes: int,
-) -> HostMemoryPlan:
-    if cache_tier_bytes < 0:
-        raise ConfigError(
-            "cache.tiering.host_bytes",
-            "HOST_CACHE_TIER_NEGATIVE",
-            "host cache tier bytes must be non-negative",
-        )
-    limit = policy.effective_pinned_limit(scope_bytes)
-    if cache_tier_bytes > limit:
-        raise ConfigError(
-            "cache.tiering.host_bytes",
-            "HOST_CACHE_TIER_EXCEEDS_PINNED_LIMIT",
-            "requested host cache tier exceeds the effective pinned-memory limit",
-            context={"requested_bytes": cache_tier_bytes, "pinned_limit_bytes": limit},
-        )
-    return HostMemoryPlan(
-        scope_bytes=scope_bytes,
-        pinned_limit_bytes=limit,
-        cache_tier_bytes=cache_tier_bytes,
-        remaining_pinned_bytes=limit - cache_tier_bytes,
     )
