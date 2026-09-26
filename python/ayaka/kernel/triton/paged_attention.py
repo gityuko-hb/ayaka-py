@@ -752,6 +752,33 @@ def compute_max_num_partitions(
     return div_ceil(effective_bound, kv_partition_size)
 
 
+def validate_decode_workspace(
+    query: torch.Tensor,
+    attn_logits: torch.Tensor,
+    attn_lse: torch.Tensor,
+    max_context_len_bucket: int,
+    kv_partition_size: int,
+    sliding_window: int | None,
+) -> None:
+    """Validate split-KV scratch before cache mutation, without device reads."""
+    batch, num_query_heads, head_dim = query.shape
+    partitions = compute_max_num_partitions(
+        max_context_len_bucket, kv_partition_size, sliding_window
+    )
+    for tensor, name, shape in (
+        (attn_logits, "attn_logits", (batch, num_query_heads, partitions, head_dim)),
+        (attn_lse, "attn_lse", (batch, num_query_heads, partitions)),
+    ):
+        _require_cuda_tensor(tensor, name, device=query.device, ndim=len(shape))
+        if tensor.dtype != torch.float32:
+            raise TypeError(f"{name} must have dtype torch.float32, got {tensor.dtype}")
+        if any(actual < required for actual, required in zip(tensor.shape, shape, strict=True)):
+            raise ValueError(
+                f"{name} workspace is too small; need at least {shape}, got {tuple(tensor.shape)}"
+            )
+    require_last_dim_stride1(attn_logits, "attn_logits")
+
+
 def decode_paged_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -804,32 +831,9 @@ def decode_paged_attention(
     )
     scale = _validate_sm_scale(sm_scale)
 
-    _require_cuda_tensor(attn_logits, "attn_logits", device=query.device, ndim=4)
-    if attn_logits.dtype != torch.float32:
-        raise TypeError(f"attn_logits must have dtype torch.float32, got {attn_logits.dtype}")
-    require_last_dim_stride1(attn_logits, "attn_logits")
-    required_logits_shape = (batch, num_query_heads, max_num_partitions, head_dim)
-    if any(
-        actual < required
-        for actual, required in zip(attn_logits.shape, required_logits_shape, strict=True)
-    ):
-        raise ValueError(
-            "attn_logits workspace is too small; need at least "
-            f"{required_logits_shape}, got {tuple(attn_logits.shape)}"
-        )
-
-    _require_cuda_tensor(attn_lse, "attn_lse", device=query.device, ndim=3)
-    if attn_lse.dtype != torch.float32:
-        raise TypeError(f"attn_lse must have dtype torch.float32, got {attn_lse.dtype}")
-    required_lse_shape = (batch, num_query_heads, max_num_partitions)
-    if any(
-        actual < required
-        for actual, required in zip(attn_lse.shape, required_lse_shape, strict=True)
-    ):
-        raise ValueError(
-            f"attn_lse workspace is too small; need at least {required_lse_shape}, "
-            f"got {tuple(attn_lse.shape)}"
-        )
+    validate_decode_workspace(
+        query, attn_logits, attn_lse, max_context_len_bucket, kv_partition_size, sliding_window
+    )
 
     sinks_arg = _prepare_optional_sinks(sinks, query, num_query_heads)
     is_fp8_kv, key_scale_arg, value_scale_arg = _prepare_kv_scales(

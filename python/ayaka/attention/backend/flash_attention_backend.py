@@ -274,7 +274,8 @@ class FlashAttentionBackend(BaseAttentionBackend):
         *,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert isinstance(metadata, FlashAttentionMetadata)
+        if not isinstance(metadata, FlashAttentionMetadata):
+            raise TypeError("flash-attn requires FlashAttentionMetadata")
         spec = self.spec
         common = metadata.common
         if common.has_tree_mask:
@@ -287,9 +288,16 @@ class FlashAttentionBackend(BaseAttentionBackend):
 
         key = key.view(-1, spec.num_kv_heads, spec.head_dim_qk)
         value = value.view(-1, spec.num_kv_heads, spec.head_dim_vo)
+        q = query.view(-1, spec.num_qo_heads, spec.head_dim_qk)
+        out = output if output is not None else metadata.output
+        if out is not None and (
+            out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
+        ):
+            raise ValueError("output must match query shape, dtype and device")
+        if key.shape[0] != q.shape[0] or value.shape[0] != q.shape[0]:
+            raise ValueError("Q/K/V token counts must match")
         self.kv_cache.store_kv(key, value, common.slot_mapping, layer_id)
 
-        q = query.view(-1, spec.num_qo_heads, spec.head_dim_qk)
         causal = spec.mask is not MaskKind.FULL
         if self._version == 3:
             result = self._attention(
@@ -321,7 +329,6 @@ class FlashAttentionBackend(BaseAttentionBackend):
                 block_table=common.block_table,
             )
 
-        out = output if output is not None else metadata.output
         if out is None:
             return result
         out.copy_(result)

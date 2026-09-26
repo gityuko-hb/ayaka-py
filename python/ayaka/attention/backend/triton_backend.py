@@ -20,9 +20,14 @@ from ayaka.attention.metadata import (
 from ayaka.attention.ports import PagedKVCache
 from ayaka.attention.spec import AttentionGroupSpec
 from ayaka.kernel.triton.paged_attention import (
+    _prepare_kv_scales,
+    _prepare_output,
+    _validate_index_tensor,
+    _validate_query_and_caches,
     compute_max_num_partitions,
     decode_paged_attention_op,
     paged_attention_op,
+    validate_decode_workspace,
 )
 from ayaka.types import (
     AttentionCudaGraphSupport,
@@ -255,8 +260,10 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
 
         device_tensors = {
             "seq_lens": (common.seq_lens, 1),
+            "computed_lens": (common.computed_lens, 1),
             "query_start_loc": (common.query_start_loc, 1),
             "block_table": (common.block_table, 2),
+            "slot_mapping": (common.slot_mapping, 1),
             "positions": (common.positions, 1),
         }
         for name, (tensor, rank) in device_tensors.items():
@@ -268,7 +275,11 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
                     expected=str(self.device),
                     actual=str(tensor.device),
                 )
-            if tensor.dtype != torch.int32 or tensor.dim() != rank:
+            if (
+                tensor.dtype != torch.int32
+                or tensor.dim() != rank
+                or (rank == 1 and not tensor.is_contiguous())
+            ):
                 raise AttentionMetadataError(
                     AttentionErrorCode.METADATA_SHAPE_MISMATCH,
                     f"{name} must be a rank-{rank} int32 tensor",
@@ -277,7 +288,7 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
                     dtype=str(tensor.dtype),
                 )
 
-        if common.seq_lens.numel() < common.num_reqs:
+        if min(common.seq_lens.numel(), common.computed_lens.numel()) < common.num_reqs:
             raise AttentionMetadataError(
                 AttentionErrorCode.METADATA_SHAPE_MISMATCH,
                 "seq_lens is shorter than num_reqs",
@@ -295,7 +306,7 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
                 "block_table has fewer rows than num_reqs",
                 group_id=group_id,
             )
-        if common.positions.numel() < common.num_tokens:
+        if min(common.positions.numel(), common.slot_mapping.numel()) < common.num_tokens:
             raise AttentionMetadataError(
                 AttentionErrorCode.METADATA_SHAPE_MISMATCH,
                 "positions is shorter than num_tokens",
@@ -330,6 +341,18 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
             raise AttentionMetadataError(
                 AttentionErrorCode.METADATA_SHAPE_MISMATCH,
                 "query_start_loc_cpu must be monotonic from zero to num_tokens",
+                group_id=group_id,
+            )
+        query_lens = query_start_cpu[1:] - query_start_cpu[:-1]
+        # Captured dummy decode rows have one query and zero context. They
+        # produce zero output and address the reserved padding page, never live KV.
+        padded_decode = (seq_lens_cpu == 0) & (common.mode is ForwardMode.DECODE)
+        if bool(((query_lens > seq_lens_cpu) & ~padded_decode).any()) or (
+            query_lens.numel() and int(query_lens.max()) > common.max_query_len
+        ):
+            raise AttentionMetadataError(
+                AttentionErrorCode.METADATA_SHAPE_MISMATCH,
+                "query lengths exceed the sequence lengths or query shape hint",
                 group_id=group_id,
             )
         return total_kv_tokens, actual_max_seq_len
@@ -794,12 +817,24 @@ class TritonAttentionBackend(BaseAttentionBackend):
         key_cache = self.kv_cache.key_cache(layer_id)
         value_cache = self.kv_cache.value_cache(layer_id)
         key_scale, value_scale = self._scales(layer_id)
-
-        # The just-produced K/V belongs to the same attention view. Queue its scatter first
-        # on the current stream so the paged read observes those tokens.
-        self.kv_cache.store_kv(k, v, common.slot_mapping, layer_id)
-
-        sliding_window = spec.sliding_window or 0
+        # Reuse the kernel's metadata-only validators before the mutating store.
+        # Address values and page generations were validated by the lease owner;
+        # reading device values here would introduce a synchronization/capture break.
+        _validate_query_and_caches(q, key_cache, value_cache)
+        _prepare_kv_scales(key_cache, key_scale, value_scale, q)
+        _prepare_output(q, out)
+        if q.shape[0] != common.num_tokens or k.shape[0] != q.shape[0] or v.shape != k.shape:
+            raise ValueError("Q/K/V token counts must match the attention snapshot")
+        if any(t.dtype != q.dtype or t.device != q.device for t in (k, v)):
+            raise ValueError("Q/K/V must share dtype and device")
+        _validate_index_tensor(
+            common.slot_mapping, "slot_mapping", q.device, numel=common.num_tokens
+        )
+        _validate_index_tensor(common.positions, "positions", q.device, numel=common.num_tokens)
+        _validate_index_tensor(metadata.indptr, "indptr", q.device, numel=common.num_reqs + 1)
+        _validate_index_tensor(metadata.indices, "indices", q.device)
+        if metadata.decode != (common.mode is ForwardMode.DECODE):
+            raise ValueError("attention phase disagrees with the snapshot")
         if metadata.decode:
             if metadata.attn_logits is None or metadata.attn_lse is None:
                 raise AttentionMetadataError(
@@ -807,6 +842,27 @@ class TritonAttentionBackend(BaseAttentionBackend):
                     "decode metadata is missing split-KV workspace",
                     group_id=self.group.group_id,
                 )
+            if common.num_tokens != common.num_reqs or common.max_query_len != 1:
+                raise ValueError("DECODE requires one query per request")
+            if metadata.max_context_len_bucket < common.max_seq_len:
+                raise ValueError("decode context bucket is smaller than the snapshot")
+            validate_decode_workspace(
+                q,
+                metadata.attn_logits,
+                metadata.attn_lse,
+                metadata.max_context_len_bucket,
+                self.kv_partition_size,
+                spec.sliding_window,
+            )
+        else:
+            _validate_index_tensor(
+                metadata.query_to_request, "query_to_request", q.device, numel=common.num_tokens
+            )
+
+        # Queue the scatter and paged read on the same stream. Never retry a failed launch.
+        self.kv_cache.store_kv(k, v, common.slot_mapping, layer_id)
+        sliding_window = spec.sliding_window or 0
+        if metadata.decode:
             decode_paged_attention_op(
                 q,
                 key_cache,

@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from ayaka.attention.base import BaseAttentionBackend
+from ayaka.attention.errors import AttentionErrorCode, BackendCapabilityError
 from ayaka.attention.metadata import (
     BaseAttentionMetadata,
     BaseAttentionMetadataBuilder,
@@ -66,10 +67,16 @@ class StoragePagedKVCache:
         self.kv_cache_dtype = KVCacheDtype.AUTO
 
     def key_cache(self, layer_id: int) -> torch.Tensor:
+        self._validate_layer(layer_id)
         return self.storage.key_buffers[layer_id]
 
     def value_cache(self, layer_id: int) -> torch.Tensor:
+        self._validate_layer(layer_id)
         return self.storage.value_buffers[layer_id]
+
+    def _validate_layer(self, layer_id: int) -> None:
+        if type(layer_id) is not int or not 0 <= layer_id < self.num_layers:
+            raise ValueError("KV layer_id must be a valid group-local layer index")
 
     def k_scale(self, layer_id: int) -> None:
         return None
@@ -80,6 +87,8 @@ class StoragePagedKVCache:
     def store_kv(self, key, value, slot_mapping, layer_id: int) -> None:
         # Slots are host-validated by the lease owner before enqueue. The
         # semantic op declares both mutations and remains capture-safe.
+        if slot_mapping.dtype not in (torch.int32, torch.int64):
+            raise ValueError("KV slot_mapping must have an integer addressing dtype")
         write_kv(
             key,
             value,
@@ -104,6 +113,7 @@ class _ReferenceBuilder(BaseAttentionMetadataBuilder[ReferenceMetadata]):
 class ReferencePagedAttention(BaseAttentionBackend):
     """Explicit eager SDPA reference with actual paged writes and cached reads."""
 
+    name = "reference"
     supports_ragged_mixed = True
 
     def build_metadata_builder(self) -> _ReferenceBuilder:
@@ -113,10 +123,48 @@ class ReferencePagedAttention(BaseAttentionBackend):
         if not isinstance(metadata, ReferenceMetadata):
             raise TypeError("reference attention needs ReferenceMetadata")
         common = metadata.common
+        if common.has_tree_mask or self.spec.logits_soft_cap or self.spec.has_sinks:
+            raise ValueError(
+                "reference paged attention does not support tree masks, softcap or sinks"
+            )
+        if self.group.kv_layout is not KVLayoutKind.NHD or self.group.kv_cache_dtype.is_quantized:
+            raise ValueError("reference paged attention requires unquantized NHD storage")
+        expected = (common.num_tokens, self.spec.num_qo_heads, self.spec.head_dim_qk)
+        if (
+            query.shape != expected
+            or query.device != self.device
+            or query.dtype != self.kv_cache.dtype
+        ):
+            raise ValueError("query disagrees with the attention binding")
+        for tensor, dim in ((key, self.spec.head_dim_qk), (value, self.spec.head_dim_vo)):
+            if (
+                tensor.shape != (common.num_tokens, self.spec.num_kv_heads, dim)
+                or tensor.dtype != query.dtype
+                or tensor.device != query.device
+            ):
+                raise ValueError("K/V payload disagrees with the attention binding")
+        if output is not None and (
+            output.shape != expected or output.dtype != query.dtype or output.device != query.device
+        ):
+            raise ValueError("output must match query shape, dtype and device")
+        # This eager oracle may synchronize/gather. Kernel-visible bounds remain
+        # authoritative even when a planner's CPU mirrors have become stale.
+        starts = common.query_start_loc.tolist()
+        lengths = common.seq_lens.tolist()
+        if (
+            len(starts) != common.num_reqs + 1
+            or len(lengths) != common.num_reqs
+            or starts[0] != 0
+            or starts[-1] != common.num_tokens
+            or any(
+                not 0 <= b - a <= n
+                for a, b, n in zip(starts[:-1], starts[1:], lengths, strict=True)
+            )
+        ):
+            raise ValueError("invalid reference attention sequence/query bounds")
         self.kv_cache.store_kv(key, value, common.slot_mapping, layer_id)
         pieces = []
-        starts = common.query_start_loc_cpu.tolist()
-        for row, seq_len in enumerate(common.seq_lens_cpu.tolist()):
+        for row, seq_len in enumerate(lengths):
             begin, end = starts[row : row + 2]
             offsets = torch.arange(seq_len, device=query.device)
             pages = common.block_table[row].index_select(0, offsets // self.group.page_size)
@@ -124,13 +172,14 @@ class ReferencePagedAttention(BaseAttentionBackend):
             k = self.kv_cache.key_cache(layer_id).flatten(0, 1).index_select(0, slots)
             v = self.kv_cache.value_cache(layer_id).flatten(0, 1).index_select(0, slots)
             positions = common.positions[begin:end, None]
-            mask = offsets[None, :] <= positions
+            mask = offsets[None, :] <= positions if self.spec.mask is not MaskKind.FULL else None
             if self.spec.sliding_window is not None:
-                mask &= offsets[None, :] > positions - self.spec.sliding_window
+                window_mask = offsets[None, :] > positions - self.spec.sliding_window
+                mask = window_mask if mask is None else mask & window_mask
             out = F.scaled_dot_product_attention(
-                query[begin:end].transpose(0, 1).unsqueeze(0),
-                k.transpose(0, 1).unsqueeze(0),
-                v.transpose(0, 1).unsqueeze(0),
+                query[begin:end].transpose(0, 1).unsqueeze(0).contiguous(),
+                k.transpose(0, 1).unsqueeze(0).contiguous(),
+                v.transpose(0, 1).unsqueeze(0).contiguous(),
                 attn_mask=mask,
                 scale=self.spec.sm_scale,
                 enable_gqa=True,
@@ -165,6 +214,8 @@ class PagedForwardTrace:
     num_tokens: int
     graph_bucket: int | None = None
     graph_key: str | None = None
+    attention_backend: str = ""
+    kv_groups: tuple[str, ...] = ()
 
 
 class PagedModelRunner(ModelRunner):
@@ -214,6 +265,13 @@ class PagedModelRunner(ModelRunner):
         parameter = next(model.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
+        if backend in ("flash_attention", "flashinfer") and self.device.type != "cuda":
+            raise BackendCapabilityError(
+                AttentionErrorCode.UNSUPPORTED_ARCH,
+                "vendor paged attention requires a CUDA model and cache",
+                backend=backend,
+                device=str(self.device),
+            )
         self._bindings: dict[str, PagedGroupBinding] = {}
         self.forward_calls = 0
         self.forward_tokens = 0
@@ -672,6 +730,8 @@ class PagedModelRunner(ModelRunner):
                 num_tokens=num_tokens,
                 graph_bucket=graph_bucket,
                 graph_key=graph_key,
+                attention_backend=self._backend_name,
+                kv_groups=tuple(self.backends),
             )
         )
 

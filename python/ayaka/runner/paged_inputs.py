@@ -34,6 +34,7 @@ def validate_paged_inputs(
     memory = prepared.memory_view
     if isinstance(memory, ExecutionMemoryView) and len(bindings) != 1:
         raise ValueError("homogeneous execution view requires exactly one KV group")
+    write_slots: dict[str, set[int]] = {name: set() for name in bindings}
     for scheduled, view in zip(prepared.step.slices, memory.sequences, strict=True):
         if scheduled.query_end > max_model_len:
             raise ValueError("scheduled range exceeds model context")
@@ -103,3 +104,6 @@ def validate_paged_inputs(
                     or getattr(slot, "logical_block", logical) != logical
                 ):
                     raise ValueError("lease write slot disagrees with its block table")
+                if slot.flat_slot in write_slots[name]:
+                    raise ValueError("requests must not share a physical KV write slot")
+                write_slots[name].add(slot.flat_slot)

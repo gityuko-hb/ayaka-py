@@ -103,8 +103,51 @@ def _write_kv_reference(
     k_inverse: float,
     v_inverse: float,
 ) -> None:
+    _validate_kv_write(key, value, key_cache, value_cache, slots, k_inverse, v_inverse)
+    # CPU oracle padding can filter negatives without device reads. CUDA graph
+    # staging supplies nonnegative reserved-page slots; the accelerated CUDA
+    # kernel handles masked negative slots when they are used outside graphs.
+    if slots.device.type == "cpu":
+        valid = slots >= 0
+        key, value, slots = key[valid], value[valid], slots[valid]
     _write_reference(key, key_cache, slots, k_inverse)
     _write_reference(value, value_cache, slots, v_inverse)
+
+
+def _validate_kv_write(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slots: torch.Tensor,
+    k_inverse: float,
+    v_inverse: float,
+) -> None:
+    """Check both planes before either mutates; CUDA address values are caller-validated."""
+    if slots.ndim != 1 or slots.dtype != torch.int64 or slots.device != key_cache.device:
+        raise ValueError("KV write slots must be a rank-1 int64 tensor on the cache device")
+    if any(not math.isfinite(s) or s <= 0 for s in (k_inverse, v_inverse)):
+        raise ValueError("KV inverse scales must be finite and positive")
+    for source, cache in ((key, key_cache), (value, value_cache)):
+        if cache.ndim != 4 or source.shape != (slots.numel(), *cache.shape[2:]):
+            raise ValueError("KV write payload must match the slot count and cache head geometry")
+        if cache.stride(0) != cache.shape[1] * cache.stride(1):
+            raise ValueError("KV cache pages must flatten without copying")
+        if source.dtype not in _COMPUTE_DTYPES or cache.dtype not in (
+            *_COMPUTE_DTYPES,
+            *_FP8_DTYPES,
+        ):
+            raise ValueError("unsupported KV write dtype")
+    if key_cache.shape != value_cache.shape or key_cache.dtype != value_cache.dtype:
+        raise ValueError("KV cache planes must share geometry and dtype")
+    if key_cache.device != value_cache.device or key.dtype != value.dtype:
+        raise ValueError("KV planes must share cache device and payload dtype")
+    if slots.device.type == "cpu":
+        active = slots[slots >= 0]
+        if active.numel() and int(active.max()) >= key_cache.shape[0] * key_cache.shape[1]:
+            raise ValueError("KV write slot is outside the cache")
+        if active.unique().numel() != active.numel():
+            raise ValueError("KV write slots must be unique")
 
 
 @custom_op(
@@ -124,6 +167,7 @@ def write_kv(
     v_inverse: float,
 ) -> None:
     """Fused NHD MHA/GQA write; called once before attention reads the cache."""
+    _validate_kv_write(key, value, key_cache, value_cache, slots, k_inverse, v_inverse)
     kernels = _triton(key_cache)
     if (
         kernels is None
