@@ -31,6 +31,10 @@ from ayaka.kernel.triton.reference.norm import (
 from ayaka.utils.math_utils import FP8_E4M3_MAX
 from ayaka.utils.torch_utils import compute_torch_dtypes
 
+#: Triton 3.8 rejects plain module globals inside ``@triton.jit`` bodies, so the
+#: clamp bound has to be a constexpr.
+_E4M3_CLAMP = tl.constexpr(float(FP8_E4M3_MAX))
+
 _SUPPORTED_INPUT_DTYPES = compute_torch_dtypes()
 _BLOCK_SIZE = 256
 _NUM_WARPS = 8
@@ -119,7 +123,7 @@ def _rms_norm_quant_kernel(
         scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
         weight = tl.load(weight_ptr + lanes, mask=mask, other=0.0).to(tl.float32)
         output = x * rms_rcp * (weight + WEIGHT_BIAS) * scale_inv
-        output = tl.maximum(-FP8_E4M3_MAX, tl.minimum(output, FP8_E4M3_MAX))
+        output = tl.maximum(-_E4M3_CLAMP, tl.minimum(output, _E4M3_CLAMP))
         if e4m3_native_cx():
             tl.store(output_ptr + row * stride_output + lanes, output.to(tl.float8e4nv), mask=mask)
         else:
@@ -146,7 +150,7 @@ def _rms_norm_quant_kernel(
             )
             weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
             output = x * rms_rcp * (weight + WEIGHT_BIAS) * scale_inv
-            output = tl.maximum(-FP8_E4M3_MAX, tl.minimum(output, FP8_E4M3_MAX))
+            output = tl.maximum(-_E4M3_CLAMP, tl.minimum(output, _E4M3_CLAMP))
             if e4m3_native_cx():
                 tl.store(
                     output_ptr + row * stride_output + offsets,
@@ -251,7 +255,7 @@ def _fused_add_rms_norm_kernel(
         if QUANTIZE:
             scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
             normed *= scale_inv
-            normed = tl.maximum(-FP8_E4M3_MAX, tl.minimum(normed, FP8_E4M3_MAX))
+            normed = tl.maximum(-_E4M3_CLAMP, tl.minimum(normed, _E4M3_CLAMP))
             if e4m3_native_cx():
                 tl.store(output_ptr + output_base + lanes, normed.to(tl.float8e4nv), mask=mask)
             else:
@@ -287,7 +291,7 @@ def _fused_add_rms_norm_kernel(
             normed = x * rms_rcp * (weight + WEIGHT_BIAS)
             if QUANTIZE:
                 normed *= scale_inv
-                normed = tl.maximum(-FP8_E4M3_MAX, tl.minimum(normed, FP8_E4M3_MAX))
+                normed = tl.maximum(-_E4M3_CLAMP, tl.minimum(normed, _E4M3_CLAMP))
                 if e4m3_native_cx():
                     tl.store(
                         output_ptr + output_base + offsets,
