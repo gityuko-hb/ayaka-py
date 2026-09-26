@@ -61,6 +61,7 @@ def select_preemption_victim(
         if not lifecycle.is_terminal
         and lifecycle.request_id not in excluded_request_ids
         and not lifecycle.token.is_cancelled
+        and lifecycle.inflight_slice is None
     ]
     if not victims:
         return None

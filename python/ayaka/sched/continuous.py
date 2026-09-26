@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from ayaka.configs.scheduler import ResolvedSchedulerPlan, SchedulingPolicy
 from ayaka.executor.completion import CompletionResult
 from ayaka.executor.ticket import ExecutionTicket, TerminalStatus, TicketId
+from ayaka.handles import SequenceHandle
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.states import RequestState
 from ayaka.sched.budget import BatchBudget
@@ -60,6 +61,7 @@ _SCHEDULABLE_STATES = frozenset(
 @dataclass(frozen=True, slots=True)
 class ContinuousSchedulerStats:
     round_id: int
+    service_round: int
     waiting: int
     prefilling: int
     running: int
@@ -71,12 +73,17 @@ class ContinuousSchedulerStats:
     preemptions: int
     bypasses: int
     admission_rejections: int
+    effective_prefill_chunk_tokens: int | None
+    chunk_adjustment_reason: str | None
+    recomputed_tokens: int
+    wasted_compute_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
 class _InflightSlice:
     request_id: str
     phase: Phase
+    query_start: int
     query_end: int
     prompt_tokens: int
 
@@ -117,7 +124,7 @@ class ContinuousScheduler(SchedulerCore):
         decode_first: bool = True,
         allow_mixed_batches: bool = True,
         prefill_chunk_size: int | None = None,
-        max_bypass: int = 64,
+        max_bypass: int | None = None,
         sampling: SamplingCoordinator | None = None,
         request_preparer: RequestPreparer | None = None,
     ) -> None:
@@ -133,6 +140,8 @@ class ContinuousScheduler(SchedulerCore):
         )
         if prefill_chunk_size is not None and prefill_chunk_size <= 0:
             raise ValueError("prefill_chunk_size must be positive")
+        if max_bypass is None:
+            max_bypass = plan.max_bypass
         if max_bypass <= 0:
             raise ValueError("max_bypass must be positive")
 
@@ -149,16 +158,23 @@ class ContinuousScheduler(SchedulerCore):
                 prefill_chunk_size if chunk_cap is None else min(chunk_cap, prefill_chunk_size)
             )
         self._prefill_chunk_size = chunk_cap
+        self._effective_prefill_chunk_size = chunk_cap
+        self._chunk_adjustment_reason: str | None = None
+        self._successful_prepares_since_pressure = 0
         self._max_bypass = max_bypass
 
         self._inflight_slices: dict[TicketId, tuple[_InflightSlice, ...]] = {}
         self._last_step: BatchStepPlan | None = None
         self._decode_cursor = 0
+        self._service_round = 0
 
         self._transient_prepare_failures = 0
         self._preemptions = 0
         self._bypasses = 0
         self._admission_rejections = 0
+        self._recomputed_tokens = 0
+        self._wasted_compute_tokens = 0
+        self._recompute_until: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Scheduling loop
@@ -188,6 +204,13 @@ class ContinuousScheduler(SchedulerCore):
                     self._prefilling.pop(item.request_id, None)
                     if lifecycle is None or lifecycle.is_terminal or lifecycle.token.is_cancelled:
                         continue
+                    recompute_until = self._recompute_until.get(item.request_id, 0)
+                    if recompute_until:
+                        self._recomputed_tokens += max(
+                            0, min(item.query_end, recompute_until) - item.query_start
+                        )
+                        if item.query_end >= recompute_until:
+                            self._recompute_until.pop(item.request_id, None)
                     if item.phase is Phase.PREFILL:
                         if item.query_end < item.prompt_tokens:
                             # Partial prefill keeps its concurrency slot between chunks.
@@ -278,7 +301,6 @@ class ContinuousScheduler(SchedulerCore):
 
         start = self._decode_cursor % count
         running = self._running
-        scheduled_count = 0
         for offset in range(count):
             lifecycle = running[ring[(start + offset) % count]]
             if lifecycle.is_terminal or lifecycle.token.is_cancelled:
@@ -302,10 +324,6 @@ class ContinuousScheduler(SchedulerCore):
                 )
             )
             inputs.append(snapshot)
-            scheduled_count += 1
-
-        if scheduled_count:
-            self._decode_cursor = (start + scheduled_count) % count
 
     def _append_prefills(
         self,
@@ -334,7 +352,7 @@ class ContinuousScheduler(SchedulerCore):
         self._refresh_candidate_hints(eligible)
         ranked = order(
             eligible,
-            round_id=self._round,
+            round_id=self._service_round,
             now_ns=now,
             max_bypass=self._max_bypass,
             scheduling_policy=self._plan.scheduling_policy,
@@ -358,8 +376,8 @@ class ContinuousScheduler(SchedulerCore):
                 continue
 
             requested = remaining
-            if self._prefill_chunk_size is not None:
-                requested = min(requested, self._prefill_chunk_size)
+            if self._effective_prefill_chunk_size is not None:
+                requested = min(requested, self._effective_prefill_chunk_size)
             chunk = budget.largest_fittable(requested)
             if chunk <= 0:
                 self._mark_bypass(entry)
@@ -417,17 +435,21 @@ class ContinuousScheduler(SchedulerCore):
             try:
                 prepared = self._runtime.prepare(current)
             except StepPrepareError as exc:
-                if not exc.transient and exc.request_id is not None:
+                if not exc.transient:
+                    if exc.request_id is None:
+                        raise
+                    if exc.request_id not in current.request_order:
+                        raise ValueError(
+                            "permanent prepare refusal named a request outside the batch"
+                        ) from exc
                     sequence = self.fail_request(exc.request_id, str(exc))
                     if sequence is not None:
                         self._allocator.release(sequence)
                     current = self._without_request(current, exc.request_id)
                     continue
-                if not exc.transient:
-                    self._resource_blocked = False
-                    return None
 
                 self._transient_prepare_failures += 1
+                self._reduce_chunk_cap(current)
                 shrunk = self._shrink_transient(current)
                 if shrunk is not None:
                     current = shrunk
@@ -449,11 +471,15 @@ class ContinuousScheduler(SchedulerCore):
 
         ticket = self._runtime.adopt(prepared)
         self._set_inflight(ticket, (scheduled.request_id for scheduled in current.slices))
+        self._service_round += 1
+        self._advance_decode_cursor(current.slices)
+        self._recover_chunk_cap()
         self._last_step = current
         self._inflight_slices[ticket.id] = tuple(
             _InflightSlice(
                 scheduled.request_id,
                 scheduled.phase,
+                scheduled.query_start,
                 scheduled.query_end,
                 value.prompt_tokens,
             )
@@ -555,6 +581,12 @@ class ContinuousScheduler(SchedulerCore):
         mode = str(getattr(mode_obj, "value", mode_obj)).lower()
         if not self._preemption.preempt(victim, sequence, mode=mode):
             return None
+
+        if mode == "recompute":
+            self._recompute_until[victim.request_id] = victim.computed_tokens
+            self._wasted_compute_tokens += max(
+                0, victim.computed_tokens - victim.machine.num_cached_tokens
+            )
 
         self._running_remove(victim.request_id)
         self._prefilling.pop(victim.request_id, None)
@@ -676,6 +708,57 @@ class ContinuousScheduler(SchedulerCore):
         entry.bypass_count += 1
         self._bypasses += 1
 
+    def _new_queue_entry(
+        self, lifecycle: RequestLifecycle, sequence: SequenceHandle | None
+    ) -> QueueEntry:
+        entry = super()._new_queue_entry(lifecycle, sequence)
+        entry.ready_round = self._service_round
+        return entry
+
+    def _advance_decode_cursor(self, slices: Sequence[ScheduledSlice]) -> None:
+        """Charge round-robin service only after the runtime adopts the step."""
+        if not self._running_ids:
+            return
+        for scheduled in reversed(slices):
+            if scheduled.phase is Phase.DECODE:
+                index = self._running_index.get(scheduled.request_id)
+                if index is not None:
+                    self._decode_cursor = (index + 1) % len(self._running_ids)
+                return
+
+    def _running_remove(self, request_id: str) -> None:
+        """Preserve the cursor's next identity when a ring removal swaps its tail."""
+        index = self._running_index.get(request_id)
+        last = len(self._running_ids) - 1
+        if index is not None and index != last and self._decode_cursor == last:
+            self._decode_cursor = index
+        super()._running_remove(request_id)
+        self._decode_cursor %= len(self._running_ids) if self._running_ids else 1
+
+    def _drop(self, request_id: str) -> None:
+        self._recompute_until.pop(request_id, None)
+        super()._drop(request_id)
+
+    def _reduce_chunk_cap(self, plan: BatchStepPlan) -> None:
+        """Remember physical pressure across steps without exceeding the resolved cap."""
+        cap = self._effective_prefill_chunk_size
+        if cap is None or cap <= 1 or not plan.num_prefill_tokens:
+            return
+        self._effective_prefill_chunk_size = max(1, cap // 2)
+        self._successful_prepares_since_pressure = 0
+        self._chunk_adjustment_reason = "physical_prepare_refusal"
+
+    def _recover_chunk_cap(self) -> None:
+        cap = self._effective_prefill_chunk_size
+        ceiling = self._prefill_chunk_size
+        if cap is None or ceiling is None or cap >= ceiling:
+            return
+        self._successful_prepares_since_pressure += 1
+        if self._successful_prepares_since_pressure >= 4:
+            self._effective_prefill_chunk_size = min(ceiling, cap * 2)
+            self._successful_prepares_since_pressure = 0
+            self._chunk_adjustment_reason = "successful_prepare_recovery"
+
     @property
     def mixed_batches_enabled(self) -> bool:
         """Whether this scheduler may admit prefill and decode in one step."""
@@ -686,6 +769,7 @@ class ContinuousScheduler(SchedulerCore):
         last = self._last_step
         return ContinuousSchedulerStats(
             round_id=self._round,
+            service_round=self._service_round,
             waiting=self.num_waiting,
             prefilling=len(self._prefilling),
             running=len(self._running),
@@ -697,4 +781,8 @@ class ContinuousScheduler(SchedulerCore):
             preemptions=self._preemptions,
             bypasses=self._bypasses,
             admission_rejections=self._admission_rejections,
+            effective_prefill_chunk_tokens=self._effective_prefill_chunk_size,
+            chunk_adjustment_reason=self._chunk_adjustment_reason,
+            recomputed_tokens=self._recomputed_tokens,
+            wasted_compute_tokens=self._wasted_compute_tokens,
         )
