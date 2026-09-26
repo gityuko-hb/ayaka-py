@@ -70,6 +70,28 @@ def fp8_blockwise_mm_ref(
     return out
 
 
+def mxfp8_scaled_mm_ref(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``(a @ b^T)`` with E4M3 operands and UE8M0 1x32 scales, accumulated in FP32."""
+    inner = int(a.shape[1])
+    group = 32
+    sa = e8m0_values(a_scale).to(torch.float32).repeat_interleave(group, dim=1)[:, :inner]
+    sb = e8m0_values(b_scale).to(torch.float32).repeat_interleave(group, dim=1)[:, :inner]
+    product = (a.to(torch.float32) * sa) @ (b.to(torch.float32) * sb).t()
+    if bias is not None:
+        product = product + bias.to(torch.float32)
+    if out is None:
+        return product
+    out.copy_(product.to(out.dtype))
+    return out
+
+
 def fp8_weight_only_gemm_ref(
     input: torch.Tensor,
     weight: torch.Tensor,

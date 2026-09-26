@@ -186,7 +186,10 @@ def _fp8_blockwise_gemv_splitk_kernel(
         if kb < n_kb:
             offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
-            a = tl.load(a_ptr + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
+            if e4m3_native_cx():
+                a = tl.load(a_ptr + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
+            else:
+                a = e4m3_u8_to_f32(tl.load(a_ptr + offs_k * stride_ak, mask=k_mask, other=0))
             if e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
@@ -469,7 +472,7 @@ def fp8_blockwise_gemv(
     n_tiles, split_k, kb_per, n_kb = _split_plan(columns, inner)
     part = torch.empty((split_k, columns), dtype=torch.float32, device=a.device)
     cast(Any, _fp8_blockwise_gemv_splitk_kernel)[(n_tiles, split_k)](
-        a_vec,
+        e4m3_kernel_view(a_vec),
         e4m3_kernel_view(b),
         scale_a,
         scale_b,
