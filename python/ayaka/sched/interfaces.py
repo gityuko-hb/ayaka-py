@@ -19,6 +19,8 @@ from ayaka.sched.plan import BatchStepPlan, PreparedStep
 __all__ = [
     "AdmissionAdvisor",
     "AdmissionCallback",
+    "ChunkCapAdvisor",
+    "DeadlineExceededError",
     "OverloadedError",
     "PrefixHintProvider",
     "PreemptionCallback",
@@ -32,6 +34,10 @@ __all__ = [
 
 class OverloadedError(RuntimeError):
     """Admission backpressure: a request or queue ceiling is already reached."""
+
+
+class DeadlineExceededError(RuntimeError):
+    """Admission refused because the request deadline already elapsed."""
 
 
 class StepPrepareError(RuntimeError):
@@ -114,6 +120,17 @@ class AdmissionAdvisor(Protocol):
         full_prompt_remaining: int,
         scheduled_prompt_tokens: int,
     ) -> bool: ...
+
+
+class ChunkCapAdvisor(Protocol):
+    """Advisory prefill-chunk ceiling from the current capacity reading.
+
+    Returned tokens are a bound, never a reservation, and must not exceed the
+    resolved prefill chunk cap.  ``None`` means no opinion.  The scheduler
+    applies its own hysteresis and ``StepRuntime.prepare`` stays authoritative.
+    """
+
+    def prefill_chunk_hint(self) -> int | None: ...
 
 
 class PreemptionController(Protocol):

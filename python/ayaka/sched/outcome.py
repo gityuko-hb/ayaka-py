@@ -38,6 +38,7 @@ class FinishReason(enum.StrEnum):
     EOS = "eos"
     ABORT = "abort"
     ERROR = "error"
+    TIMEOUT = "timeout"  # request deadline elapsed
 
 
 @dataclass(frozen=True, slots=True)

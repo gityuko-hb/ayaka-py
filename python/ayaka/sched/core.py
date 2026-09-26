@@ -105,6 +105,9 @@ class SchedulerCore(BaseScheduler):
         self._inflight_request_ids: dict[TicketId, frozenset[str]] = {}
         self._inflight_ids_all: set[str] = set()
         self._abort_pending: set[str] = set()
+        #: Per-request abort detail and optional finish reason, consumed once by
+        #: ``_finalize_abort``.  ``None`` keeps the historical ``abort`` reason.
+        self._abort_reasons: dict[str, tuple[str, FinishReason | None]] = {}
         self._resource_blocked = False
 
         self._next_ordinal = 0
@@ -185,6 +188,7 @@ class SchedulerCore(BaseScheduler):
                 self._sampling.release(request_id)
             self._drop(request_id)
             self._abort_pending.discard(request_id)
+            self._abort_reasons.pop(request_id, None)
             self._ordinals.pop(request_id, None)
             self._pending.pop(request_id, None)
             self._requests.rollback(request_id)
@@ -305,7 +309,13 @@ class SchedulerCore(BaseScheduler):
                 "text stop strings require a tokenizer-backed output owner",
             )
 
-    def abort(self, request_id: str) -> bool:
+    def abort(
+        self,
+        request_id: str,
+        *,
+        reason: str = "aborted by scheduler",
+        finish_reason: FinishReason | None = None,
+    ) -> bool:
         """Cancel one request without poisoning unrelated co-batched requests.
 
         A parallel parent fans out to every child. If the request is already
@@ -313,12 +323,16 @@ class SchedulerCore(BaseScheduler):
         whole execution ticket is cancelled only when every request in that
         ticket is pending abort. Sequence release/reporting is deferred until
         the ticket settles, preserving lease and state-version safety.
+
+        ``finish_reason`` lets an owner name a terminal cause (for example
+        deadline expiry) that survives ticket settlement; it is applied exactly
+        once when the abort is finalized.
         """
         children = self._parents.children_of(request_id)
         if children is not None:
             did = False
             for child in children:
-                did = self.abort(child) or did
+                did = self.abort(child, reason=reason, finish_reason=finish_reason) or did
             return did
         lifecycle = self._requests.find(request_id)
         if lifecycle is None or lifecycle.is_terminal:
@@ -326,7 +340,13 @@ class SchedulerCore(BaseScheduler):
         if request_id in self._abort_pending:
             return False
 
-        lifecycle.token.cancel("aborted by scheduler")
+        self._abort_reasons[request_id] = (reason, finish_reason)
+        lifecycle.token.cancel(reason)
+        if finish_reason is not None and lifecycle.finish_reason is None:
+            # Completion settlement can move the lifecycle to CANCELLED before
+            # the scheduler finalizes the abort, so the terminal cause must be
+            # recorded at abort time; the ABORTED report carries it too.
+            lifecycle.finish_reason = finish_reason
         self._abort_pending.add(request_id)
 
         if self._owns_inflight(request_id):
@@ -373,6 +393,7 @@ class SchedulerCore(BaseScheduler):
             return None
         self._drop(request_id)
         self._abort_pending.discard(request_id)
+        self._abort_reasons.pop(request_id, None)
         if self._sampling is not None:
             self._sampling.release(request_id)
         self._queue_report(
@@ -392,6 +413,7 @@ class SchedulerCore(BaseScheduler):
             return None
         self._drop(request_id)
         self._abort_pending.discard(request_id)
+        self._abort_reasons.pop(request_id, None)
         if self._sampling is not None:
             self._sampling.release(request_id)
         self._queue_report(
@@ -460,6 +482,7 @@ class SchedulerCore(BaseScheduler):
 
     def _finalize_abort(self, request_id: str) -> None:
         lifecycle = self._requests.find(request_id)
+        detail, finish_reason = self._abort_reasons.pop(request_id, ("aborted by scheduler", None))
         self._drop(request_id)
         if self._sampling is not None:
             self._sampling.release(request_id)
@@ -469,7 +492,8 @@ class SchedulerCore(BaseScheduler):
                     request_id,
                     RequestOutcome.ABORTED,
                     lifecycle.sequence_epoch,
-                    detail="aborted by scheduler",
+                    finish_reason=finish_reason,
+                    detail=detail,
                 )
             )
         sequence = self._sequences.pop(request_id, None)

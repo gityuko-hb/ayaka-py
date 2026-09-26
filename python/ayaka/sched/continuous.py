@@ -21,6 +21,7 @@ from ayaka.sched.budget import BatchBudget
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import (
     AdmissionAdvisor,
+    ChunkCapAdvisor,
     PreemptionController,
     PrefixHintProvider,
     RequestPreparer,
@@ -120,6 +121,7 @@ class ContinuousScheduler(SchedulerCore):
         clock: Callable[[], int] | None = None,
         prefix_hints: PrefixHintProvider | None = None,
         admission: AdmissionAdvisor | None = None,
+        capacity_hint: ChunkCapAdvisor | None = None,
         preemption: PreemptionController | None = None,
         decode_first: bool = True,
         allow_mixed_batches: bool = True,
@@ -147,6 +149,7 @@ class ContinuousScheduler(SchedulerCore):
 
         self._prefix_hints = prefix_hints
         self._admission = admission
+        self._capacity_hint = capacity_hint
         self._preemption = preemption
         self._decode_first = bool(decode_first)
         self._allow_mixed_batches = bool(allow_mixed_batches)
@@ -184,12 +187,40 @@ class ContinuousScheduler(SchedulerCore):
         if len(self._inflight) >= self._plan.max_inflight:
             return None
         self._round += 1
+        self._apply_capacity_hint()
         self._drain_window()
         for plan in self._candidate_plans():
             ticket = self._prepare_and_adopt(plan)
             if ticket is not None:
                 return ticket
         return None
+
+    def _apply_capacity_hint(self) -> None:
+        """Shrink the effective chunk cap from an advisory pressure reading.
+
+        The provider reports only a bound; reduction is immediate when it is
+        below the current cap, while recovery stays with ``_recover_chunk_cap``
+        (double after four successful adopts), which is the hysteresis that
+        keeps the cap from oscillating.
+        """
+        provider = self._capacity_hint
+        if provider is None:
+            return
+        ceiling = self._prefill_chunk_size
+        if ceiling is None:
+            return
+        try:
+            hint = provider.prefill_chunk_hint()
+        except Exception:
+            return
+        if hint is None:
+            return
+        bounded = max(1, min(int(hint), ceiling))
+        current = self._effective_prefill_chunk_size
+        if current is None or bounded < current:
+            self._effective_prefill_chunk_size = bounded
+            self._successful_prepares_since_pressure = 0
+            self._chunk_adjustment_reason = "pressure_snapshot"
 
     def update_from_output(self, output: CompletionResult) -> None:
         if self._sampling is not None and output.published:
@@ -376,8 +407,15 @@ class ContinuousScheduler(SchedulerCore):
                 continue
 
             requested = remaining
-            if self._effective_prefill_chunk_size is not None:
-                requested = min(requested, self._effective_prefill_chunk_size)
+            # A reduced cap applies to continuation chunks only: the first
+            # chunk of a request keeps the resolved cap so a request that can
+            # never fit its group still hits the permanent capacity check
+            # before execution instead of being sliced past it.
+            cap = self._effective_prefill_chunk_size
+            if cap is not None:
+                if snapshot.computed_tokens == 0 and self._prefill_chunk_size is not None:
+                    cap = self._prefill_chunk_size
+                requested = min(requested, cap)
             chunk = budget.largest_fittable(requested)
             if chunk <= 0:
                 self._mark_bypass(entry)
