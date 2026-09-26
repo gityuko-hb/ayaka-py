@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
+import torch
+
 from ayaka.types import AttentionCudaGraphSupport, ForwardMode
 
 if TYPE_CHECKING:
-    import torch
-
     from ayaka.attention.ports import PagedKVCache
     from ayaka.attention.spec import AttentionGroupSpec
 
@@ -139,6 +140,31 @@ class BaseAttentionMetadataBuilder[M: BaseAttentionMetadata](ABC):
         # Raising it above the class value is never correct -- the registry advertised the
         # class value to the selector, and a promise made at selection time must hold.
         self.cudagraph_support = type(self).cudagraph_support
+
+    def graph_binding_digest(self) -> str:
+        """Stable digest of the kernel/backend binding a capture depends on.
+
+        ``ResourceGeneration`` covers the owner, model, KV storage, workspace
+        and buffers. This digest covers what can change *under the same backend
+        name*: the selected builder/kernel family, its declared graph support,
+        the toolchain and device, and the captured ceilings. A change in any of
+        them must invalidate the pool and recapture instead of replaying.
+
+        Subclasses append their own algorithm parameters (for example Triton's
+        split-KV partition size) and re-hash the result.
+        """
+        parts = (
+            type(self).__module__,
+            type(self).__qualname__,
+            self.cudagraph_support.name,
+            torch.__version__,
+            f"{self.device.type}:{self.device.index}",
+            f"batch={self.max_graph_batch_size}",
+            f"seq={self.max_graph_seq_len}",
+            f"query={self.max_graph_query_len}",
+            f"padding={self.graph_padding_slot}",
+        )
+        return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:16]
 
     @abstractmethod
     def build(self, common: CommonAttentionMetadata) -> M:

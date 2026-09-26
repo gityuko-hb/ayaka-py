@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 
@@ -554,6 +555,26 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
     def graph_state_bytes(self) -> int:
         """Persistent backend buffers a decode capture depends on, in bytes."""
         return self._graph_bytes
+
+    def graph_binding_digest(self) -> str:
+        """Base digest plus the split-KV/launch topology this backend pinned.
+
+        The graph state bakes ``compute_max_num_partitions`` at capture time, so
+        a Triton version, partition size, page size, window or head geometry
+        change must produce a new binding and force a recapture.
+        """
+        import triton
+
+        parts = (
+            super().graph_binding_digest(),
+            f"triton={triton.__version__}",
+            f"partition={self.kv_partition_size}",
+            f"page={self.group.page_size}",
+            f"window={self.spec.sliding_window}",
+            f"heads={self.spec.num_qo_heads}/{self.spec.num_kv_heads}",
+            f"dims={self.spec.head_dim_qk}/{self.spec.head_dim_vo}",
+        )
+        return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:16]
 
     def _stage_graph_decode(
         self, common: CommonAttentionMetadata, padded_batch_size: int
