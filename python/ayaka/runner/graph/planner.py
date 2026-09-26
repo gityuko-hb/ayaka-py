@@ -18,6 +18,7 @@ resource generation is the only path back to REPLAY.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -54,6 +55,7 @@ class GraphFallbackReason(StrEnum):
     BUCKET_CEILING = "bucket_ceiling"
     MISSING_BUCKET = "missing_bucket"
     GENERATION_MISMATCH = "generation_mismatch"
+    KERNEL_BINDING_MISMATCH = "kernel_binding_mismatch"
     INVALIDATED = "invalidated"
     WORKSPACE_GROWTH = "workspace_growth"
 
@@ -71,19 +73,27 @@ class GraphStats:
     captured_buckets: tuple[int, ...]
     invalidated: bool
     last_reason: str
+    capture_bytes: int = 0
+    capture_seconds: float = 0.0
+    reason_counts: tuple[tuple[str, int], ...] = ()
 
-    def as_dict(self) -> dict[str, int | str | tuple[int, ...] | bool]:
-        """Metric-named view; reason is a finite label, never a request id."""
+    def as_dict(
+        self,
+    ) -> dict[str, int | str | bool | float | tuple[int, ...] | tuple[tuple[str, int], ...]]:
+        """Metric-named view; every reason is a finite label, never a request id."""
         return {
             "graph_hit": self.hits,
             "graph_miss": self.misses,
             "graph_capture": self.captures,
+            "graph_capture_bytes": self.capture_bytes,
+            "graph_capture_seconds": self.capture_seconds,
             "graph_invalidation": self.invalidations,
             "workspace_growth": self.workspace_growth,
             "eager_fallback": self.eager_fallbacks,
             "graph_captured_buckets": self.captured_buckets,
             "graph_invalidated": self.invalidated,
             "graph_reason": self.last_reason,
+            "graph_reason_counts": self.reason_counts,
         }
 
 
@@ -104,6 +114,7 @@ class DecodeGraphPlanner:
         dtype: str,
         generation: Callable[[], ResourceGeneration | None],
         captured: Callable[[], frozenset[int]],
+        kernel_binding: Callable[[], str],
         eager_only_reason: Callable[[BatchStepPlan], str | None] | None = None,
         enabled: bool = True,
         metrics: Any | None = None,
@@ -116,16 +127,20 @@ class DecodeGraphPlanner:
             raise TypeError("support must be an AttentionCudaGraphSupport")
         if not backend or not dtype:
             raise ValueError("backend and dtype must be non-empty")
+        if not callable(kernel_binding):
+            raise TypeError("kernel_binding must be a zero-argument callable")
         self._buckets = tuple(buckets)
         self._support = support
         self._backend = backend
         self._dtype = dtype
         self._generation = generation
         self._captured = captured
+        self._kernel_binding = kernel_binding
         self._eager_only_reason = eager_only_reason
         self._enabled = bool(enabled)
         self._metrics = metrics
         self._captured_generation: ResourceGeneration | None = None
+        self._captured_binding: str | None = None
         self._invalidated = False
         self._invalidation_reason: GraphFallbackReason = GraphFallbackReason.INVALIDATED
         self._hits = 0
@@ -135,15 +150,26 @@ class DecodeGraphPlanner:
         self._eager_fallbacks = 0
         self._workspace_growth = 0
         self._last_reason = ""
+        self._capture_bytes = 0
+        self._capture_seconds = 0.0
+        self._reason_counts: Counter[str] = Counter()
 
     # ── capture-side state ────────────────────────────────────────────────
 
-    def note_capture(self, buckets: tuple[int, ...] = ()) -> None:
+    def note_capture(
+        self,
+        buckets: tuple[int, ...] = (),
+        *,
+        actual_bytes: int | None = None,
+        capture_seconds: float | None = None,
+    ) -> None:
         """Record that a capture session completed under the current generation.
 
-        The route decision compares the live generation against
-        ``_captured_generation``; a capture against any other generation would
-        produce graphs whose pointers belong to a replaced owner.
+        The route decision compares the live generation and kernel binding
+        against the captured ones; a capture against any other generation or
+        binding would produce graphs whose pointers/plan belong to a replaced
+        owner or kernel plan. ``actual_bytes``/``capture_seconds`` are the
+        measured footprint and wall cost of the capture that just finished.
         """
         if buckets:
             for bucket in buckets:
@@ -153,7 +179,19 @@ class DecodeGraphPlanner:
                     )
                 if bucket < 1:
                     raise ValueError("captured buckets must be positive")
+        if actual_bytes is not None and actual_bytes < 0:
+            raise ValueError("actual_bytes must be non-negative")
+        if capture_seconds is not None and capture_seconds < 0:
+            raise ValueError("capture_seconds must be non-negative")
+        binding = self._kernel_binding()
+        if not isinstance(binding, str) or not binding:
+            raise ValueError("kernel binding digest must be a non-empty string")
         self._captured_generation = self._generation()
+        self._captured_binding = binding
+        if actual_bytes is not None:
+            self._capture_bytes = int(actual_bytes)
+        if capture_seconds is not None:
+            self._capture_seconds = float(capture_seconds)
         self._captures += 1
         self._invalidated = False
         self._invalidation_reason = GraphFallbackReason.INVALIDATED
@@ -162,6 +200,10 @@ class DecodeGraphPlanner:
     @property
     def captured_generation(self) -> ResourceGeneration | None:
         return self._captured_generation
+
+    @property
+    def captured_binding(self) -> str | None:
+        return self._captured_binding
 
     def captured_buckets(self) -> frozenset[int]:
         return frozenset(self._captured())
@@ -199,6 +241,9 @@ class DecodeGraphPlanner:
         if not self._generation_current():
             self.invalidate(GraphFallbackReason.GENERATION_MISMATCH)
             return self._fallback(GraphFallbackReason.GENERATION_MISMATCH)
+        if not self._binding_current():
+            self.invalidate(GraphFallbackReason.KERNEL_BINDING_MISMATCH)
+            return self._fallback(GraphFallbackReason.KERNEL_BINDING_MISMATCH)
         raw = step.padded_num_tokens
         if raw < 1:
             return self._fallback(GraphFallbackReason.NO_TOKENS)
@@ -231,6 +276,10 @@ class DecodeGraphPlanner:
             raise GraphCapabilityError(
                 "graph replay plan belongs to a disabled/invalidated/replaced generation"
             )
+        if not self._binding_current():
+            raise GraphCapabilityError(
+                "graph replay plan belongs to a replaced kernel binding (routing bug)"
+            )
         bucket = pad_to_bucket(step.padded_num_tokens, self._buckets)
         if bucket != step.graph.bucket:
             raise GraphCapabilityError(
@@ -261,6 +310,9 @@ class DecodeGraphPlanner:
         if not self._generation_current():
             self.invalidate(GraphFallbackReason.GENERATION_MISMATCH)
             return self._refuse_execution(GraphFallbackReason.GENERATION_MISMATCH)
+        if not self._binding_current():
+            self.invalidate(GraphFallbackReason.KERNEL_BINDING_MISMATCH)
+            return self._refuse_execution(GraphFallbackReason.KERNEL_BINDING_MISMATCH)
         if step.graph.bucket not in self._captured():
             return self._refuse_execution(GraphFallbackReason.MISSING_BUCKET)
         return True
@@ -306,6 +358,7 @@ class DecodeGraphPlanner:
             mode=ForwardMode.DECODE,
             dtype=self._dtype,
             backend=self._backend,
+            kernel_binding=self._captured_binding or self._kernel_binding(),
         )
 
     def stats(self) -> GraphStats:
@@ -319,6 +372,9 @@ class DecodeGraphPlanner:
             captured_buckets=tuple(sorted(self._captured())),
             invalidated=self._invalidated,
             last_reason=self._last_reason,
+            capture_bytes=self._capture_bytes,
+            capture_seconds=self._capture_seconds,
+            reason_counts=tuple(sorted(self._reason_counts.items())),
         )
 
     def attach_metrics(self, metrics: Any | None) -> None:
@@ -331,9 +387,16 @@ class DecodeGraphPlanner:
         live = self._generation()
         return live is not None and live == self._captured_generation
 
+    def _binding_current(self) -> bool:
+        """Whether the live kernel binding still matches the captured one."""
+        if self._captured_binding is None:
+            return False
+        return self._kernel_binding() == self._captured_binding
+
     def _fallback(self, reason: GraphFallbackReason, *, detail: str = "") -> GraphPlan:
         self._misses += 1
         self._last_reason = str(reason)
+        self._count_reason("miss", reason)
         self._bump("graph_miss")
         if detail:
             logger.debug("decode graph eager fallback: %s (%s)", reason, detail)
@@ -342,8 +405,15 @@ class DecodeGraphPlanner:
     def _refuse_execution(self, reason: GraphFallbackReason) -> bool:
         self._eager_fallbacks += 1
         self._last_reason = str(reason)
+        self._count_reason("eager", reason)
         self._bump("eager_fallback")
         return False
+
+    def _count_reason(self, stage: str, reason: GraphFallbackReason) -> None:
+        """Count a fallback under a bounded ``stage:reason`` label."""
+        label = f"{stage}:{reason}"
+        self._reason_counts[label] += 1
+        self._bump(f"graph_{label}")
 
     def _bump(self, name: str) -> None:
         if self._metrics is not None:

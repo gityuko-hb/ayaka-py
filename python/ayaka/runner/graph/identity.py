@@ -37,26 +37,30 @@ def graph_identity_key(
     mode: ForwardMode,
     dtype: str,
     backend: str,
+    kernel_binding: str,
 ) -> str:
     """Content-free key for one decode bucket under one resource generation.
 
     Stable across replays with different table values/lengths/prefix hits;
     changes whenever any generation component or the padded bucket changes.
-    The KV group-layout fingerprints and model identity are spelled out in the
-    key itself, so a capture cannot replay after a group layout, page size or
-    weight revision change even if an owner incarnation were ever reused.
+    The KV group-layout fingerprints, model identity and ``kernel_binding``
+    digest are spelled out in the key itself, so a capture cannot replay after
+    a group layout, page size, weight revision or kernel-plan change even if an
+    owner incarnation were ever reused.
     """
     require_int(bucket, "bucket", minimum=1)
     if not isinstance(mode, ForwardMode):
         raise TypeError("mode must be a ForwardMode")
     require_text(dtype, "dtype")
     require_text(backend, "backend")
+    require_text(kernel_binding, "kernel_binding")
     if not isinstance(generation, ResourceGeneration):
         raise TypeError("generation must be a ResourceGeneration")
     return (
         f"decode:{backend}:{dtype}:b{bucket}:{mode.name.lower()}:"
         f"own{generation.owner_incarnation}:ws{generation.workspace}:"
         f"buf{generation.buffers}:kv{_fingerprint_tag(generation.kv_storage)}:"
+        f"kb{kernel_binding}:"
         f"model{generation.model_id}@{generation.model_revision}"
         f"/{generation.weights_revision}"
     )
@@ -71,6 +75,7 @@ class GraphIdentity:
     mode: ForwardMode
     dtype: str
     backend: str
+    kernel_binding: str
     slot_index: int
 
     def __post_init__(self) -> None:
@@ -83,6 +88,7 @@ class GraphIdentity:
             raise ValueError("captured decode graphs serve pure decode only")
         require_text(self.dtype, "dtype")
         require_text(self.backend, "backend")
+        require_text(self.kernel_binding, "kernel_binding")
         require_int(self.slot_index, "slot_index")
 
     @property
@@ -94,11 +100,12 @@ class GraphIdentity:
             mode=self.mode,
             dtype=self.dtype,
             backend=self.backend,
+            kernel_binding=self.kernel_binding,
         )
         return f"{base}:slot{self.slot_index}"
 
     def same_binding(self, other: GraphIdentity) -> bool:
-        """Whether both identities name the same generation/bucket/slot."""
+        """Whether both identities name the same generation/bucket/slot/binding."""
         if not isinstance(other, GraphIdentity):
             return NotImplemented
         return (
@@ -107,5 +114,6 @@ class GraphIdentity:
             and self.mode is other.mode
             and self.dtype == other.dtype
             and self.backend == other.backend
+            and self.kernel_binding == other.kernel_binding
             and self.slot_index == other.slot_index
         )

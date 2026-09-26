@@ -18,6 +18,18 @@ Notes:
     Slot indices are stable for the lifetime of a request: compaction is forbidden
     because it would rewrite penalty and RNG states of live rows that are not
     sampled in the current step (such as during chunked prefill or mixed prefill/decode).
+
+RNG policy (explicit contract, no speculative rollback):
+    * The counter-based RNG state is one offset per request slot; every sampled
+      row advances its own offset exactly once per sampling step, greedy rows
+      included, and no operation rewinds an offset.
+    * Cancellation, transient prepare failure, dropped candidate plans and
+      discarded samples never rewind RNG state. A request that is re-admitted
+      after a terminal outcome gets a fresh slot/seed from its new ordinal.
+    * ``release`` resets the slot (penalties, bias, ids logprobs, RNG offset),
+      so a reused slot cannot leak state into the next request.
+    * Penalty history is recorded only from prompt admission and from committed
+      token publication (``record_published``); recompute never re-records.
 """
 
 from __future__ import annotations
@@ -197,13 +209,19 @@ class SamplingCoordinator:
         return slot
 
     def release(self, request_id: str) -> int | None:
-        """Drop a request and reset its slot; missing ids are a caller bug."""
+        """Drop a request and reset its slot; missing ids are a caller bug.
+
+        RNG offsets, penalty/bias state, ids-logprobs and any attached mask
+        producers are reset, so a released slot cannot leak per-request state
+        into the next occupant. No other request's RNG stream is touched.
+        """
         slot = self._request_to_slot.pop(request_id, None)
         if slot is None:
             return None
         self.penalty_state.reset(slot)
         self.bias_state.reset(slot)
         self._ids_logprobs.pop(request_id, None)
+        self.planner.detach(slot)
         self.md.reset_slot(slot)
         self._free_slots.append(slot)
         return slot

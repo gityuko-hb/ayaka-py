@@ -16,6 +16,7 @@ before admission.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -95,6 +96,7 @@ class DecodeGraphPool:
         support: AttentionCudaGraphSupport,
         slots: Sequence[int],
         generation: Callable[[], ResourceGeneration | None],
+        kernel_binding: Callable[[], str],
         metrics: Any | None = None,
         barrier_fn: Callable[[], None] | None = None,
         eager_only_reason: Callable[[BatchStepPlan], str | None] | None = None,
@@ -102,6 +104,8 @@ class DecodeGraphPool:
     ) -> None:
         if device.type != "cuda":
             raise DecodeGraphPoolError("decode graphs require a CUDA device")
+        if not callable(kernel_binding):
+            raise DecodeGraphPoolError("kernel_binding must be a zero-argument callable")
         resolved = tuple(sorted(set(int(b) for b in buckets)))
         if not resolved or resolved[0] < 1:
             raise DecodeGraphPoolError("decode graph buckets must be positive")
@@ -123,6 +127,7 @@ class DecodeGraphPool:
             dtype=dtype,
             generation=generation,
             captured=self._captured_buckets,
+            kernel_binding=kernel_binding,
             eager_only_reason=eager_only_reason,
             metrics=metrics,
         )
@@ -175,6 +180,7 @@ class DecodeGraphPool:
         if self._runners:
             raise DecodeGraphPoolError("this pool already captured; rebuild instead of recapturing")
         before = self._reserved_bytes()
+        started = time.perf_counter()
         try:
             for slot in self._slots:
                 arena = GraphBufferArena()
@@ -206,17 +212,23 @@ class DecodeGraphPool:
             self.cleanup()
             raise
         torch.cuda.synchronize(self._device)
+        capture_seconds = time.perf_counter() - started
         after = self._reserved_bytes()
         self._actual_bytes = max(0, after - before) + max(0, int(persistent_bytes))
         generation = self._generation()
         for runner in self._runners.values():
             runner.bind_generation(generation)
-        self._planner.note_capture(self._buckets)
+        self._planner.note_capture(
+            self._buckets,
+            actual_bytes=self._actual_bytes,
+            capture_seconds=capture_seconds,
+        )
         logger.info(
-            "captured decode graphs: buckets=%s slots=%s bytes=%d",
+            "captured decode graphs: buckets=%s slots=%s bytes=%d seconds=%.3f",
             self._buckets,
             self._slots,
             self._actual_bytes,
+            capture_seconds,
         )
         return self._actual_bytes
 
@@ -265,8 +277,11 @@ class DecodeGraphPool:
             raise GraphCapabilityError("decode graph replay refused after the plan was validated")
         if rows > bucket:
             raise GraphCapabilityError(f"{rows} real rows exceed the captured bucket {bucket}")
+        output = runner.execute(rows, forward_fn=stage)
+        # Only a launched replay counts as a hit; a refused/failed launch above
+        # must not inflate the hit counter.
         self._planner.note_replay(bucket)
-        return runner.execute(rows, forward_fn=stage)
+        return output
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 

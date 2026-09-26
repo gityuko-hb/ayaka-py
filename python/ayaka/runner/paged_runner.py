@@ -437,7 +437,8 @@ class PagedModelRunner(ModelRunner):
         if not buckets:
             raise ValueError("no decode graph bucket fits the runner buffer ceilings")
         resolved = replace(config, buckets=buckets)
-        support = next(iter(self.builders.values())).cudagraph_support
+        builder = next(iter(self.builders.values()))
+        support = builder.cudagraph_support
         self._graph_config = resolved
         pool = DecodeGraphPool(
             device=self.device,
@@ -447,6 +448,7 @@ class PagedModelRunner(ModelRunner):
             support=support,
             slots=tuple(range(spec.max_inflight)),
             generation=lambda: self.kv.generation if self.kv is not None else None,
+            kernel_binding=builder.graph_binding_digest,
             barrier_fn=resolved.barrier_fn,
             eager_only_reason=self._graph_eager_only_reason,
             enable_gc_freeze=resolved.enable_gc_freeze,
