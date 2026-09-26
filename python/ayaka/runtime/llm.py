@@ -13,10 +13,15 @@ from ayaka.request.parallel import expand_parallel_request
 from ayaka.request.schema import Request
 from ayaka.request.stream import OutputEvent
 from ayaka.runtime.collection import OutputCollector, OutputListener, OutputStream
+from ayaka.sched.interfaces import OverloadedError
 
 __all__ = ["AyakaLLM", "AsyncAyakaLLM"]
 
 _LOG = logging.getLogger(__name__)
+
+#: Commands admitted per owner-loop pass.  Bounded so a sustained submit burst
+#: cannot starve ``engine.step()`` while the queue drains over later passes.
+_COMMANDS_PER_PASS = 32
 
 
 class AyakaLLM:
@@ -28,13 +33,18 @@ class AyakaLLM:
         *,
         stream_limit: int = 1024,
         idle_interval: float = 0.05,
+        max_pending_commands: int = 256,
         on_settled: Callable[[str, str | None], None] | None = None,
         collector_downstream: OutputListener | None = None,
     ) -> None:
+        if not isinstance(max_pending_commands, int) or isinstance(max_pending_commands, bool):
+            raise TypeError("max_pending_commands must be an integer")
+        if max_pending_commands < 1:
+            raise ValueError("max_pending_commands must be positive")
         self.engine = engine
         self._collector = OutputCollector(limit=stream_limit, downstream=collector_downstream)
         engine.output.set_listener(self._collector)
-        self._commands: queue.Queue = queue.Queue()
+        self._commands: queue.Queue = queue.Queue(maxsize=max_pending_commands)
         self._closing = threading.Event()
         self._stopped = threading.Event()
         self._signal = threading.Event()
@@ -54,8 +64,9 @@ class AyakaLLM:
     def submit(self, request: Request) -> Future[OutputStream]:
         """Queue admission on the owner thread; resolves to the request's stream.
 
-        Raises immediately when the engine already closed; per-request
-        validation errors are surfaced through the future instead.
+        Raises immediately when the engine already closed or the bounded
+        command queue is full; per-request validation errors are surfaced
+        through the future instead.
         """
         future: Future[OutputStream] = Future()
         with self._lock:
@@ -63,7 +74,10 @@ class AyakaLLM:
                 raise RuntimeError("engine owner is stopped")
             if self._closing.is_set():
                 raise RuntimeError("engine is closing")
-            self._commands.put_nowait((request, future))
+            try:
+                self._commands.put_nowait((request, future))
+            except queue.Full as exc:
+                raise OverloadedError("engine SDK command queue is full") from exc
         self._signal.set()
         return future
 
@@ -151,7 +165,7 @@ class AyakaLLM:
             self._forget_family(request_id)
 
     def _admit_pending(self) -> None:
-        while True:
+        for _ in range(_COMMANDS_PER_PASS):
             try:
                 request, future = self._commands.get_nowait()
             except queue.Empty:
@@ -262,8 +276,20 @@ class AyakaLLM:
 class AsyncAyakaLLM:
     """asyncio façade: ``generate`` streams ``OutputEvent`` values."""
 
-    def __init__(self, engine, *, stream_limit: int = 1024, idle_interval: float = 0.05) -> None:
-        self._llm = AyakaLLM(engine, stream_limit=stream_limit, idle_interval=idle_interval)
+    def __init__(
+        self,
+        engine,
+        *,
+        stream_limit: int = 1024,
+        idle_interval: float = 0.05,
+        max_pending_commands: int = 256,
+    ) -> None:
+        self._llm = AyakaLLM(
+            engine,
+            stream_limit=stream_limit,
+            idle_interval=idle_interval,
+            max_pending_commands=max_pending_commands,
+        )
 
     async def generate(self, request: Request) -> AsyncIterator[OutputEvent]:
         """Yield output events until terminal; aborts when consumed partially.

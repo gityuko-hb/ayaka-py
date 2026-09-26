@@ -121,6 +121,11 @@ class ResidentKVExecutor(Executor):
     def has_submission_capacity(self) -> bool:
         return super().has_submission_capacity() and self._worker.accepting
 
+    @property
+    def accepting_work(self) -> bool:
+        """Admission requires both executor and worker to accept new work."""
+        return super().accepting_work and self._worker.accepting
+
     def shutdown(self) -> bool:
         # Stop worker admission first: a later retry must never enqueue.
         self._worker.request_closing()
@@ -187,7 +192,11 @@ class ResidentKVEngine(Engine):
             raise ValueError("prefix reuse requires declared runner support")
         requests = LifecycleManager()
         allocator = KVSequenceAllocator(kv)
-        self.preparer = KVRequestPreparer(allocator, prefix_context=prefix_context)
+        self.preparer = KVRequestPreparer(
+            allocator,
+            prefix_context=prefix_context,
+            chunk_cap=(plan.max_prefill_chunk_tokens if plan.enable_chunked_prefill else None),
+        )
         # The worker owns the device context, streams, runner and fences; the
         # engine only composes it and the executor adapter drives tickets.
         self.worker = worker or LocalWorker(kv, runner, max_inflight=plan.max_inflight)
@@ -214,6 +223,8 @@ class ResidentKVEngine(Engine):
             request_preparer=self.preparer,
             prefix_hints=self.preparer,
             preemption=self.preparer if plan.preemption_mode is PreemptionMode.RECOMPUTE else None,
+            admission=self.preparer,
+            capacity_hint=self.preparer,
             allow_mixed_batches=bool(getattr(runner, "supports_mixed_batches", False)),
         )
         super().__init__(

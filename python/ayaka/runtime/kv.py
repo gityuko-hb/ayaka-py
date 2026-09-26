@@ -6,14 +6,16 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from ayaka.exceptions import InvalidHandleError, InvalidStateTransitionError
 from ayaka.executor.base import Executor
 from ayaka.executor.completion import CompletionCoordinator
 from ayaka.executor.ticket import ExecutionTicket, TerminalStatus, TicketId, TicketState
 from ayaka.handles import SequenceHandle
-from ayaka.kvcache.manager import KVCapacityError, LogicalKVManager
+from ayaka.kvcache.manager import KVCapacityError, LogicalKVManager, MemorySnapshotView
 from ayaka.memory.capacity import ResourceGeneration
-from ayaka.memory.pressure import PreemptionStatus
+from ayaka.memory.pressure import GroupedPressureSnapshot, PreemptionStatus, PressureStopReason
 from ayaka.memory.state import ReservationFailure
+from ayaka.memory.views import GroupedMemorySnapshot
 from ayaka.memory.workspace import WorkspaceLease, WorkspaceManager
 from ayaka.obs import runtime_event
 from ayaka.plan import (
@@ -34,18 +36,43 @@ from ayaka.sched.plan import BatchStepPlan, PreparedStep
 PrefixContextProvider = Callable[[Request], PrefixCacheContext]
 
 
+@dataclass(frozen=True, slots=True)
+class ChunkPressurePolicy:
+    """Watermark that bounds prefill chunks while reclaimable KV runs low.
+
+    ``low_watermark_pages`` is the reclaimable page count (free + deferred +
+    cache-evictable) under which the scheduler should shrink its effective
+    prefill chunk.  A snapshot is advisory: authoritative reservation still
+    happens in ``prepare``.
+    """
+
+    low_watermark_pages: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.low_watermark_pages, int) or isinstance(
+            self.low_watermark_pages, bool
+        ):
+            raise TypeError("low_watermark_pages must be an integer")
+        if self.low_watermark_pages < 1:
+            raise ValueError("low_watermark_pages must be positive")
+
+
 @dataclass(slots=True)
 class PrefixReuseRequestMetrics:
     """One request's prefix accounting: ranking hint vs acquisition vs forwards.
 
-    ``hint_tokens`` is the latest borrowed lookup estimate; ``acquired_tokens``
-    is what attach actually validated and bound (never guessed from the hint);
-    ``forwarded_tokens`` counts query rows whose forward completed and KV
-    committed. Suffix-only compute means ``forwarded_tokens == (P - H) + G - 1``
-    for ``P`` prompt tokens, ``G`` outputs and ``H`` acquired tokens.
+    ``hint_tokens`` is the latest borrowed lookup estimate; ``matched_tokens``
+    is the capability the acquire call revalidated at lookup time;
+    ``acquired_tokens`` is what attach actually validated and bound (never
+    guessed from the hint); ``forwarded_tokens`` counts query rows whose
+    forward completed and KV committed. Suffix-only compute means
+    ``forwarded_tokens == (P - H) + G - 1`` for ``P`` prompt tokens, ``G``
+    outputs and ``H`` acquired tokens. ``matched >= acquired`` always holds;
+    a nonzero match with zero acquisition is a stale hint, not a hit.
     """
 
     hint_tokens: int = 0
+    matched_tokens: int = 0
     acquired_tokens: int = 0
     forwarded_tokens: int = 0
 
@@ -92,7 +119,9 @@ class PrefixReuseTelemetry:
         record = self.records.get(request_id) or self.records.setdefault(
             request_id, PrefixReuseRequestMetrics()
         )
+        matched = max(0, int(matched))
         acquired = max(0, int(acquired))
+        record.matched_tokens = matched
         record.acquired_tokens = acquired
         if acquired:
             self.stats.hits += 1
@@ -190,15 +219,55 @@ class KVRequestPreparer:
     """
 
     def __init__(
-        self, allocator: KVSequenceAllocator, *, prefix_context: PrefixContextProvider | None = None
+        self,
+        allocator: KVSequenceAllocator,
+        *,
+        prefix_context: PrefixContextProvider | None = None,
+        chunk_cap: int | None = None,
+        chunk_pressure: ChunkPressurePolicy | None = None,
     ) -> None:
         self.allocator = allocator
         self.kv = allocator.kv
         self.prefix_context = prefix_context
+        self._chunk_cap = chunk_cap
+        self._chunk_pressure = chunk_pressure
         self._contexts: dict[SequenceHandle, PrefixCacheContext] = {}
         allocator.on_release = self.forget
         self.prefix = allocator.kv.prefix_service if prefix_context is not None else None
         self.telemetry = PrefixReuseTelemetry()
+
+    def prefill_chunk_hint(self) -> int | None:
+        """Advisory chunk ceiling from the current reclaimable KV capacity.
+
+        ``None`` means no pressure opinion; the scheduler keeps its resolved
+        cap and may recover gradually.  Under the watermark the hint falls to
+        half of the currently reclaimable tokens, so a chunked prefill is cut
+        before the authoritative prepare path has to refuse or preempt.
+        """
+        if self._chunk_cap is None:
+            return None
+        try:
+            snapshot = self.kv.pressure_snapshot()
+        except Exception:
+            # A capacity hint can never break scheduling; prepare stays
+            # authoritative and will refuse transiently if capacity is gone.
+            return None
+        available = (
+            snapshot.binding_available_pages
+            if isinstance(snapshot, GroupedPressureSnapshot)
+            else snapshot.available_pages
+        )
+        page_size = max(1, int(snapshot.page_size))
+        if self._chunk_pressure is not None:
+            low = self._chunk_pressure.low_watermark_pages
+        else:
+            # Conservative default: engage only inside a quarter chunk of
+            # reclaimable headroom, so the authority of prepare is preserved
+            # and preemption still runs before the cap is touched.
+            low = max(1, -(-self._chunk_cap // page_size) // 4)
+        if available > low:
+            return None
+        return max(1, (available * page_size) // 2)
 
     def _context(self, request: Request) -> PrefixCacheContext:
         if self.prefix_context is None:
@@ -223,6 +292,78 @@ class KVRequestPreparer:
         value = 0 if match is None else match.logical_position
         self.telemetry.observe_hint(lifecycle.request_id, value)
         return value
+
+    def can_admit(
+        self,
+        lifecycle: RequestLifecycle,
+        *,
+        full_prompt_remaining: int,
+        scheduled_prompt_tokens: int,
+    ) -> bool:
+        """Advisory page and COW-headroom precheck before a prefill candidate.
+
+        This is a ranking/refusal hint only: ``KVStepRuntime.prepare`` still
+        reserves every page and refuses the batch authoritatively. A rejection
+        here increases the request's bypass count (which bounded aging can
+        counter), so the estimate stays conservative and never mutates KV.
+        """
+        if lifecycle.is_terminal or lifecycle.token.is_cancelled or lifecycle.inflight_slice:
+            return False
+        try:
+            sequence = self.allocator.get(lifecycle.request_id)
+            state = self.kv.get_sequence(sequence)
+        except (KeyError, InvalidHandleError, InvalidStateTransitionError):
+            return True
+        if state.busy or state.release_requested:
+            return False
+        snapshot = self.kv.snapshot()
+        page_size = max(1, int(snapshot.page_size))
+        remaining_after_chunk = max(0, int(full_prompt_remaining) - int(scheduled_prompt_tokens))
+        table = getattr(state, "page_table", ()) or ()
+        tail_free = 0
+        if table:
+            tail_free = max(0, page_size - int(getattr(table[-1], "valid_tokens", 0)))
+        needed_tokens = max(0, remaining_after_chunk - tail_free)
+        if needed_tokens > self._reclaimable_tokens(snapshot):
+            return False
+        if (
+            needed_tokens > 0
+            and self.prefix is not None
+            and lifecycle.request.cache.prefix_cache
+            and not prompt_logprobs_requires_full_prompt(lifecycle.request)
+        ):
+            try:
+                context = self._context(lifecycle.request)
+                match = self.prefix.lookup(
+                    prefix_prompt_candidate(lifecycle.request), context=context
+                )
+                if match is not None and not self.prefix.ready(match):
+                    return False
+            except Exception:
+                # A failing hint cannot become an admission authority.
+                return True
+        return True
+
+    @staticmethod
+    def _reclaimable_tokens(snapshot: MemorySnapshotView) -> int:
+        """Headroom the authoritative prepare path can actually realize.
+
+        Free pages alone understate capacity: prepare may evict cache-only
+        prefix pages and reclaim deferred pages at the completed epoch. The
+        grouped snapshot has no evictable counter, so each group contributes
+        its own free and deferred pages and the binding group wins.
+        """
+        if isinstance(snapshot, GroupedMemorySnapshot):
+            return min(
+                (
+                    (group.free_pages + group.deferred_free_pages) * group.page_size
+                    for group in snapshot.groups
+                ),
+                default=0,
+            )
+        return (
+            snapshot.free_pages + snapshot.deferred_free_pages + snapshot.cache_evictable_pages
+        ) * snapshot.page_size
 
     def prepare_request(self, lifecycle: RequestLifecycle) -> bool:
         if lifecycle.is_terminal or lifecycle.token.is_cancelled or lifecycle.inflight_slice:
@@ -524,11 +665,21 @@ class KVStepRuntime:
                 break
             except KVCapacityError as exc:
                 if exc.reason is ReservationFailure.NO_CAPACITY:
-                    # Release only as many cache-only pages as the reservation needs.
-                    # Every retry is a fresh atomic reservation across all groups.
-                    pressure = kv.evict_prefixes_for_pressure(1)
-                    if pressure.pages_reclaimed:
+                    # One bounded relief sequence covers reclaim, bounded
+                    # demotion and cache-only eviction. Every retry is a fresh
+                    # atomic reservation across all groups.
+                    outcome = kv.relieve_pressure(1)
+                    if outcome.made_progress:
                         continue
+                    if outcome.stop_reason is PressureStopReason.HOST_BACKPRESSURE:
+                        runtime_event(
+                            "pressure",
+                            step_id=step.step_id,
+                            status="host_backpressure",
+                            detail=(
+                                f"target={outcome.target_pages} reached={outcome.reached_pages}"
+                            ),
+                        )
                     if any(kv.privatize_prefix_tail(value.sequence) for value in step.inputs):
                         # Removing cache sharing can eliminate a COW allocation
                         # even when eviction cannot free a request-owned page.

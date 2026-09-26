@@ -26,7 +26,7 @@ from ayaka.request.parallel import expand_parallel_request
 from ayaka.request.schema import Request
 from ayaka.runtime.output import FinishDecision, OutputProcessor
 from ayaka.sched.core import SchedulerCore
-from ayaka.sched.interfaces import SequenceAllocator
+from ayaka.sched.interfaces import DeadlineExceededError, SequenceAllocator
 from ayaka.sched.outcome import FinishReason, RequestOutcome, SchedulerReport
 from ayaka.sched.plan import BatchStepPlan
 from ayaka.serving.router import RemoteKVPending
@@ -50,6 +50,7 @@ class Engine:
         stat_loggers: Sequence[StatLogger] = (),
         log_interval: float = 10.0,
         log_clock: Callable[[], float] | None = None,
+        clock: Callable[[], int] | None = None,
     ) -> None:
         if not isinstance(plan, ResolvedSchedulerPlan):
             raise TypeError("plan must be ResolvedSchedulerPlan")
@@ -61,6 +62,9 @@ class Engine:
         self._allocator = allocator
         self._remote_kv = remote_kv
         self._settled = 0
+        #: Monotonic nanosecond source for request deadlines; tests inject a
+        #: fake clock, production uses the process monotonic clock.
+        self._clock = clock or time.monotonic_ns
         self._manager = (
             StatLoggerManager(loggers=stat_loggers, log_interval=log_interval, clock=log_clock)
             if stat_loggers
@@ -82,6 +86,9 @@ class Engine:
                 "REMOTE_KV_REGISTRY_REQUIRED",
                 "deferring a request to WAITING_REMOTE_KV requires a remote-KV pending registry",
             )
+        deadline = request.deadline_ns
+        if deadline is not None and deadline <= self._clock():
+            raise DeadlineExceededError(f"{request.request_id}: deadline elapsed before admission")
         children = expand_parallel_request(request) if request.sampling.n > 1 else None
         if children is None:
             self._output.register(request)
@@ -137,9 +144,23 @@ class Engine:
         started = time.monotonic()
         settled_before = self._settled
         did = False
-        for lifecycle in self._requests.cancelled_requests():
-            if self._scheduler.abort(lifecycle.request_id):
-                did = True
+        now_ns = self._clock()
+        for lifecycle in self._requests:
+            if lifecycle.token.is_cancelled:
+                if self._scheduler.abort(lifecycle.request_id):
+                    did = True
+                continue
+            deadline = lifecycle.request.deadline_ns
+            if deadline is not None and now_ns >= deadline:
+                # Expiry cancels publication through the shared abort path: the
+                # executor discards sampled tokens for a cancelled token, and
+                # the terminal cause survives ticket settlement exactly once.
+                if self._scheduler.abort(
+                    lifecycle.request_id,
+                    reason="deadline exceeded",
+                    finish_reason=FinishReason.TIMEOUT,
+                ):
+                    did = True
 
         finishes: list[FinishDecision] = []
         published_tokens = 0

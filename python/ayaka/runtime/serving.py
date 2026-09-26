@@ -38,6 +38,7 @@ from ayaka.memory.capacity import (
     CapacityFreeze,
     CapacitySnapshot,
 )
+from ayaka.memory.host.host_policy import HostMemoryPolicy, MirrorDecision
 from ayaka.memory.ledger import MemoryLedger
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.tiering import TieringConfig
@@ -55,7 +56,7 @@ from ayaka.serving.http import create_app
 from ayaka.serving.prepare import RequestProcessor
 from ayaka.serving.service import ServingService
 from ayaka.tokenizers.service import TokenizerService
-from ayaka.types import AttentionType, DType
+from ayaka.types import AttentionType, DType, MemoryTier
 from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.torch_memory import empty_cache
 from ayaka.utils.validation import require_int
@@ -130,6 +131,7 @@ class ServingRuntime:
         max_inflight: int = 1,
         batch_tokens=256,
         prefill_chunk=128,
+        max_model_len: int | None = None,
         tokenizer_workers=2,
         backend="triton",
         resize_safety_bytes: int = DEFAULT_RESIZE_SAFETY_BYTES,
@@ -163,6 +165,10 @@ class ServingRuntime:
                 metadata and graph resources before capacity is frozen.
             batch_tokens: Maximum batched tokens per step.
             prefill_chunk: Chunked-prefill cap.
+            max_model_len: Served context ceiling; may reserve less than the
+                checkpoint's ``max_position_embeddings`` but never more.  An
+                oversized request is rejected before admission on the effective
+                value.
             tokenizer_workers: Encode worker count.
             backend: ``triton``, ``reference``, ``flash_attention`` or
                 ``flashinfer``; CPU requires ``reference``.
@@ -203,7 +209,17 @@ class ServingRuntime:
         self._graph_buckets = resolved_buckets
         parameter = next(model.parameters())
         device, dtype, model_config = parameter.device, parameter.dtype, model.config
-        max_seq = model_config.max_position_embeddings
+        model_ceiling = model_config.max_position_embeddings
+        if max_model_len is None:
+            max_seq = model_ceiling
+        else:
+            if not isinstance(max_model_len, int) or isinstance(max_model_len, bool):
+                raise TypeError("max_model_len must be an integer or None")
+            if not 1 <= max_model_len <= model_ceiling:
+                raise ValueError(
+                    f"max_model_len must be in [1, {model_ceiling}], the checkpoint context"
+                )
+            max_seq = max_model_len
         if max_requests < 1 or pages < 2 or not 1 <= prefill_chunk <= batch_tokens:
             raise ValueError("invalid serving capacity")
         require_int(max_inflight, "max_inflight", minimum=1)
@@ -255,6 +271,14 @@ class ServingRuntime:
             raise TypeError("tiering must be a TieredCacheConfig or None")
         _validate_serving_tiering(tiering)
         self._tiering = tiering
+        # The operator's pin ceiling plus one probe of the machine. The mirror
+        # decision is taken per build, because a SWAP resize holds both mirrors
+        # and a starved host is a moment, not a configuration.
+        self._host_policy = (
+            HostMemoryPolicy.from_limits(tiering.host_bytes, self._memory_config.host)
+            if tiering is not None
+            else None
+        )
         self._weights_bytes = (
             self._measure_weights(model) if weights_bytes is None else weights_bytes
         )
@@ -264,6 +288,8 @@ class ServingRuntime:
         self._freeze: CapacityFreeze | None = None
         self._constraints: GrammarConstraints | None = None
         self._tail: _KVTail | None = None
+        self._mirror_bytes = 0
+        self._mirror_pinned = False
 
         self.tokenizer = self.kv = self.storage = self.engine = self.service = None
         self.manager = self.workspace = self.workspace_allocator = self.runner_buffers = None
@@ -436,6 +462,47 @@ class ServingRuntime:
                 peak = max(peak, max(0, observed[0] - baseline))
         return peak
 
+    def _resident_pinned_mirror_bytes(self) -> int:
+        """Pinned mirror bytes still resident from the currently bound tail.
+
+        A SWAP resize allocates the replacement mirror while the old one is
+        still pinned, so the old bytes count against the same ceiling. The
+        ledger cannot answer this: it charges staging and mirror to the same
+        owner account. The value is tracked on the bound tail, not read from a
+        closed manager, so a REBUILD (which frees first) does not over-count.
+        """
+        return self._mirror_bytes if self._mirror_pinned else 0
+
+    def _check_host_mirror(self, pages: int) -> MirrorDecision | None:
+        """Validate the mirror at ``pages`` against the host pin ceiling.
+
+        Read-only and raisable; used by :meth:`plan_resize` so a refused resize
+        never reaches a destructive free. The allocation path repeats the check
+        with the same inputs, so both agree.
+        """
+        if self._tiering is None or self._host_policy is None:
+            return None
+        spec = self._storage_spec(pages)
+        tiering_config, _ = self._tiering_config(spec)
+        assert tiering_config is not None
+        mirror_bytes = tiering_config.host_capacity_pages * spec.bytes_per_page
+        decision = self._host_policy.decide_mirror(
+            mirror_bytes,
+            requested_tier=(
+                MemoryTier.HOST_PINNED if self._device.type == "cuda" else MemoryTier.HOST_PAGEABLE
+            ),
+            already_pinned_bytes=self._staging_bytes + self._resident_pinned_mirror_bytes(),
+        )
+        if not decision:
+            raise CacheRebuildRejected(
+                f"host KV mirror refused by host memory policy: {decision.reason}",
+                reason=ResizeRejectionReason.BUDGET,
+                requested_pages=tiering_config.host_capacity_pages,
+                need_bytes=mirror_bytes,
+                available_bytes=decision.headroom_bytes,
+            )
+        return decision
+
     def _build_kv(self, pages: int) -> WorkerResources:
         """Delegate allocation, reconciliation and freeze to the Worker owner."""
         spec = self._storage_spec(pages)
@@ -461,6 +528,8 @@ class ServingRuntime:
             staging_bytes=self._staging_bytes,
             tiering=tiering_config,
             max_inflight_bytes=max_inflight_bytes,
+            host_policy=self._host_policy if tiering_config is not None else None,
+            already_pinned_host_bytes=self._resident_pinned_mirror_bytes(),
         ).build()
 
     def _tiering_config(self, spec: MHAStorageSpec) -> tuple[TieringConfig | None, int | None]:
@@ -650,6 +719,9 @@ class ServingRuntime:
         self.workspace_allocator = tail.workspace_allocator
         self.runner_buffers = tail.buffers
         self.engine = tail.engine
+        mirror = getattr(tail.manager, "host_storage", None)
+        self._mirror_bytes = 0 if mirror is None else int(mirror.total_bytes)
+        self._mirror_pinned = bool(mirror is not None and mirror.pinned)
 
     def _teardown_tail(self) -> None:
         """Drain and release the currently bound owners, if any.
@@ -667,6 +739,9 @@ class ServingRuntime:
                 raise RuntimeError("engine still owns unsettled work; tail retained")
         if self._tail is not None:
             self._tail.resources.close()
+        # The mirror died with the tail; a following build must not count it.
+        self._mirror_bytes = 0
+        self._mirror_pinned = False
 
     def _resolve_headroom(self) -> int | None:
         """Measured resizable headroom, or None when the device cannot report."""
@@ -710,7 +785,7 @@ class ServingRuntime:
         self._require_live()
         storage = self.storage
         assert storage is not None
-        return validate_resize(
+        plan = validate_resize(
             spec=storage.storage.spec,
             requested_pages=pages,
             page_size=self._page_size,
@@ -720,6 +795,10 @@ class ServingRuntime:
             safety_bytes=self._resize_safety_bytes,
             kv_budget_bytes=self._frozen_budget(),
         )
+        # The host mirror is rebuilt alongside the slab; its pin ceiling is
+        # part of the fit and must reject here, before any free.
+        self._check_host_mirror(pages)
+        return plan
 
     def cache_status(self) -> CacheStatus:
         """Return current capacity and the largest admissible resize for a UI."""

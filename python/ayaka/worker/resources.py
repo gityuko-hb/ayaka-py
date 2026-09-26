@@ -49,11 +49,13 @@ from ayaka.memory.capacity import (
     mint_generation,
     reconcile_actual_usage,
 )
+from ayaka.memory.host.host_policy import HostMemoryPolicy
 from ayaka.memory.ledger import MemoryLedger, Reservation
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.source import TorchDeviceSource, TorchHostByteSource
 from ayaka.memory.tiering import HostKVStorage, TieringConfig, build_transfer_engine
 from ayaka.memory.workspace import WorkspaceManager
+from ayaka.obs import runtime_event
 from ayaka.prefix.transfer import TransferCredits
 from ayaka.runner.buffers import RunnerBuffers, RunnerBufferSpec
 from ayaka.types import DType, MemoryOwner, MemoryTier
@@ -86,6 +88,12 @@ class WorkerResourcePlan:
     max_num_requests: int | None = None
     tiering: TieringConfig | None = None
     max_inflight_bytes: int | None = None
+    #: Resolved host pin ceiling for the KV mirror. ``None`` keeps the
+    #: allocation-time behavior (pin on CUDA, pageable fallback allowed).
+    host_policy: HostMemoryPolicy | None = None
+    #: Pinned mirror bytes a shorter-lived rebuild still holds (a SWAP holds
+    #: both mirrors until the old tail closes). Counted against the pin ceiling.
+    already_pinned_host_bytes: int = 0
     #: Alignment the KV slab is charged with; must match the planner's cost
     #: model for this geometry.
     alignment_bytes: int = DEFAULT_KV_ALIGNMENT_BYTES
@@ -147,12 +155,39 @@ class WorkerResourcePlan:
         mirror_bytes = (
             self.storage_spec.bytes_per_page * tier.host_capacity_pages if tier is not None else 0
         )
+        # The host hard cap gates the mirror before a single byte is allocated.
+        # A refusal with fallback allowed is a decision, not an error: the
+        # mirror is built pageable and charged there.
+        mirror_decision = None
+        if tier is not None and self.host_policy is not None:
+            mirror_decision = self.host_policy.decide_mirror(
+                mirror_bytes,
+                requested_tier=(
+                    MemoryTier.HOST_PINNED
+                    if self.lane is MemoryLane.CUDA
+                    else MemoryTier.HOST_PAGEABLE
+                ),
+                already_pinned_bytes=self.staging_bytes + self.already_pinned_host_bytes,
+            )
+            if not mirror_decision:
+                raise CacheRebuildRejected(
+                    f"host KV mirror refused by host memory policy: {mirror_decision.reason}",
+                    reason=ResizeRejectionReason.BUDGET,
+                    requested_pages=tier.host_capacity_pages,
+                    need_bytes=mirror_bytes,
+                    available_bytes=mirror_decision.headroom_bytes,
+                )
+        # Both host accounts cover staging plus mirror: staging itself may
+        # degrade to pageable, so sizing only one account turns an allowed
+        # fallback into a ledger overrun.
         ledger = MemoryLedger.for_device(
             device_budget_bytes=budget,
             device_total_bytes=total,
             host_pinned_bytes=self.staging_bytes + mirror_bytes,
             device_index=index,
-            host_pageable_bytes=budget if self.lane is MemoryLane.CPU else mirror_bytes,
+            host_pageable_bytes=(
+                budget if self.lane is MemoryLane.CPU else self.staging_bytes + mirror_bytes
+            ),
             host_total_bytes=total if self.lane is MemoryLane.CPU else 0,
         )
         with ExitStack() as rollback:
@@ -192,11 +227,34 @@ class WorkerResourcePlan:
             credits: TransferCredits | None = None
             engine: object | None = None
             if tier is not None:
+                allow_pageable = (
+                    self.host_policy.allow_pageable_fallback
+                    if self.host_policy is not None
+                    else True
+                )
                 host_mirror = HostKVStorage(
                     storage.storage,
                     capacity_pages=tier.host_capacity_pages,
-                    pin_memory=self.lane is MemoryLane.CUDA,
+                    pin_memory=(
+                        mirror_decision.tier is MemoryTier.HOST_PINNED
+                        if mirror_decision is not None
+                        else self.lane is MemoryLane.CUDA
+                    ),
+                    allow_pageable_fallback=allow_pageable,
                 )
+                if mirror_decision is not None:
+                    requested_tier = mirror_decision.tier
+                    assert requested_tier is not None
+                    if mirror_decision.fallback or host_mirror.actual_tier is not requested_tier:
+                        runtime_event(
+                            "host_mirror",
+                            owner_id="tier",
+                            status="pageable_fallback",
+                            detail=(
+                                f"requested={requested_tier.name} "
+                                f"actual={host_mirror.actual_tier.name}: {mirror_decision.reason}"
+                            ),
+                        )
                 # The mirror is page-locked host staging for KV content: the
                 # R01 owner table charges it to WORKSPACE on the host tier
                 # exactly like runner-buffer staging, never as a second KV
@@ -441,6 +499,27 @@ def build_configured_resources(
         grouped_tiers = host_tier_plan.configs
         mirror_bytes = host_tier_plan.charged_bytes
     lane = MemoryLane.CPU if torch.device(device).type == "cpu" else MemoryLane.CUDA
+    host_policy = None
+    mirror_decision = None
+    if grouped_tiers:
+        host_policy = HostMemoryPolicy.from_limits(
+            tier_policy.host_bytes,
+            (memory_config or MemoryConfig()).host,
+        )
+        mirror_decision = host_policy.decide_mirror(
+            mirror_bytes,
+            requested_tier=(
+                MemoryTier.HOST_PINNED if lane is MemoryLane.CUDA else MemoryTier.HOST_PAGEABLE
+            ),
+            already_pinned_bytes=0,
+        )
+        if not mirror_decision:
+            raise CacheRebuildRejected(
+                f"grouped host KV mirror refused by host memory policy: {mirror_decision.reason}",
+                reason=ResizeRejectionReason.BUDGET,
+                need_bytes=mirror_bytes,
+                available_bytes=mirror_decision.headroom_bytes,
+            )
     if grouped_tiers:
         # CUDA mirrors can degrade to pageable memory. Reserve both possible
         # host accounts at the frozen ceiling; charge only the actual kind.
@@ -481,18 +560,26 @@ def build_configured_resources(
         rollback.callback(lambda: tier_release() if tier_release is not None else None)
         backend, kv = bind_resident_kv(plan, leases)
         rollback.callback(kv.close)
-        mirror_pinned = lane is MemoryLane.CUDA
+        mirror_pinned = (
+            mirror_decision.tier is MemoryTier.HOST_PINNED
+            if mirror_decision is not None
+            else lane is MemoryLane.CUDA
+        )
         if grouped_tiers:
             if not isinstance(backend, KVCacheGroupManager):
                 raise TypeError("grouped host tier requires KVCacheGroupManager")
             by_group = {lease.label: lease for lease in leases}
             charged_labels: list[str] = []
+            allow_pageable = (
+                host_policy.allow_pageable_fallback if host_policy is not None else True
+            )
             try:
                 mirrors = {
                     name: HostKVStorage(
                         by_group[name].storage,
                         capacity_pages=config.host_capacity_pages,
-                        pin_memory=lane is MemoryLane.CUDA,
+                        pin_memory=mirror_pinned,
+                        allow_pageable_fallback=allow_pageable,
                     )
                     for name, config in grouped_tiers.items()
                 }
@@ -502,6 +589,20 @@ def build_configured_resources(
                 if len(pin_kinds) != 1:
                     raise RuntimeError("grouped host mirrors must use one host memory tier")
                 mirror_pinned = next(iter(pin_kinds))
+                if (
+                    host_policy is not None
+                    and mirror_decision is not None
+                    and mirror_decision.fallback
+                ):
+                    runtime_event(
+                        "host_mirror",
+                        owner_id="grouped_tier",
+                        status="policy_fallback",
+                        detail=(
+                            f"requested={MemoryTier.HOST_PINNED.name} "
+                            f"actual={MemoryTier.HOST_PAGEABLE.name}: {mirror_decision.reason}"
+                        ),
+                    )
                 credits = TransferCredits(cache_config.tiering.max_inflight_bytes or mirror_bytes)
                 for name, mirror in mirrors.items():
                     label = f"serving.kv.tier.{name}"
