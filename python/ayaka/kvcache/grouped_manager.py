@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from threading import RLock
@@ -32,11 +33,16 @@ from ayaka.kvcache.retention.range import retained_page_range
 from ayaka.kvcache.storage.ports import KVStorage
 from ayaka.memory.allocator import PageAllocator
 from ayaka.memory.pressure import (
+    GroupedPressureSnapshot,
     MemoryPressureMetrics,
     MemoryPressureResult,
     PreemptionStatus,
     PressureAction,
+    PressureOutcome,
+    PressurePolicy,
+    PressureSnapshot,
     PressureStatus,
+    PressureStopReason,
     SequencePreemptionResult,
     SequenceTruncationResult,
 )
@@ -58,6 +64,7 @@ from ayaka.memory.tiering import (
     HostTierSnapshot,
     ReadinessState,
     TieringConfig,
+    TieringMetrics,
     TransferBudget,
     TransferEngine,
 )
@@ -216,6 +223,7 @@ class KVCacheGroupManager:
         self._next_snapshot = 0
         self._prefix_cache: GroupedPrefixCache | None = None
         self._tier: GroupedTierManager | None = None
+        self._transfer_budget: TransferBudget | None = None
         self._pending_prefix_matches: dict[int, GroupedValidResume] = {}
         self._next_prefix_match = 0
 
@@ -251,6 +259,7 @@ class KVCacheGroupManager:
                 transfer_engine=transfer_engine,
                 transfer_budget=transfer_budget,
             )
+            self._transfer_budget = transfer_budget
 
     def tier_entry_device_ready(self, entry_id: int) -> bool:
         """A borrowed grouped boundary is usable only when every group is ready."""
@@ -305,6 +314,7 @@ class KVCacheGroupManager:
             if self._tier is not None:
                 self._tier.release()
                 self._tier = None
+            self._transfer_budget = None
 
     @property
     def current_epoch(self) -> int:
@@ -1489,7 +1499,12 @@ class KVCacheGroupManager:
                 cached_pages_after=0,
             )
 
-    def evict_prefixes_for_pressure(self, required_pages: int) -> MemoryPressureResult:
+    def evict_prefixes_for_pressure(
+        self,
+        required_pages: int,
+        *,
+        max_spill_pages: int | None = None,
+    ) -> MemoryPressureResult:
         """Evict LRU canonical grouped prefix entries until capacity is gained.
 
         Every evicted entry releases the pins of a whole all-group boundary;
@@ -1501,6 +1516,11 @@ class KVCacheGroupManager:
             raise TypeError("required_pages must be an integer")
         if required_pages < 0:
             raise ValueError("required_pages must be non-negative")
+        if max_spill_pages is not None:
+            if not isinstance(max_spill_pages, int) or isinstance(max_spill_pages, bool):
+                raise TypeError("max_spill_pages must be an integer or None")
+            if max_spill_pages < 0:
+                raise ValueError("max_spill_pages must be non-negative")
         with self._lock:
             before = self.snapshot()
             before_cached = None if self._prefix_cache is None else self._prefix_cache.snapshot()
@@ -1509,7 +1529,7 @@ class KVCacheGroupManager:
             evicted = 0
             reclaimed = 0
             if cache is not None and cache.snapshot().terminal_entries:
-                if self.tiering_enabled:
+                if self.tiering_enabled and (max_spill_pages is None or max_spill_pages > 0):
                     # Begin a bounded copy before dropping an idle canonical
                     # boundary. Async copies create backpressure until poll
                     # lands them; source pins remain owned throughout.
@@ -1557,6 +1577,148 @@ class KVCacheGroupManager:
                 cached_pages_before=(0 if before_cached is None else before_cached.cached_blocks),
                 cached_pages_after=0 if after_cached is None else after_cached.cached_blocks,
             )
+
+    def relieve_pressure(
+        self,
+        required_pages: int,
+        *,
+        policy: PressurePolicy | None = None,
+    ) -> PressureOutcome:
+        """Resolve missing grouped capacity in bounded, observable rounds.
+
+        The order matches the homogeneous manager: reclaim completed epochs,
+        demote whole canonical boundaries to the host while the shared host
+        watermark permits, then drop cache-only boundaries. Capacity is bound
+        by the group with the least headroom.
+        """
+        if not isinstance(required_pages, int) or isinstance(required_pages, bool):
+            raise TypeError("required_pages must be an integer")
+        if required_pages < 0:
+            raise ValueError("required_pages must be non-negative")
+        policy = policy or PressurePolicy()
+        if not isinstance(policy, PressurePolicy):
+            raise TypeError("policy must be a PressurePolicy")
+        with self._lock:
+            initial = self.snapshot()
+            target = min(
+                initial.usable_pages,
+                initial.free_pages + required_pages,
+            )
+            spills_before = self._tier_spills()
+            results: list[MemoryPressureResult] = []
+            blocked_by_host = False
+            for _ in range(policy.max_rounds):
+                reached = sum(
+                    runtime.allocator.available_pages() for runtime in self._group_runtimes
+                )
+                if reached >= target:
+                    return self._grouped_pressure_outcome(
+                        required_pages,
+                        target,
+                        results,
+                        PressureStopReason.SATISFIED,
+                        spills_before,
+                    )
+                reclaim = self.reclaim_deferred()
+                spill_budget: int | None = None
+                if self.tiering_enabled:
+                    free_slots = min(
+                        snapshot.host_capacity_pages - snapshot.host_used_slots
+                        for snapshot in self.tier_snapshots.values()
+                    )
+                    headroom = free_slots - policy.host_low_watermark_slots
+                    if headroom <= 0:
+                        blocked_by_host = True
+                        spill_budget = 0
+                    else:
+                        spill_budget = headroom
+                evict = self.evict_prefixes_for_pressure(
+                    min(required_pages, policy.max_pages_per_round),
+                    max_spill_pages=spill_budget,
+                )
+                results.append(evict)
+                if reclaim.made_progress:
+                    results.append(reclaim)
+                reached = sum(
+                    runtime.allocator.available_pages() for runtime in self._group_runtimes
+                )
+                if reached >= target:
+                    return self._grouped_pressure_outcome(
+                        required_pages,
+                        target,
+                        results,
+                        PressureStopReason.SATISFIED,
+                        spills_before,
+                    )
+                if not evict.made_progress and not reclaim.made_progress:
+                    reason = (
+                        PressureStopReason.HOST_BACKPRESSURE
+                        if blocked_by_host
+                        else PressureStopReason.NO_PROGRESS
+                    )
+                    return self._grouped_pressure_outcome(
+                        required_pages,
+                        target,
+                        results,
+                        reason,
+                        spills_before,
+                    )
+            return self._grouped_pressure_outcome(
+                required_pages,
+                target,
+                results,
+                PressureStopReason.ROUND_LIMIT,
+                spills_before,
+            )
+
+    def tier_metrics(self) -> TieringMetrics | None:
+        """Aggregate per-group placement, transfer and budget accounting."""
+        with self._lock:
+            if not self.tiering_enabled:
+                return None
+            by_group = self.tier_snapshots
+            snapshots = tuple(by_group.values())
+            budget = self._transfer_budget
+            mirror_bytes = 0
+            pinned_flags: list[bool] = []
+            assert self._tier is not None
+            for name in by_group:
+                info = self._tier.host_bytes(name)
+                if info is None:
+                    continue
+                mirror_bytes += info[0]
+                pinned_flags.append(info[1])
+            return TieringMetrics.from_snapshots(
+                snapshots,
+                host_pinned=bool(pinned_flags) and all(pinned_flags),
+                host_mirror_bytes=mirror_bytes,
+                transfer_limit_bytes=int(getattr(budget, "limit", 0) or 0),
+                transfer_held_bytes=int(getattr(budget, "held", 0) or 0),
+            )
+
+    def _tier_spills(self) -> int:
+        if self._tier is None:
+            return 0
+        return sum(snapshot.spills_total for snapshot in self.tier_snapshots.values())
+
+    def _grouped_pressure_outcome(
+        self,
+        requested_pages: int,
+        target: int,
+        results: list[MemoryPressureResult],
+        stop_reason: PressureStopReason,
+        spills_before: int,
+    ) -> PressureOutcome:
+        return PressureOutcome(
+            requested_pages=requested_pages,
+            target_pages=target,
+            reached_pages=sum(
+                runtime.allocator.available_pages() for runtime in self._group_runtimes
+            ),
+            results=tuple(results),
+            stop_reason=stop_reason,
+            host_demotions=max(0, self._tier_spills() - spills_before),
+        )
 
     def cache_resume(
         self,
@@ -1715,6 +1877,80 @@ class KVCacheGroupManager:
                 live_sequences=len(live_states),
                 open_transactions=len(self._transactions),
                 active_leases=len(self._leases),
+            )
+
+    def pressure_snapshot(
+        self,
+        *,
+        host_pin_limit_bytes: int = 0,
+        timestamp_ns: int | None = None,
+    ) -> GroupedPressureSnapshot:
+        """Return one advisory capacity reading per group; never reserves.
+
+        Every group executes a step in parallel, so the binding capacity is the
+        minimum across groups; the underlying per-group readings stay exact.
+        """
+        if not isinstance(host_pin_limit_bytes, int) or isinstance(host_pin_limit_bytes, bool):
+            raise TypeError("host_pin_limit_bytes must be an integer")
+        if host_pin_limit_bytes < 0:
+            raise ValueError("host_pin_limit_bytes must be non-negative")
+        with self._lock:
+            stamp = time.monotonic_ns() if timestamp_ns is None else timestamp_ns
+            tier_snapshots = self.tier_snapshots
+            budget = self._transfer_budget
+            transfer_limit = int(getattr(budget, "limit", 0) or 0)
+            transfer_held = int(getattr(budget, "held", 0) or 0)
+            readings: list[PressureSnapshot] = []
+            for runtime in self._group_runtimes:
+                name = runtime.descriptor.name
+                allocator = runtime.allocator.snapshot()
+                tier = tier_snapshots.get(name)
+                host_info = None if self._tier is None else self._tier.host_bytes(name)
+                if tier is None:
+                    host_capacity_pages = 0
+                    host_used_slots = 0
+                    inflight_transfers = 0
+                    quarantined_blocks = 0
+                else:
+                    host_capacity_pages = tier.host_capacity_pages
+                    host_used_slots = tier.host_used_slots
+                    inflight_transfers = tier.evicting_blocks + tier.promoting_blocks
+                    quarantined_blocks = tier.quarantined_blocks
+                readings.append(
+                    PressureSnapshot(
+                        generation=runtime.allocator.current_epoch,
+                        timestamp_ns=stamp,
+                        page_size=runtime.descriptor.storage_spec.page_size,
+                        total_pages=allocator.total_pages,
+                        usable_pages=allocator.usable_pages,
+                        free_pages=allocator.free_pages,
+                        reserved_pages=allocator.reserved_pages,
+                        live_pages=allocator.live_pages,
+                        reclaim_pending_pages=allocator.reclaim_pending_pages,
+                        permanent_pages=allocator.permanent_pages,
+                        request_owned_pages=allocator.request_owned_pages,
+                        cache_owned_pages=allocator.cache_owned_pages,
+                        shared_pages=allocator.shared_pages,
+                        inflight_pages=allocator.inflight_pages,
+                        cache_evictable_pages=allocator.evictable_pages,
+                        open_transactions=len(self._transactions),
+                        active_leases=len(self._leases),
+                        host_capacity_pages=host_capacity_pages,
+                        host_used_slots=host_used_slots,
+                        host_free_slots=host_capacity_pages - host_used_slots,
+                        host_pinned=False if host_info is None else host_info[1],
+                        host_mirror_bytes=0 if host_info is None else host_info[0],
+                        host_pin_limit_bytes=host_pin_limit_bytes,
+                        transfer_limit_bytes=transfer_limit,
+                        transfer_held_bytes=transfer_held,
+                        inflight_transfers=inflight_transfers,
+                        quarantined_blocks=quarantined_blocks,
+                    )
+                )
+            return GroupedPressureSnapshot(
+                generation=self.current_epoch,
+                timestamp_ns=stamp,
+                groups=tuple(readings),
             )
 
     def leak_report(self) -> GroupedLeakReport:

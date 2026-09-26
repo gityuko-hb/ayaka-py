@@ -18,12 +18,18 @@ from ayaka.memory.capacity import CapacitySnapshot, ResourceGeneration
 from ayaka.memory.ledger import MemoryLedger
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.pressure import (
+    GroupedPressureSnapshot,
+    MemoryPressureMetrics,
     MemoryPressureResult,
+    PressureOutcome,
+    PressurePolicy,
+    PressureSnapshot,
     SequencePreemptionResult,
     SequenceTruncationResult,
 )
 from ayaka.memory.sequence import GroupedSequenceSnapshot, SequenceMemorySnapshot
 from ayaka.memory.state import ReleaseStatus, ReservationFailure
+from ayaka.memory.tiering import TieringMetrics
 from ayaka.memory.views import (
     ExecutionMemoryView,
     GroupedExecutionMemoryView,
@@ -273,10 +279,39 @@ class LogicalKVManager:
         if isinstance(backend, (RuntimeMemoryManager, KVCacheGroupManager)):
             backend.shutdown_tier()
 
-    def evict_prefixes_for_pressure(self, required_pages: int) -> MemoryPressureResult:
+    def evict_prefixes_for_pressure(
+        self,
+        required_pages: int,
+        *,
+        max_spill_pages: int | None = None,
+    ) -> MemoryPressureResult:
         """Release cache-only pages under reservation pressure."""
         self._require_open()
-        return self.backend.evict_prefixes_for_pressure(required_pages)
+        return self.backend.evict_prefixes_for_pressure(
+            required_pages,
+            max_spill_pages=max_spill_pages,
+        )
+
+    def relieve_pressure(
+        self,
+        required_pages: int,
+        *,
+        policy: PressurePolicy | None = None,
+    ) -> PressureOutcome:
+        """Resolve missing capacity in bounded, observable rounds."""
+        self._require_open()
+        return self.backend.relieve_pressure(required_pages, policy=policy)
+
+    @property
+    def pressure_metrics(self) -> MemoryPressureMetrics:
+        """Cumulative pressure counters for the active backend."""
+        self._require_open()
+        return self.backend.pressure_metrics
+
+    def tier_metrics(self) -> TieringMetrics | None:
+        """Aggregate host-tier accounting, or None when tiering is off."""
+        self._require_open()
+        return self.backend.tier_metrics()
 
     def privatize_prefix_tail(self, sequence: SequenceHandle) -> bool:
         """Relinquish cache sharing on a sole-consumer partial tail.
@@ -306,6 +341,19 @@ class LogicalKVManager:
         """Capacity accounting for diagnostics and status reporting."""
         self._require_open()
         return self.backend.snapshot()
+
+    def pressure_snapshot(
+        self,
+        *,
+        host_pin_limit_bytes: int = 0,
+        timestamp_ns: int | None = None,
+    ) -> PressureSnapshot | GroupedPressureSnapshot:
+        """Advisory capacity reading across device ownership and host tier."""
+        self._require_open()
+        return self.backend.pressure_snapshot(
+            host_pin_limit_bytes=host_pin_limit_bytes,
+            timestamp_ns=timestamp_ns,
+        )
 
     def leak_report(self) -> LeakReportView:
         """Deterministic ownership report; ``clean`` gates storage teardown."""

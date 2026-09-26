@@ -374,6 +374,13 @@ class GroupedTierManager:
             )
         return result
 
+    def host_bytes(self, group_name: str) -> tuple[int, bool] | None:
+        """Actual mirror bytes and pinned kind for one attached group."""
+        binding = self._groups.get(group_name)
+        if binding is None:
+            return None
+        return int(binding.storage.total_bytes), bool(binding.storage.pinned)
+
     def reserved_pages(self, group_name: str) -> tuple[KVPageHandle, ...]:
         return tuple(
             move.device_page

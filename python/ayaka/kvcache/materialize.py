@@ -27,7 +27,16 @@ class KVStorageLease:
     counted by the lease, so the owner must stop using them before close.
     """
 
-    __slots__ = ("_closed", "_charged_bytes", "_ledger", "_lock", "_storage", "_pins", "label")
+    __slots__ = (
+        "_closed",
+        "_charged_bytes",
+        "_ledger",
+        "_lock",
+        "_storage",
+        "_tier",
+        "_pins",
+        "label",
+    )
 
     def __init__(
         self,
@@ -36,11 +45,13 @@ class KVStorageLease:
         label: str,
         *,
         charged_bytes: int,
+        tier: MemoryTier = MemoryTier.DEVICE,
     ) -> None:
         self._storage: KVStorage | None = storage
         self._ledger = ledger
         self.label = label
         self._charged_bytes = charged_bytes
+        self._tier = tier
         self._closed = False
         self._lock = Lock()
         self._pins = 0
@@ -76,6 +87,16 @@ class KVStorageLease:
     def ledger(self) -> MemoryLedger:
         """The single accounting authority for this physical slab."""
         return self._ledger
+
+    @property
+    def tier(self) -> MemoryTier:
+        """Actual residency tier the backing tensors report.
+
+        Resolved from the live buffers before the ledger claim is finalized, so
+        a factory that silently changes residency cannot publish an unaccounted
+        or mis-tiered slab.
+        """
+        return self._tier
 
     @property
     def pin_count(self) -> int:
@@ -144,6 +165,7 @@ def materialize_kv_storage(
     alignment_bytes: int = DEFAULT_KV_ALIGNMENT_BYTES,
     storage_factory: StorageFactory | None = None,
     validate_support: bool = True,
+    tier: MemoryTier | None = None,
 ) -> KVStorageLease:
     """Reserve, allocate, materialize and publish one KV slab atomically.
 
@@ -162,10 +184,14 @@ def materialize_kv_storage(
         storage_factory: Injection point for tests and diagnostics.
         validate_support: Check dtype / device / layout / capability before
             allocating. Turn off only when the caller has already validated.
+        tier: Requested host residency. Defaults to ``DEVICE`` for CUDA and
+            ``HOST_PAGEABLE`` for CPU. The live buffers must report the same
+            residency or the materialization fails before the claim is
+            committed.
 
     Raises:
         KVStorageCompatibilityError: when the spec cannot run on this device.
-        ValueError: on a device or accounting disagreement.
+        ValueError: on a device, tier or accounting disagreement.
     """
     if not isinstance(spec, BaseKVStorageSpec):
         raise TypeError(f"spec must be a BaseKVStorageSpec, got {type(spec).__name__}")
@@ -194,6 +220,20 @@ def materialize_kv_storage(
             compute_capability=_compute_capability(device_type, resolved_index),
         ).require_compatible()
 
+    requested_tier = (
+        (MemoryTier.HOST_PAGEABLE if resolved_device == "cpu" else MemoryTier.DEVICE)
+        if tier is None
+        else tier
+    )
+    if not isinstance(requested_tier, MemoryTier) or not requested_tier.allocatable:
+        raise ValueError(f"{requested_tier!r} is not an allocatable memory tier")
+    if resolved_device == "cpu" and requested_tier not in (
+        MemoryTier.HOST_PINNED,
+        MemoryTier.HOST_PAGEABLE,
+    ):
+        raise ValueError("CPU KV storage must be requested as a host tier")
+    if resolved_device.startswith("cuda") and requested_tier is not MemoryTier.DEVICE:
+        raise ValueError("CUDA KV storage must be requested as DEVICE tier")
     charged_bytes = spec.aligned_total_bytes(alignment_bytes)
     reservation = Reservation(
         owner=MemoryOwner.KV,
@@ -201,7 +241,7 @@ def materialize_kv_storage(
         reserved_bytes=charged_bytes,
         backed_bytes=charged_bytes,
         charged_bytes=charged_bytes,
-        tier=(MemoryTier.HOST_PAGEABLE if resolved_device == "cpu" else MemoryTier.DEVICE),
+        tier=requested_tier,
         device_index=resolved_index,
     )
     ticket = ledger.reserve(reservation)
@@ -222,6 +262,12 @@ def materialize_kv_storage(
         if storage.spec != spec:
             raise ValueError("materialized KV storage does not match the planned specification")
 
+        actual_tier = _storage_actual_tier(storage, reservation.tier)
+        if actual_tier is not reservation.tier:
+            raise ValueError(
+                f"KV storage residency {actual_tier.name} disagrees with the reserved "
+                f"tier {reservation.tier.name}"
+            )
         measured = storage.materialized_bytes
         if measured > charged_bytes:
             # The reservation is derived from the same spec, so this can only
@@ -245,7 +291,29 @@ def materialize_kv_storage(
         with suppress(KeyError, ValueError):
             ledger.rollback(ticket)
         raise
-    return KVStorageLease(storage, ledger, label, charged_bytes=charged_bytes)
+    return KVStorageLease(
+        storage,
+        ledger,
+        label,
+        charged_bytes=charged_bytes,
+        tier=reservation.tier,
+    )
+
+
+def _storage_actual_tier(storage: KVStorage, requested: MemoryTier) -> MemoryTier:
+    """Observe the residency the backing tensors actually landed in.
+
+    Host allocations must report pinned versus pageable before the claim is
+    committed. CUDA slabs and storages that expose no torch buffers keep the
+    reserved tier; an observable disagreement fails the materialization.
+    """
+    if requested is not MemoryTier.DEVICE:
+        tensors = [tensor for family in storage.buffers() for tensor in family]
+        if tensors and all(hasattr(tensor, "is_pinned") for tensor in tensors):
+            if all(bool(tensor.is_pinned()) for tensor in tensors):
+                return MemoryTier.HOST_PINNED
+            return MemoryTier.HOST_PAGEABLE
+    return requested
 
 
 def _compute_capability(device_type: str, device_index: int) -> tuple[int, int] | None:
