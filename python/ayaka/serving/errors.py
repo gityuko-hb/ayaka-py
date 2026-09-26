@@ -52,6 +52,13 @@ class RequestCancelledError(ServingError):
     status_code = 499
 
 
+class DeadlineExceededError(ServingError):
+    """The request deadline elapsed before or during execution."""
+
+    code = "deadline_exceeded"
+    status_code = 408
+
+
 class StructuredOutputError(InvalidRequestError):
     code = "structured_output_error"
 

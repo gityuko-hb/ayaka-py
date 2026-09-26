@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import time
 from contextlib import aclosing, asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -48,8 +49,12 @@ def error_response(exc: ServingError, path: str):
 class AccessMiddleware:
     """Authenticate before parsing; cap actual body bytes including chunked requests."""
 
-    def __init__(self, app, config):
-        self.app, self.config = app, config
+    def __init__(self, app, config, stats=None):
+        self.app, self.config, self.stats = app, config, stats
+
+    def _reject(self, reason):
+        if self.stats is not None:
+            self.stats.record_rejection(reason)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -69,6 +74,7 @@ class AccessMiddleware:
             if not valid:
                 from ayaka.serving.errors import AuthenticationError
 
+                self._reject("auth")
                 response = error_response(AuthenticationError("invalid API key"), path)
                 return await response(scope, receive, send)
             tenant = hashlib.sha256(supplied.encode()).hexdigest()
@@ -81,6 +87,7 @@ class AccessMiddleware:
                     return
                 size += len(message.get("body", b""))
                 if size > self.config.max_request_bytes:
+                    self._reject("request_bytes")
                     response = JSONResponse(
                         {
                             "error": {
@@ -109,8 +116,17 @@ class GenerationResponse(StreamingResponse):
         self.pipeline, self.handle = pipeline, handle
 
     async def __call__(self, scope, receive, send):
+        async def stamp_first_write(message):
+            if (
+                not self.handle.first_socket_write_ns
+                and message.get("type") == "http.response.body"
+                and message.get("body")
+            ):
+                self.handle.first_socket_write_ns = time.monotonic_ns()
+            await send(message)
+
         try:
-            return await super().__call__(scope, receive, send)
+            return await super().__call__(scope, receive, stamp_first_write)
         finally:
             self.pipeline.release(self.handle)
 
@@ -168,7 +184,9 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
 
     app = FastAPI(title="Ayaka Serving", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.pipeline, app.state.service = pipeline, service
-    app.add_middleware(AccessMiddleware, config=processor.config)
+    app.add_middleware(
+        AccessMiddleware, config=processor.config, stats=getattr(service, "stats", None)
+    )
 
     @app.exception_handler(ServingError)
     async def handle_error(request, exc):
@@ -212,6 +230,9 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
         return {
             "ready": service.ready,
             "frontend_active": pipeline.active,
+            "outstanding": service.outstanding,
+            "conservation": service.stats.conservation(outstanding=service.outstanding),
+            "slo": service.stats.slo_summary(),
             "recent_requests": service.stats.recent(),
         }
 
@@ -219,7 +240,9 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
 
         @app.get("/v1/cache/status")
         async def cache_status():
-            return await asyncio.to_thread(admin.cache_status)
+            # Owner-thread dispatch: never read storage/manager while a resize
+            # may be rebuilding the tail.
+            return await asyncio.to_thread(service.cache_status)
 
         @app.post("/v1/cache/resize")
         async def cache_resize(request: Request):

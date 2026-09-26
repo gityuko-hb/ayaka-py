@@ -46,7 +46,7 @@ class UsageUpdate:
 
 @dataclass(frozen=True, slots=True)
 class GenerationFinished:
-    finish_reason: Literal["stop", "length", "tool_call", "cancelled"]
+    finish_reason: Literal["stop", "length", "tool_call", "cancelled", "timeout"]
     usage: UsageUpdate = UsageUpdate()
 
 

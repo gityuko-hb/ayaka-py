@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from ayaka.request.cancel import CancellationToken
 from ayaka.serving.errors import EngineUnavailableError, OverloadedError
 from ayaka.serving.events import GenerationFailed, GenerationFinished
+from ayaka.serving.prepare import PrepareTimings
 
 
 class GenerationPipeline:
@@ -22,18 +24,19 @@ class GenerationPipeline:
             raise EngineUnavailableError("engine is not ready")
         limit = self.config.max_concurrent_requests
         if limit and self.active >= limit:
-            self.service.stats.rejected.inc()
+            self.service.stats.record_rejection("concurrent")
             raise OverloadedError("too many concurrent requests")
         self.active += 1
 
     async def prepare(self, spec, tenant):
         # Called before SSE headers, so all validation/admission errors have HTTP status.
+        timings = PrepareTimings(ingress_ns=time.monotonic_ns())
         self.reserve()
         token = CancellationToken()
         future = None
         try:
-            request = await asyncio.to_thread(self.processor.prepare, spec, tenant, token)
-            future = self.service.submit(request, spec)
+            request = await asyncio.to_thread(self.processor.prepare, spec, tenant, token, timings)
+            future = self.service.submit(request, spec, timings=timings)
             return await asyncio.shield(asyncio.wrap_future(future))
         except BaseException:
             token.cancel("preparation cancelled")

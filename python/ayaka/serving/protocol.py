@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from ayaka.serving.errors import (
+    DeadlineExceededError,
     InvalidRequestError,
     RequestCancelledError,
     ServingError,
@@ -42,6 +43,7 @@ def normalize(body: dict, protocol: str) -> GenerationSpec:
             "tools",
             "tool_choice",
             "metadata",
+            "timeout",
         }
         _fields(data, allowed)
         if "max_tokens" not in data:
@@ -143,6 +145,7 @@ def normalize(body: dict, protocol: str) -> GenerationSpec:
             "parallel_tool_calls",
             "previous_response_id",
             "background",
+            "timeout",
         }
         _fields(data, allowed)
         for field in ("previous_response_id", "background", "store"):
@@ -236,13 +239,20 @@ def normalize(body: dict, protocol: str) -> GenerationSpec:
             "parallel_tool_calls",
         }
         _fields(data, allowed)
-        if data.pop("n", 1) != 1 or data.pop("best_of", 1) != 1:
-            raise UnsupportedFeatureError("only one completion per request is supported")
+        # `n`/`best_of` are compared by exact type so `true` (bool is an int
+        # subclass) or 1.0 cannot slip past the "one completion" guard.
+        for field in ("n", "best_of"):
+            value = data.pop(field, 1)
+            if type(value) is not int or value != 1:
+                raise UnsupportedFeatureError("only one completion per request is supported")
+        # logprobs/top_logprobs/echo/suffix stay explicitly rejected: accepting
+        # them without a response payload would silently lie to the client.
         for field in ("logprobs", "top_logprobs", "echo", "suffix"):
             value = data.pop(field, None)
             if value is not None and value is not False:
                 raise UnsupportedFeatureError(f"{field} is not supported by this serving runner")
-        if data.pop("parallel_tool_calls", True) is False:
+        parallel = data.pop("parallel_tool_calls", True)
+        if parallel is not None and parallel is not True:
             raise UnsupportedFeatureError("parallel_tool_calls=false is not supported")
         data.pop("user", None)
         if "max_completion_tokens" in data:
@@ -308,6 +318,8 @@ class Result:
         elif isinstance(event, GenerationFinished):
             if event.finish_reason == "cancelled":
                 raise RequestCancelledError("generation cancelled")
+            if event.finish_reason == "timeout":
+                raise DeadlineExceededError("request deadline exceeded")
             self.finished = event
         elif isinstance(event, GenerationFailed):
             raise ServingError(event.message)
@@ -433,8 +445,11 @@ def anthropic_usage(usage):
 
 
 def _wire_event(event):
-    if isinstance(event, GenerationFinished) and event.finish_reason == "cancelled":
-        return GenerationFailed("request_cancelled", "generation cancelled")
+    if isinstance(event, GenerationFinished):
+        if event.finish_reason == "cancelled":
+            return GenerationFailed("request_cancelled", "generation cancelled")
+        if event.finish_reason == "timeout":
+            return GenerationFailed("deadline_exceeded", "request deadline exceeded")
     return event
 
 

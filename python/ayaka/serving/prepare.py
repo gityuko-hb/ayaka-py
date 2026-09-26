@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from dataclasses import dataclass
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator, SchemaError
@@ -26,6 +27,20 @@ from ayaka.tokenizers.contracts import EncodeOptions, TemplateInput, TextInput, 
 from ayaka.tokenizers.service import TokenizerOverloaded, TokenizerService
 
 
+@dataclass(slots=True)
+class PrepareTimings:
+    """Absolute monotonic boundaries recorded during one request preparation.
+
+    ``ingress_ns`` is the service boundary before validation; ``tokenize_done``
+    closes the tokenizer stage.  Both are in the shared monotonic clock domain
+    so a request can be joined across service, engine and stream boundaries.
+    """
+
+    ingress_ns: int = 0
+    validation_done_ns: int = 0
+    tokenize_done_ns: int = 0
+
+
 class GenerationSpec(BaseModel):
     """Every protocol maps into this model before touching the engine."""
 
@@ -43,6 +58,7 @@ class GenerationSpec(BaseModel):
     frequency_penalty: float = Field(default=0.0, ge=-2, le=2)
     presence_penalty: float = Field(default=0.0, ge=-2, le=2)
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
+    timeout: float | None = Field(default=None, gt=0)
     stop: str | list[str] | None = None
     stop_token_ids: list[int] = Field(default_factory=list)
     ignore_eos: bool = False
@@ -225,8 +241,14 @@ class RequestProcessor:
         self.tokenizer, self.config = tokenizer, config
 
     def prepare(
-        self, spec: GenerationSpec, tenant: str, cancellation: CancellationToken | None = None
+        self,
+        spec: GenerationSpec,
+        tenant: str,
+        cancellation: CancellationToken | None = None,
+        timings: PrepareTimings | None = None,
     ) -> Request:
+        if timings is not None and not timings.ingress_ns:
+            timings.ingress_ns = time.monotonic_ns()
         if spec.model != self.config.model:
             raise ModelNotFoundError(f"unknown model: {spec.model}", param="model")
         constraint = constraint_for(spec)
@@ -256,6 +278,8 @@ class RequestProcessor:
                 else TokenIdsInput(tuple(spec.prompt or ()))
             )
         namespace = hashlib.sha256(tenant.encode()).hexdigest()
+        if timings is not None:
+            timings.validation_done_ns = time.monotonic_ns()
         try:
             encoded = self.tokenizer.encode(
                 source,
@@ -268,9 +292,18 @@ class RequestProcessor:
             if "context" in str(exc) or "reservation" in str(exc) or "budget" in str(exc):
                 raise ContextLengthExceededError(str(exc)) from exc
             raise InvalidRequestError(str(exc)) from exc
+        if timings is not None:
+            timings.tokenize_done_ns = time.monotonic_ns()
         if any(t >= self.tokenizer.model_vocab_size for t in spec.stop_token_ids):
             raise InvalidRequestError("stop token ID exceeds model vocabulary")
         stops = (spec.stop,) if isinstance(spec.stop, str) else tuple(spec.stop or ())
+        # Freeze the deadline once, in the monotonic clock domain.  A protocol
+        # duration and the process clock are never compared across domains, and
+        # downstream owners only ever read the absolute ``deadline_ns``.
+        timeout = spec.timeout
+        if timeout is None:
+            timeout = self.config.default_request_timeout_seconds
+        deadline_ns = None if timeout is None else time.monotonic_ns() + int(timeout * 1e9)
         return Request(
             RequestId("req_" + uuid4().hex),
             tuple(encoded.token_ids),
@@ -295,4 +328,5 @@ class RequestProcessor:
             tenant_id=tenant,
             constraint=constraint,
             arrival_ns=time.monotonic_ns(),
+            deadline_ns=deadline_ns,
         )

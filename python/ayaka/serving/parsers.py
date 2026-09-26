@@ -25,7 +25,16 @@ class OutputParser:
     A length-limited unfinished tool is an explicit error.
     """
 
-    def __init__(self, *, reasoning=False, tools=(), constrained_tools=False):
+    def __init__(
+        self,
+        *,
+        reasoning=False,
+        tools=(),
+        constrained_tools=False,
+        max_buffer: int = 1 << 20,
+    ):
+        if type(max_buffer) is not int or max_buffer < 1:
+            raise ValueError("max_buffer must be a positive integer")
         self.reasoning = reasoning
         self.tools = {t["function"]["name"]: t["function"] for t in tools}
         self.constrained_tools = constrained_tools
@@ -33,6 +42,16 @@ class OutputParser:
         self.buffer = ""
         self.index = 0
         self.had_tools = False
+        self.max_buffer = max_buffer
+        self._finished = False
+
+    def _enforce_bound(self) -> None:
+        """Fail closed when an unterminated tool payload exceeds the bound."""
+        if len(self.buffer.encode("utf-8")) > self.max_buffer:
+            raise ParserError(
+                f"parser buffer exceeded {self.max_buffer} bytes; the model is "
+                "not emitting the expected delimiter"
+            )
 
     def _call(self, value):
         if not isinstance(value, dict) or value.get("name") not in self.tools:
@@ -64,6 +83,7 @@ class OutputParser:
     def feed(self, text: str):
         self.buffer += text
         if self.constrained_tools:
+            self._enforce_bound()
             return []
         events = []
         while self.buffer:
@@ -109,9 +129,19 @@ class OutputParser:
                 cls = ReasoningDelta if self.mode == "reasoning" else ContentDelta
                 events.append(cls(emit))
             break
+        self._enforce_bound()
         return events
 
     def finish(self):
+        """Flush the parser exactly once; later calls return no events.
+
+        A first call that raises :class:`ParserError` still consumes the
+        terminal state, so a retry cannot duplicate deltas or emit a second
+        terminal flush.
+        """
+        if self._finished:
+            return []
+        self._finished = True
         if self.constrained_tools:
             try:
                 value = json.loads(self.buffer)
