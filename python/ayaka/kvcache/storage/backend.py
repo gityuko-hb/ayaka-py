@@ -393,6 +393,11 @@ class PagedKVStorage:
     def write(self, layer_index: int, slots: Any, /, *values: Any) -> None:
         """Scatter one value tensor per plane, in :attr:`plane_names` order.
 
+        ``values`` are real, unscaled K/V activations; on a quantized store each
+        plane is multiplied by the inverse of its calibrated scale
+        (``stored = real / scale``) before the cast. The slab copies the inputs,
+        so the caller keeps ownership of the tensors it passes.
+
         Args:
             layer_index: Target layer.
             slots: Unique slot addresses -- a Python sequence, a 1-D integer
@@ -534,6 +539,11 @@ class PagedKVStorage:
 
         The strict counterpart of :meth:`gather`. Use it wherever a duplicate
         address would indicate a scheduling bug rather than intentional padding.
+
+        ``raw=False`` dequantizes a quantized store (``real = stored * scale``);
+        ``dtype`` selects the output float dtype and is mandatory there.
+        ``raw=True`` returns stored codes unscaled. Each output is freshly
+        allocated for this call, owned by the caller, never a slab view.
         """
         return self._gather(layer_index, slots, dtype=dtype, raw=raw, require_unique=True)
 
@@ -550,7 +560,8 @@ class PagedKVStorage:
 
         Retention-aware reference execution gathers the full logical token range
         and resolves evicted leading blocks to a shared padding page, so many
-        logical positions legitimately resolve to the same slot.
+        logical positions legitimately resolve to the same slot. Raw/dequant and
+        output-ownership semantics are the same as :meth:`read`.
         """
         return self._gather(layer_index, slots, dtype=dtype, raw=raw, require_unique=False)
 

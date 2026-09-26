@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
+from typing import Final
 
 from ayaka.kvcache.storage.dtypes import normalize_storage_dtype, storage_dtype_bytes
 from ayaka.kvcache.storage.layout import (
@@ -13,6 +14,16 @@ from ayaka.kvcache.storage.layout import (
 from ayaka.kvcache.storage.quantization import KVQuantization
 from ayaka.types import KVLayoutKind
 from ayaka.utils.math_utils import align_up
+
+#: Hard ceiling on materialized pages for one slab. The allocator keeps a
+#: metadata object per page, so a plan above this is not a real plan; the bound
+#: also keeps every derived page/slot count inside int64.
+MAX_KV_PAGES: Final[int] = 1 << 32
+
+#: Largest flat slot address the int64 index path can represent. The host
+#: address buffer is ``array("q")`` and the device index tensors are int64, so
+#: a slot capacity beyond this has no valid representation.
+MAX_KV_SLOT_CAPACITY: Final[int] = (1 << 63) - 1
 
 
 class BaseKVStorageSpec(ABC):
@@ -110,6 +121,26 @@ class BaseKVStorageSpec(ABC):
         bounds check in the backend is against this number.
         """
         return self.capacity_pages * self.page_size
+
+    def validate_address_bounds(self) -> None:
+        """Reject geometries whose page/slot metadata overflows its carriers.
+
+        Runs before any allocation so an absurd capacity is a configuration
+        error rather than a metadata allocation or a wrapped int64 address.
+
+        Raises:
+            ValueError: when the page count exceeds :data:`MAX_KV_PAGES`, or the
+                flat slot address space exceeds :data:`MAX_KV_SLOT_CAPACITY`.
+        """
+        if self.capacity_pages > MAX_KV_PAGES:
+            raise ValueError(
+                f"capacity {self.capacity_pages} pages exceeds the metadata ceiling "
+                f"of {MAX_KV_PAGES} pages"
+            )
+        if self.slot_capacity > MAX_KV_SLOT_CAPACITY:
+            raise ValueError(
+                f"slot capacity {self.slot_capacity} overflows the int64 slot index space"
+            )
 
     @property
     def scale_bytes(self) -> int:

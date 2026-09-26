@@ -66,29 +66,35 @@ def claim_tier(
     *,
     lane: MemoryLane,
     pinned_host: bool = False,
+    pageable_host: bool = False,
 ) -> MemoryTier:
     """Physical tier a claim of ``owner`` must be charged against on ``lane``.
 
     A CPU diagnostic run materializes every backing into host-pageable memory,
     so all claims land on ``HOST_PAGEABLE`` -- charging ``DEVICE`` there would
-    split the full budget into two virtual accounts. On CUDA every non-pinned
+    split the full budget into two virtual accounts. On CUDA every non-host
     claim lands on ``DEVICE``; ``pinned_host`` marks staging buffers that
     physically live in page-locked host memory and therefore charge
-    ``HOST_PINNED`` while remaining owned by ``WORKSPACE``.
+    ``HOST_PINNED``. ``pageable_host`` is the degraded case: a CUDA mirror or
+    staging buffer that requested pinned memory and actually received ordinary
+    host memory. It charges ``HOST_PAGEABLE`` -- the tier it really is -- while
+    remaining owned by ``WORKSPACE``.
 
     R07 note: ``WorkspaceRequest.tier`` defaults to ``DEVICE`` and must be
     remapped through this helper on the CPU lane instead of used directly.
     """
     if not isinstance(owner, MemoryOwner):
         raise TypeError("owner must be a MemoryOwner")
+    if pinned_host and pageable_host:
+        raise ValueError("host staging cannot be both pinned and pageable")
     if lane is MemoryLane.CPU or lane == MemoryLane.CPU:
         return MemoryTier.HOST_PAGEABLE
     if lane is not MemoryLane.CUDA and lane != MemoryLane.CUDA:
         raise ValueError(f"unknown memory lane {lane!r}")
-    if pinned_host:
+    if pinned_host or pageable_host:
         if owner is not MemoryOwner.WORKSPACE:
-            raise ValueError("only WORKSPACE-owned staging may charge HOST_PINNED")
-        return MemoryTier.HOST_PINNED
+            raise ValueError("only WORKSPACE-owned staging may charge a host tier")
+        return MemoryTier.HOST_PINNED if pinned_host else MemoryTier.HOST_PAGEABLE
     return MemoryTier.DEVICE
 
 
@@ -156,8 +162,8 @@ class CapacitySnapshot:
     lane: MemoryLane
     dtype: str
     kv_dtype: str
-    page_size: int
     group_pages: tuple[tuple[str, int], ...]
+    group_page_sizes: tuple[tuple[str, int], ...]
     max_model_len: int
     max_num_seqs: int
     max_num_batched_tokens: int
@@ -183,7 +189,6 @@ class CapacitySnapshot:
         for name in ("dtype", "kv_dtype"):
             require_text(getattr(self, name), name)
         for name in (
-            "page_size",
             "max_model_len",
             "max_num_seqs",
             "max_num_batched_tokens",
@@ -208,6 +213,17 @@ class CapacitySnapshot:
         for name, pages in self.group_pages:
             require_text(name, "group name")
             require_int(pages, f"{name} pages", minimum=1)
+        if type(self.group_page_sizes) is not tuple or not self.group_page_sizes:
+            raise TypeError("group_page_sizes must be a non-empty tuple")
+        if len({name for name, _ in self.group_page_sizes}) != len(self.group_page_sizes):
+            raise ValueError("group_page_sizes names must be unique")
+        for name, page_size in self.group_page_sizes:
+            require_text(name, "group name")
+            require_int(page_size, f"{name} page size", minimum=1)
+        if {name for name, _ in self.group_page_sizes} != {name for name, _ in self.group_pages}:
+            # Every page pool has exactly one token page size; a group that
+            # owns pages but no size (or vice versa) is an incomplete geometry.
+            raise ValueError("group_page_sizes must name exactly the groups in group_pages")
         if not isinstance(self.ledger, LedgerSnapshot):
             raise TypeError("ledger must be a LedgerSnapshot")
         if not self.owners:
@@ -235,12 +251,35 @@ class CapacitySnapshot:
             if (owner, tier) not in seen:
                 raise ValueError(f"{owner.value} claim must be charged to {tier.name} on this lane")
         if self.staging_bytes and self.lane is MemoryLane.CUDA:
-            if (MemoryOwner.WORKSPACE, MemoryTier.HOST_PINNED) not in seen:
-                raise ValueError("staging bytes require a WORKSPACE/HOST_PINNED claim on CUDA")
+            host_staging_claims = {
+                (MemoryOwner.WORKSPACE, MemoryTier.HOST_PINNED),
+                (MemoryOwner.WORKSPACE, MemoryTier.HOST_PAGEABLE),
+            }
+            if not (host_staging_claims & seen):
+                raise ValueError(
+                    "staging bytes require a WORKSPACE host-tier claim "
+                    "(HOST_PINNED, or HOST_PAGEABLE after a fallback) on CUDA"
+                )
 
     @property
     def pages(self) -> int:
         return sum(pages for _, pages in self.group_pages)
+
+    @property
+    def page_size(self) -> int:
+        """Conservative scheduler-facing page size across all groups.
+
+        Per-group token geometry stays in :attr:`group_page_sizes`; capacity
+        heuristics use the minimum because every group must fit a step.
+        """
+        return min(size for _, size in self.group_page_sizes)
+
+    def page_size_for(self, group_name: str) -> int:
+        """Token page size of one cache group."""
+        for name, size in self.group_page_sizes:
+            if name == group_name:
+                return size
+        raise KeyError(f"unknown cache group {group_name!r}")
 
     def owner_budget(self, owner: MemoryOwner) -> int:
         total = 0
@@ -289,8 +328,8 @@ def build_capacity_snapshot(
     lane: MemoryLane,
     dtype: str,
     kv_dtype: str,
-    page_size: int,
     group_pages: Mapping[str, int],
+    group_page_sizes: Mapping[str, int],
     max_model_len: int,
     max_num_seqs: int,
     max_num_batched_tokens: int,
@@ -303,16 +342,21 @@ def build_capacity_snapshot(
     kv_budget_bytes: int,
     weights_bytes: int,
     ledger: MemoryLedger,
-    staging_pinned: bool = True,
+    staging_tier: MemoryTier = MemoryTier.HOST_PINNED,
     runner_buffer_bytes: int = 0,
 ) -> CapacitySnapshot:
     """Freeze one generation's owner table from the resolved budgets.
 
     The owner table maps every budget to the physical tier it must be charged
     against on ``lane`` (see :func:`claim_tier`). ``staging_bytes`` is a
-    WORKSPACE-owned HOST_PINNED claim and may be zero. ``runner_buffer_bytes``
-    widens the WORKSPACE claim by the persistent per-flight metadata footprint.
+    WORKSPACE-owned host claim and may be zero; ``staging_tier`` is the tier the
+    staging backing *actually* landed on, so a degraded pageable mirror charges
+    HOST_PAGEABLE rather than the pinned tier it asked for. On the CPU lane the
+    claim collapses to HOST_PAGEABLE regardless. ``runner_buffer_bytes`` widens
+    the WORKSPACE claim by the persistent per-flight metadata footprint.
     """
+    if staging_tier not in (MemoryTier.HOST_PINNED, MemoryTier.HOST_PAGEABLE):
+        raise ValueError("staging_tier must be a host tier")
     owners = [
         OwnerClaim(MemoryOwner.WEIGHT, claim_tier(MemoryOwner.WEIGHT, lane=lane), weights_bytes),
         OwnerClaim(MemoryOwner.KV, claim_tier(MemoryOwner.KV, lane=lane), kv_budget_bytes),
@@ -332,7 +376,12 @@ def build_capacity_snapshot(
         owners.append(
             OwnerClaim(
                 MemoryOwner.WORKSPACE,
-                claim_tier(MemoryOwner.WORKSPACE, lane=lane, pinned_host=staging_pinned),
+                claim_tier(
+                    MemoryOwner.WORKSPACE,
+                    lane=lane,
+                    pinned_host=staging_tier is MemoryTier.HOST_PINNED,
+                    pageable_host=staging_tier is MemoryTier.HOST_PAGEABLE,
+                ),
                 staging_bytes,
             )
         )
@@ -347,8 +396,8 @@ def build_capacity_snapshot(
         lane=lane,
         dtype=dtype,
         kv_dtype=kv_dtype,
-        page_size=page_size,
         group_pages=tuple(sorted(group_pages.items())),
+        group_page_sizes=tuple(sorted(group_page_sizes.items())),
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,

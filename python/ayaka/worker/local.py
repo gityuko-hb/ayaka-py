@@ -19,7 +19,9 @@ from ayaka.device.backend import DeviceBackend, NullBackend
 from ayaka.device.context import DeviceContext
 from ayaka.device.stream import StreamPool
 from ayaka.executor.ticket import CompletionFence
+from ayaka.handles import SequenceHandle
 from ayaka.kvcache.manager import LogicalKVManager
+from ayaka.memory.views import ExecutionMemoryView, GroupedExecutionMemoryView
 from ayaka.obs import RuntimeMetrics
 from ayaka.runner.sampling_runner import SampleRunner
 from ayaka.types import StreamRole
@@ -343,21 +345,73 @@ class LocalWorker(StepWorker):
             pool.close()
             self._pool = None
 
+    def _validate_copies(
+        self,
+        view: ExecutionMemoryView | GroupedExecutionMemoryView,
+    ) -> tuple[tuple[str, int, int, int], ...]:
+        """Validate COW ownership and ranges before any transfer is enqueued.
+
+        A destination must be a page this step's own reservation writes to, in
+        the same group, and claimed by exactly one sequence: a corrupted or
+        stale view can never redirect a copy into another sequence's live
+        page. Every length is inside ``(0, page_size]`` and source and
+        destination must differ. Returns the resolved
+        ``(group, source, destination, valid_tokens)`` rows; the caller slices
+        only ``[0, valid_tokens)`` per plane, so a destination's tail beyond
+        the copied range is never overwritten.
+        """
+        claimed: dict[tuple[str, int], set[SequenceHandle]] = {}
+        if isinstance(view, ExecutionMemoryView):
+            for sequence in view.sequences:
+                for slot in sequence.write_slots:
+                    claimed.setdefault(("default", slot.physical_page), set()).add(
+                        sequence.sequence
+                    )
+        else:
+            for sequence in view.sequences:
+                for group in sequence.groups:
+                    for slot in group.write_slots:
+                        claimed.setdefault((group.group_name, slot.physical_page), set()).add(
+                            sequence.sequence
+                        )
+
+        rows: list[tuple[str, int, int, int]] = []
+        destinations: set[tuple[str, int]] = set()
+        for copy in view.copies:
+            if copy.group_name not in self.kv.storages:
+                raise ValueError(f"COW copy names unknown group {copy.group_name!r}")
+            storage = self.kv.storages[copy.group_name].storage
+            if type(copy.valid_tokens) is not int or not 0 < copy.valid_tokens <= storage.page_size:
+                raise ValueError("invalid COW copy length")
+            source = self.kv.physical_page(copy.group_name, copy.source)
+            destination = self.kv.physical_page(copy.group_name, copy.destination)
+            if source == destination:
+                raise ValueError("COW copy requires distinct source and destination pages")
+            owners = claimed.get((copy.group_name, destination))
+            if not owners:
+                raise ValueError("COW destination is not written by this step's reservation")
+            if len(owners) != 1:
+                raise ValueError("COW destination is claimed by multiple sequences")
+            destination_key = (copy.group_name, destination)
+            if destination_key in destinations:
+                raise ValueError("two COW copies share one destination page")
+            destinations.add(destination_key)
+            rows.append((copy.group_name, source, destination, copy.valid_tokens))
+        return tuple(rows)
+
     def _copy_pages(self, step: WorkerStep) -> None:
         from ayaka.kernel.triton.cache.cache_ops import copy_cache
 
         sources, destinations = [], []
-        for copy in step.prepared.memory_view.copies:
-            source = self.kv.physical_page(copy.group_name, copy.source)
-            destination = self.kv.physical_page(copy.group_name, copy.destination)
-            storage = self.kv.storages[copy.group_name].storage
-            if not 0 < copy.valid_tokens <= storage.page_size:
-                raise ValueError("invalid COW copy length")
+        for group_name, source, destination, valid_tokens in self._validate_copies(
+            step.prepared.memory_view
+        ):
+            storage = self.kv.storages[group_name].storage
             # Slice valid tokens only; never overwrite a destination's tail.
             for family in storage.buffers():
                 for tensor in family:
-                    sources.append(tensor[source, : copy.valid_tokens])
-                    destinations.append(tensor[destination, : copy.valid_tokens])
+                    sources.append(tensor[source, :valid_tokens])
+                    destinations.append(tensor[destination, :valid_tokens])
         if sources:
             copy_cache(sources, destinations, False)
 

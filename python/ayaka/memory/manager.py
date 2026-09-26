@@ -47,6 +47,7 @@ from ayaka.memory.pressure import (
     PressureAction,
     PressureStatus,
     SequencePreemptionResult,
+    SequenceTruncationResult,
 )
 from ayaka.memory.sequence import (
     PageTableEntry,
@@ -1154,6 +1155,114 @@ class RuntimeMemoryManager:
                 free_pages_after=after.free_pages,
             )
 
+    def truncate_sequence(
+        self,
+        sequence: SequenceHandle,
+        num_tokens: int,
+        *,
+        safe_epoch: int | None = None,
+    ) -> SequenceTruncationResult:
+        """Release the committed suffix above ``num_tokens``; never copy bytes.
+
+        Only entries beyond the requested boundary leave the sequence table.
+        A released page survives under every other durable owner it has (fork
+        sibling, prefix cache, explicit pin); only this sequence's request
+        reference is dropped, and allocator validity is left untouched so a
+        remaining owner keeps reading exactly what it was promised. A tail
+        page this sequence still exclusively owns shrinks its validity to the
+        new boundary so the next append can continue in place; otherwise the
+        next append observes the mismatch and copies the tail first.
+
+        The sequence version bumps on every effective truncation, so frozen
+        plans and execution views built before it are stale and rejected.
+
+        Args:
+            sequence: An idle sequence with committed KV.
+            num_tokens: New committed length; at most the current length.
+            safe_epoch: Epoch whose completion makes released pages reusable;
+                defaults to the current epoch.
+
+        Returns:
+            A structured truncation result; an equal length is a clean no-op.
+
+        Raises:
+            ValueError: if ``num_tokens`` is negative or exceeds committed KV,
+                or if ``safe_epoch`` precedes the completed epoch.
+            SequenceBusyError: if the sequence has an open transaction, an
+                active lease, a pending release, or a blocking failure epoch.
+        """
+
+        require_int(num_tokens, "num_tokens", minimum=0)
+        epoch = self.current_epoch if safe_epoch is None else safe_epoch
+        if epoch < self.current_epoch:
+            raise ValueError("safe_epoch cannot precede the completed epoch")
+        with self._lock, self.sequences.mutate(sequence) as state:
+            if (
+                state.pending_transaction_index is not None
+                or state.active_lease_index is not None
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("cannot truncate a busy or blocked sequence")
+            if num_tokens > state.committed_tokens:
+                raise ValueError("truncate length exceeds committed KV")
+            before = self.allocator.snapshot()
+            released_tokens = state.committed_tokens - num_tokens
+            if released_tokens == 0:
+                return SequenceTruncationResult(
+                    sequence=sequence,
+                    retained_tokens=num_tokens,
+                    released_tokens=0,
+                    released_request_pages=0,
+                    pages_reclaimed=0,
+                    pages_deferred=0,
+                    free_pages_before=before.free_pages,
+                    free_pages_after=before.free_pages,
+                )
+
+            page_size = self.page_size
+            entries = state.page_table.entries
+            keep_blocks = div_ceil(num_tokens, page_size)
+            kept = list(entries[:keep_blocks])
+            released = tuple(entries[keep_blocks:])
+            # Validate the whole suffix before any mutation: a corrupt entry
+            # must not leave the release half-applied.
+            self.allocator.validate_release_request_refs(tuple(entry.page for entry in released))
+            if kept:
+                tail = kept[-1]
+                boundary = num_tokens - (keep_blocks - 1) * page_size
+                if boundary < tail.valid_tokens:
+                    meta = self.allocator.get_meta(tail.page)
+                    if meta.can_mutate and not meta.inflight_refs:
+                        # Exclusive tail: shrink allocator validity with the
+                        # request so a later append can write in place.
+                        self.allocator.set_valid_tokens(tail.page, boundary)
+                    kept[-1] = PageTableEntry(page=tail.page, valid_tokens=boundary)
+
+            for entry in released:
+                self.allocator.release_request_ref(entry.page, safe_epoch=epoch)
+
+            state.page_table.entries = kept
+            state.committed_tokens = num_tokens
+            state.version += 1
+
+            pending = self.allocator.snapshot()
+            reclaimed = self.allocator.reclaim_completed()
+            after = self.allocator.snapshot()
+            return SequenceTruncationResult(
+                sequence=sequence,
+                retained_tokens=num_tokens,
+                released_tokens=released_tokens,
+                released_request_pages=len(released),
+                pages_reclaimed=reclaimed,
+                pages_deferred=max(
+                    pending.reclaim_pending_pages - before.reclaim_pending_pages,
+                    0,
+                ),
+                free_pages_before=before.free_pages,
+                free_pages_after=after.free_pages,
+            )
+
     def begin_transaction(self, step_id: int) -> MemoryTransactionHandle:
         """Open a tentative-planning transaction for one scheduler step.
 
@@ -1535,6 +1644,11 @@ class RuntimeMemoryManager:
             lease = self._get_lease(lease_handle)
             LifecycleTransitions.require_lease(lease, LeaseState.PREPARED)
             records = [self._get_reservation(handle) for handle in lease.reservation_handles]
+            # Validate the whole batch before any mutation: an abort must not
+            # leave earlier records rolled back if a later one is inconsistent.
+            self.allocator.validate_rollback_reserved(
+                tuple(page for record in records for page in record.allocated_pages)
+            )
             for record in records:
                 self.allocator.rollback_reserved(record.allocated_pages)
                 with self.sequences.mutate(record.sequence) as state:

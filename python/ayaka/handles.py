@@ -2,18 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+#: Largest generation a handle can carry. Generations never wrap: an owner that
+#: reaches the ceiling must rebuild (mint a new owner incarnation) rather than
+#: reuse an identity that stale holders may still reference.
+MAX_HANDLE_GENERATION: int = (1 << 63) - 1
+
 
 def _validate_index_generation(index: int, generation: int) -> None:
     """Validate the shared ``(index, generation)`` handle invariant.
 
     Indexes are non-negative slot identities; generations start at 1 so that a
     freshly initialized slot (generation 0) can never be confused with a live
-    object.
+    object. Generations never wrap: the ceiling is a rebuild trigger, not a
+    modulo.
     """
     if index < 0:
         raise ValueError("handle index must be non-negative")
     if generation <= 0:
         raise ValueError("handle generation must be positive")
+    if generation > MAX_HANDLE_GENERATION:
+        raise ValueError("handle generation exceeds the int64 identity space")
 
 
 @dataclass(frozen=True, slots=True, order=True)

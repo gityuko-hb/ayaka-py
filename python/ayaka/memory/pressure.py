@@ -147,6 +147,52 @@ class SequencePreemptionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SequenceTruncationResult:
+    """Logical result of releasing one sequence's committed suffix.
+
+    Suffix release is not a pressure action: the caller asks for an exact new
+    length. The result reports what left this sequence's table and how much
+    capacity that returned immediately. ``released_request_pages`` counts the
+    request references dropped, including pages a fork sibling, prefix cache,
+    or pin still owns; those pages stay live under their remaining owners.
+    """
+
+    sequence: SequenceHandle
+    retained_tokens: int
+    """Committed length this sequence keeps (the requested boundary)."""
+    released_tokens: int
+    """Committed tokens removed from the tail."""
+    released_request_pages: int
+    """Request-owned page entries dropped from the sequence table."""
+    pages_reclaimed: int
+    """Released pages already returned to the free pool during this call."""
+    pages_deferred: int
+    """Released pages queued for deferred free, awaiting their safe epoch."""
+    free_pages_before: int
+    free_pages_after: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sequence, SequenceHandle):
+            raise TypeError("sequence must be a SequenceHandle")
+        counts = (
+            self.retained_tokens,
+            self.released_tokens,
+            self.released_request_pages,
+            self.pages_reclaimed,
+            self.pages_deferred,
+            self.free_pages_before,
+            self.free_pages_after,
+        )
+        if any(value < 0 for value in counts):
+            raise ValueError("truncation counts must be non-negative")
+
+    @property
+    def released_any(self) -> bool:
+        """True when the call changed the sequence's committed length."""
+        return self.released_tokens > 0
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryPressureMetrics:
     """Cumulative memory-owned counters; page counters count physical pages.
 

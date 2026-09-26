@@ -57,6 +57,7 @@ from ayaka.kvcache.materialize import KVStorageLease, materialize_kv_storage
 from ayaka.kvcache.retention.policy import FullRetention, SlidingWindowRetention
 from ayaka.kvcache.storage.dtypes import to_storage_dtype
 from ayaka.kvcache.storage.geometry import BaseKVStorageSpec, MHAStorageSpec, MLAStorageSpec
+from ayaka.kvcache.storage.layout import DEFAULT_KV_ALIGNMENT_BYTES
 from ayaka.memory.ledger import MemoryLedger
 from ayaka.plan import ComputePlan, ExecutionPlan, ParallelPlan
 from ayaka.types import AttentionType, DeviceKind, DType, KVCacheDtype, MaskKind
@@ -136,6 +137,19 @@ def _spec_for(storage_specs: Mapping[str, BaseKVStorageSpec], group_id: str) -> 
         ) from None
 
 
+def _require_address_bounds(spec: BaseKVStorageSpec, group_id: str) -> BaseKVStorageSpec:
+    """Fail a plan that would overflow page/slot metadata before any byte math."""
+    try:
+        spec.validate_address_bounds()
+    except ValueError as exc:
+        raise ConfigError(
+            f"cache.physical.groups.{group_id}",
+            "PHYSICAL_CACHE_METADATA_OVERFLOW",
+            str(exc),
+        ) from exc
+    return spec
+
+
 def build_storage_specs(
     architecture: ArchitectureConfig,
     cache_config: CacheConfig,
@@ -172,23 +186,29 @@ def build_storage_specs(
                     "MLA_LATENT_GEOMETRY_MISSING",
                     "an MLA group requires kv_lora_rank and qk_rope_head_dim",
                 )
-            specs[group.group_id] = MLAStorageSpec(
-                latent_dim=latent_dim,
-                rope_dim=rope_dim,
-                page_size=group.page_size,
-                capacity_pages=pages,
-                num_layers=len(group.layer_indices),
-                dtype=dtype_name,
+            specs[group.group_id] = _require_address_bounds(
+                MLAStorageSpec(
+                    latent_dim=latent_dim,
+                    rope_dim=rope_dim,
+                    page_size=group.page_size,
+                    capacity_pages=pages,
+                    num_layers=len(group.layer_indices),
+                    dtype=dtype_name,
+                ),
+                group.group_id,
             )
             continue
-        specs[group.group_id] = MHAStorageSpec(
-            num_layers=len(group.layer_indices),
-            num_kv_heads_local=group.geometry.local_kv_heads(tp_size),
-            head_dim=group.geometry.head_dim,
-            page_size=group.page_size,
-            capacity_pages=pages,
-            dtype=dtype_name,
-            layout=cache_config.layout,
+        specs[group.group_id] = _require_address_bounds(
+            MHAStorageSpec(
+                num_layers=len(group.layer_indices),
+                num_kv_heads_local=group.geometry.local_kv_heads(tp_size),
+                head_dim=group.geometry.head_dim,
+                page_size=group.page_size,
+                capacity_pages=pages,
+                dtype=dtype_name,
+                layout=cache_config.layout,
+            ),
+            group.group_id,
         )
     return specs
 
@@ -318,9 +338,13 @@ def build_cache_groups(
     return tuple(groups)
 
 
-def _group_cost(spec: BaseKVStorageSpec, pages: int) -> int:
+def _group_cost(
+    spec: BaseKVStorageSpec,
+    pages: int,
+    alignment_bytes: int = DEFAULT_KV_ALIGNMENT_BYTES,
+) -> int:
     """Exact reservation bytes for ``pages`` pages, padding included."""
-    return spec.with_capacity_pages(pages).aligned_total_bytes()
+    return spec.with_capacity_pages(pages).aligned_total_bytes(alignment_bytes)
 
 
 def plan_physical_cache(
@@ -330,6 +354,7 @@ def plan_physical_cache(
     *,
     max_sequences: int,
     max_model_len: int,
+    alignment_bytes: int = DEFAULT_KV_ALIGNMENT_BYTES,
 ) -> PhysicalCachePlan:
     """Partition one device's KV budget into exact per-group page pools.
 
@@ -337,7 +362,8 @@ def plan_physical_cache(
     ratio of full-attention token capacity, as the config specifies) and then
     corrected until the storage geometries' ``aligned_total_bytes`` fit the
     budget. The remainder is reported as ``unallocated_bytes``; nothing is
-    silently rounded away.
+    silently rounded away. The alignment used for the charge is recorded in the
+    returned plan so the materializer cannot diverge from the cost model.
     """
 
     if device_kv_budget_bytes < 1:
@@ -351,6 +377,16 @@ def plan_physical_cache(
             "cache.physical",
             "PHYSICAL_CACHE_LIMIT_INVALID",
             "max_sequences and max_model_len must be positive",
+        )
+    if (
+        isinstance(alignment_bytes, bool)
+        or not isinstance(alignment_bytes, int)
+        or alignment_bytes <= 0
+    ):
+        raise ConfigError(
+            "cache.physical.alignment_bytes",
+            "PHYSICAL_CACHE_ALIGNMENT_INVALID",
+            "cache alignment must be a positive integer number of bytes",
         )
 
     groups = cache.groups
@@ -401,12 +437,16 @@ def plan_physical_cache(
         common_tokens = int(device_kv_budget_bytes / weighted_bytes_per_token)
         page_counts = counts_for(common_tokens)
         while (
-            sum(_group_cost(specs[group.group_id], page_counts[group.group_id]) for group in groups)
+            sum(
+                _group_cost(specs[group.group_id], page_counts[group.group_id], alignment_bytes)
+                for group in groups
+            )
             > device_kv_budget_bytes
             and common_tokens > 0
         ):
             total = sum(
-                _group_cost(specs[group.group_id], page_counts[group.group_id]) for group in groups
+                _group_cost(specs[group.group_id], page_counts[group.group_id], alignment_bytes)
+                for group in groups
             )
             common_tokens = min(
                 common_tokens - 1,
@@ -415,7 +455,8 @@ def plan_physical_cache(
             page_counts = counts_for(common_tokens)
 
     allocated = sum(
-        _group_cost(specs[group.group_id], page_counts[group.group_id]) for group in groups
+        _group_cost(specs[group.group_id], page_counts[group.group_id], alignment_bytes)
+        for group in groups
     )
     if allocated > device_kv_budget_bytes:
         raise ConfigError(
@@ -442,7 +483,7 @@ def plan_physical_cache(
                 page_size=group.page_size,
                 bytes_per_page=group.bytes_per_page,
                 page_major_layout=group.page_major_layout,
-                capacity_bytes=_group_cost(specs[group.group_id], pages),
+                capacity_bytes=_group_cost(specs[group.group_id], pages, alignment_bytes),
                 num_pages=pages,
                 token_capacity=pages * group.page_size,
                 state_slot_capacity=0,
@@ -455,6 +496,7 @@ def plan_physical_cache(
         max_sequences=max_sequences,
         max_model_len=max_model_len,
         groups=tuple(physical),
+        alignment_bytes=alignment_bytes,
     )
 
 
@@ -488,6 +530,7 @@ def plan_resident_kv(
     parallel: ParallelConfig | ResolvedParallelPlan | None = None,
     tp_size: int = 1,
     max_model_len: int | None = None,
+    alignment_bytes: int = DEFAULT_KV_ALIGNMENT_BYTES,
 ) -> ResidentKVPlan:
     """Resolve the full memory -> scheduler -> attention -> storage chain.
 
@@ -502,6 +545,8 @@ def plan_resident_kv(
         tp_size: Tensor-parallel size; heads are sharded or replicated by it.
             Only used when ``parallel`` is omitted, or as a consistency check.
         max_model_len: Sequence-length bound; defaults to the model context.
+        alignment_bytes: Per-allocation alignment the physical plan is charged
+            with; the same value must reach the materializer.
     """
 
     resolved_parallel = _resolve_parallel(architecture, parallel, tp_size)
@@ -526,6 +571,7 @@ def plan_resident_kv(
         memory_plan.kv_cache_bytes,
         max_sequences=max_num_seqs,
         max_model_len=resolved_max_model_len,
+        alignment_bytes=alignment_bytes,
     )
     specs = build_storage_specs(
         architecture,
@@ -563,9 +609,29 @@ def build_resident_kv(
 
     from ayaka.kvcache.build import build_kv_storage
     from ayaka.kvcache.grouped_manager import KVCacheGroupManager
+    from ayaka.kvcache.storage.validation import validate_kv_storage_support
+    from ayaka.utils.torch_utils import compute_capability as torch_compute_capability
+
+    normalized = str(device).strip().lower()
+    device_type = normalized.partition(":")[0]
+    device_index = 0
+    if ":" in normalized:
+        try:
+            device_index = int(normalized.partition(":")[2])
+        except ValueError as exc:
+            raise ValueError(f"invalid device {device!r}") from exc
+    capability = torch_compute_capability(device_index) if device_type == "cuda" else None
 
     supplied = dict(storages or {})
     for group_id, spec in plan.storage_specs:
+        # The resident path bypasses the ledger, so capability validation has to
+        # happen here as well: a plan must never allocate an unsupported dtype,
+        # layout or geometry just because no charge is reserved.
+        validate_kv_storage_support(
+            spec,
+            device_type=device_type,
+            compute_capability=capability,
+        ).require_compatible()
         if group_id not in supplied:
             supplied[group_id] = build_kv_storage(spec, device=device)
     return KVCacheGroupManager(
@@ -638,6 +704,7 @@ def materialize_resident_kv(
                     label=group_id,
                     device=device,
                     zero_initialize=zero_initialize,
+                    alignment_bytes=plan.physical.alignment_bytes,
                 )
             )
     except BaseException:

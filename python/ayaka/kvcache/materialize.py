@@ -21,7 +21,10 @@ class KVStorageLease:
 
     ``close`` is explicit and idempotent. The runtime must drain every stream
     that can touch the slab before calling it; Python finalizers cannot enforce
-    CUDA completion ordering and are intentionally not used.
+    CUDA completion ordering and are intentionally not used. A pin is the
+    tracked protection for a logical manager; borrowed buffers returned by
+    ``KVStorage.buffers()`` / ``plane()`` are the caller's contract and are not
+    counted by the lease, so the owner must stop using them before close.
     """
 
     __slots__ = ("_closed", "_charged_bytes", "_ledger", "_lock", "_storage", "_pins", "label")
@@ -88,7 +91,12 @@ class KVStorageLease:
             return KVStoragePin(self)
 
     def close(self) -> None:
-        """Close only after every owner released its pin; idempotent."""
+        """Close only after every owner released its pin; idempotent.
+
+        A live pin (logical manager, flight) refuses the close. Borrowed
+        buffer views are not tracked: the caller must have drained them,
+        together with every stream touching the slab, before calling this.
+        """
         with self._lock:
             if self._closed:
                 return

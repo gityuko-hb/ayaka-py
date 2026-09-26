@@ -59,29 +59,58 @@ class KVStorage(Protocol):
         ...
 
     def write(self, layer_index: int, slots: Any, /, *values: Any) -> None:
-        """Scatter one value tensor per plane, in :attr:`plane_names` order."""
+        """Scatter one value tensor per plane, in :attr:`plane_names` order.
+
+        ``values`` are real, unscaled K/V activations; a quantized store applies
+        its static inverse scale while writing. The store copies the inputs into
+        the slab, so the caller keeps ownership of ``values``.
+        """
         ...
 
     def write_planes(self, layer_index: int, slots: Any, /, **values: Any) -> None:
-        """Scatter planes addressed by name rather than by position."""
+        """Scatter planes addressed by name rather than by position.
+
+        Same value and scale contract as :meth:`write`.
+        """
         ...
 
     def read(
         self, layer_index: int, slots: Any, /, *, dtype: Any | None = None, raw: bool = False
     ) -> tuple[Any, ...]:
-        """Gather slots, requiring every address to be unique."""
+        """Gather slots, requiring every address to be unique.
+
+        With ``raw=False`` a quantized store dequantizes: ``real = stored *
+        scale`` and ``dtype`` selects the output float dtype (and is required to
+        dequantize). With ``raw=True`` the stored codes are returned unscaled.
+        An unquantized store returns the stored values in either mode. Outputs
+        are freshly allocated and owned by the caller; they are never views into
+        the slab.
+        """
         ...
 
     def gather(
         self, layer_index: int, slots: Any, /, *, dtype: Any | None = None, raw: bool = False
     ) -> tuple[Any, ...]:
-        """Gather slots, allowing repeated padding-slot addresses."""
+        """Gather slots, allowing repeated padding-slot addresses.
+
+        Same raw/dequantization and ownership contract as :meth:`read`.
+        """
         ...
 
     def buffers(self) -> tuple[tuple[Any, ...], ...]:
-        """Return per-plane tensor families, in :attr:`plane_names` order."""
+        """Return per-plane tensor families, in :attr:`plane_names` order.
+
+        Borrowed views into the live slab, not leases: they keep the allocation
+        alive but are not tracked by the lease pin count. The owner must not
+        close the slab while any returned buffer is still in use.
+        """
         ...
 
     def close(self) -> None:
-        """Release tensor references after callers have drained GPU work."""
+        """Release tensor references after callers have drained GPU work.
+
+        Closing does not synchronize and does not free anything still under a
+        borrowed view; the caller owns that drain. Allocator page state lives
+        outside this port and is reclaimed by the logical owner.
+        """
         ...

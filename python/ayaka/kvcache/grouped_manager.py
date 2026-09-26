@@ -38,6 +38,7 @@ from ayaka.memory.pressure import (
     PressureAction,
     PressureStatus,
     SequencePreemptionResult,
+    SequenceTruncationResult,
 )
 from ayaka.memory.sequence import (
     GroupedSequenceMemoryState as _SequenceState,
@@ -1124,11 +1125,18 @@ class KVCacheGroupManager:
                     "only a not-yet-launched step can be aborted immediately"
                 )
             records = [self._get_reservation(handle) for handle in lease.reservation_handles]
+            allocations = [
+                (self._runtime_by_name[plan.group_name], plan.allocated_pages)
+                for record in records
+                for plan in record.group_plans
+            ]
+            # Validate every group/record before mutating any allocator, so a
+            # late inconsistency cannot leave the step half-rolled-back.
+            for runtime, pages in allocations:
+                runtime.allocator.validate_rollback_reserved(pages)
+            for runtime, pages in allocations:
+                runtime.allocator.rollback_reserved(pages)
             for record in records:
-                for plan in record.group_plans:
-                    self._runtime_by_name[plan.group_name].allocator.rollback_reserved(
-                        plan.allocated_pages
-                    )
                 self._get_sequence_state(record.sequence).active_lease_index = None
             LifecycleTransitions.transition_lease(
                 lease, expected=LeaseState.PREPARED, target=LeaseState.ABORTED
@@ -1283,6 +1291,150 @@ class KVCacheGroupManager:
             return SequencePreemptionResult(
                 sequence=sequence,
                 status=PreemptionStatus.RELEASED,
+                released_tokens=released_tokens,
+                released_request_pages=released_pages,
+                pages_reclaimed=reclaimed,
+                pages_deferred=max(
+                    pending.deferred_free_pages - before.deferred_free_pages,
+                    0,
+                ),
+                free_pages_before=before.free_pages,
+                free_pages_after=after.free_pages,
+            )
+
+    def truncate_sequence(
+        self,
+        sequence: SequenceHandle,
+        num_tokens: int,
+        *,
+        safe_epoch: int | None = None,
+    ) -> SequenceTruncationResult:
+        """Release every group's committed suffix above ``num_tokens``.
+
+        The new length is resolved against each group's retention window.
+        Every block the shorter sequence must still retain has to exist
+        already: retention never resurrects evicted history, so a boundary
+        that would need it is rejected instead of silently breaking the
+        attention contract. Blocks that fall out of the new window keep every
+        other durable owner (fork sibling, canonical prefix entry, pin); only
+        this sequence's request reference is dropped, and allocator validity
+        is left alone for a remaining owner. An exclusively owned tail page
+        shrinks its validity with the request so a later append can continue
+        in place.
+
+        The sequence version bumps on every effective truncation, so frozen
+        plans and execution views built before it are stale and rejected.
+
+        Args:
+            sequence: An idle sequence with committed KV.
+            num_tokens: New committed length; at most the current length.
+            safe_epoch: Epoch whose completion makes released pages reusable;
+                defaults to the current epoch.
+
+        Returns:
+            A structured truncation result; an equal length is a clean no-op.
+
+        Raises:
+            ValueError: if ``num_tokens`` is negative or exceeds committed KV,
+                or if ``safe_epoch`` precedes the completed epoch.
+            InvalidStateTransitionError: if the new window needs a group block
+                retention already evicted.
+            SequenceBusyError: if the sequence has an open transaction, an
+                active lease, a pending release, or a blocking failure epoch.
+        """
+        require_int(num_tokens, "num_tokens", minimum=0)
+        epoch = self.current_epoch if safe_epoch is None else safe_epoch
+        if epoch < self.current_epoch:
+            raise ValueError("safe_epoch cannot precede the completed epoch")
+        with self._lock:
+            state = self._get_sequence_state(sequence)
+            if (
+                state.pending_transaction_index is not None
+                or state.active_lease_index is not None
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                raise SequenceBusyError("cannot truncate a busy or blocked sequence")
+            if num_tokens > state.committed_tokens:
+                raise ValueError("truncate length exceeds committed KV")
+            before = self.snapshot()
+            released_tokens = state.committed_tokens - num_tokens
+            if released_tokens == 0:
+                return SequenceTruncationResult(
+                    sequence=sequence,
+                    retained_tokens=num_tokens,
+                    released_tokens=0,
+                    released_request_pages=0,
+                    pages_reclaimed=0,
+                    pages_deferred=0,
+                    free_pages_before=before.free_pages,
+                    free_pages_after=before.free_pages,
+                )
+
+            windows: dict[str, range] = {}
+            for runtime in self._group_runtimes:
+                descriptor = runtime.descriptor
+                window = retained_page_range(
+                    descriptor.retention,
+                    layer_id=descriptor.layer_ids[0],
+                    sequence_length=num_tokens,
+                    page_size=descriptor.storage_spec.page_size,
+                )
+                existing = {entry.logical_block for entry in state.group_tables[descriptor.name]}
+                if any(block not in existing for block in window):
+                    raise InvalidStateTransitionError(
+                        f"truncate would require evicted history in group {descriptor.name}"
+                    )
+                windows[descriptor.name] = window
+
+            # Validate every group's suffix and shrink candidates before any
+            # mutation so a corrupt table cannot leave the release half-applied.
+            for runtime in self._group_runtimes:
+                descriptor = runtime.descriptor
+                size = descriptor.storage_spec.page_size
+                table = state.group_tables[descriptor.name]
+                released = tuple(
+                    entry for entry in table if entry.logical_block not in windows[descriptor.name]
+                )
+                runtime.allocator.validate_release_request_refs(
+                    tuple(entry.page for entry in released)
+                )
+                for entry in table:
+                    boundary = min(size, num_tokens - entry.logical_block * size)
+                    if entry.logical_block in windows[descriptor.name] and (
+                        boundary < entry.valid_tokens
+                    ):
+                        runtime.allocator.get_meta(entry.page)
+
+            released_pages = 0
+            for runtime in self._group_runtimes:
+                descriptor = runtime.descriptor
+                size = descriptor.storage_spec.page_size
+                kept: list[GroupPageTableEntry] = []
+                for entry in state.group_tables[descriptor.name]:
+                    if entry.logical_block not in windows[descriptor.name]:
+                        runtime.allocator.release_request_ref(entry.page, safe_epoch=epoch)
+                        released_pages += 1
+                        continue
+                    boundary = min(size, num_tokens - entry.logical_block * size)
+                    if boundary < entry.valid_tokens:
+                        meta = runtime.allocator.get_meta(entry.page)
+                        if meta.can_mutate and not meta.inflight_refs:
+                            runtime.allocator.set_valid_tokens(entry.page, boundary)
+                        entry = GroupPageTableEntry(entry.logical_block, entry.page, boundary)
+                    kept.append(entry)
+                state.group_tables[descriptor.name] = kept
+            state.committed_tokens = num_tokens
+            state.version += 1
+
+            pending = self.snapshot()
+            reclaimed = sum(
+                runtime.allocator.reclaim_completed() for runtime in self._group_runtimes
+            )
+            after = self.snapshot()
+            return SequenceTruncationResult(
+                sequence=sequence,
+                retained_tokens=num_tokens,
                 released_tokens=released_tokens,
                 released_request_pages=released_pages,
                 pages_reclaimed=reclaimed,

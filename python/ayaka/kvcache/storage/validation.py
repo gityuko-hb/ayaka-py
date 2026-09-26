@@ -68,6 +68,8 @@ class KVStorageIssueCode(StrEnum):
     """No storage implementation exists for this cache family."""
     QUANTIZATION = "quantization"
     """The quantization policy is incoherent with the dtype."""
+    ADDRESS_OVERFLOW = "address_overflow"
+    """Page or slot metadata exceeds the int64 address carriers."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +239,12 @@ def validate_kv_storage_support(
                 f"supported: {', '.join(sorted(item.value for item in supported))}",
             )
         )
+
+    # metadata / address bounds
+    try:
+        spec.validate_address_bounds()
+    except ValueError as exc:
+        issues.append(KVStorageCompatibilityIssue(KVStorageIssueCode.ADDRESS_OVERFLOW, str(exc)))
 
     return KVStorageValidationResult(
         spec=spec,

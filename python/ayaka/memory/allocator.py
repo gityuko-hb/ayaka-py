@@ -29,7 +29,7 @@ from ayaka.exceptions import (
     InvalidStateTransitionError,
     InvariantViolationError,
 )
-from ayaka.handles import KVPageHandle, PhysicalPageId
+from ayaka.handles import MAX_HANDLE_GENERATION, KVPageHandle, PhysicalPageId
 from ayaka.memory.metadata import PageMetadata
 from ayaka.memory.state import PageAllocationState
 
@@ -289,6 +289,53 @@ class PageAllocator:
                 meta.request_refs += 1
                 meta.allocation_state = PageAllocationState.LIVE
 
+    def validate_rollback_reserved(self, pages: Sequence[KVPageHandle]) -> None:
+        """Check that every page can be rolled back, mutating nothing.
+
+        A manager validates a whole step before aborting it: if one record is
+        inconsistent, the abort must fail before any earlier record is rolled
+        back, or the transaction is left half-cancelled.
+
+        Raises:
+            InvalidHandleError: If a handle is stale or outside the allocator.
+            InvalidStateTransitionError: If a page is not reserved or still has
+                an in-flight execution reference.
+            InvariantViolationError: If a reserved page has an invalid
+                reservation reference count.
+        """
+        with self._lock:
+            self._validate_rollback_reserved(pages)
+
+    def _validate_rollback_reserved(self, pages: Sequence[KVPageHandle]) -> list[PageMetadata]:
+        metas = [self._require_state(page, PageAllocationState.RESERVED) for page in pages]
+        for meta in metas:
+            if meta.inflight_refs:
+                raise InvalidStateTransitionError(
+                    "an in-flight reserved page cannot be rolled back immediately"
+                )
+            if meta.reservation_refs != 1:
+                raise InvariantViolationError("invalid reservation refcount")
+        return metas
+
+    def validate_release_request_refs(self, pages: Sequence[KVPageHandle]) -> None:
+        """Check every page can release one request reference, mutating nothing.
+
+        A manager releasing a sequence suffix validates the whole suffix first:
+        if one entry is inconsistent, the release must fail before any earlier
+        entry drops its reference, or the page table is left half-truncated.
+
+        Raises:
+            InvalidHandleError: If a handle is stale or outside the allocator.
+            InvalidStateTransitionError: If a page is not ``LIVE``.
+            InvariantViolationError: If a page has no request reference to
+                release.
+        """
+        with self._lock:
+            for page in pages:
+                meta = self._require_state(page, PageAllocationState.LIVE)
+                if meta.request_refs <= 0:
+                    raise InvariantViolationError("request refcount underflow")
+
     def rollback_reserved(self, pages: Sequence[KVPageHandle]) -> None:
         """Cancel reservations and return their pages to the free queue.
 
@@ -309,14 +356,7 @@ class PageAllocator:
                 reservation reference count.
         """
         with self._lock:
-            metas = [self._require_state(page, PageAllocationState.RESERVED) for page in pages]
-            for meta in metas:
-                if meta.inflight_refs:
-                    raise InvalidStateTransitionError(
-                        "an in-flight reserved page cannot be rolled back immediately"
-                    )
-                if meta.reservation_refs != 1:
-                    raise InvariantViolationError("invalid reservation refcount")
+            metas = self._validate_rollback_reserved(pages)
             for meta in metas:
                 meta.reservation_refs = 0
                 self._make_free(meta)
@@ -334,6 +374,17 @@ class PageAllocator:
         unowned page is placed on the deferred-reclamation path. If it has
         in-flight references, the page remains protected until both those
         references are released and ``safe_epoch`` has completed.
+
+        Resulting state per page:
+
+        * unowned and no in-flight references -> ``RECLAIM_PENDING`` with the
+          given ``safe_epoch``;
+        * in-flight references remain -> stays ``RESERVED`` with
+          ``reservation_refs == 0``; ``unmark_inflight`` moves it to
+          ``RECLAIM_PENDING`` once the last reference is released, keeping the
+          greatest required epoch;
+        * durable request/cache refs or pins remain -> the page stays alive
+          under those owners; the abandonment only drops the reservation claim.
 
         Args:
             pages: Reserved handles to abandon. Each page must still have one
@@ -907,14 +958,23 @@ class PageAllocator:
         before the caller assigns the new lifecycle state. Incrementing the
         generation first invalidates every handle from the previous lifetime.
 
+        Generations never wrap. Reaching :data:`MAX_HANDLE_GENERATION` is a
+        hard error rather than a reuse of identities stale holders may still
+        carry; the owner must be rebuilt with a new incarnation.
+
         Args:
             meta: Allocator-owned metadata whose state must be ``FREE``.
 
         Raises:
-            InvariantViolationError: If the supplied metadata is not free.
+            InvariantViolationError: If the supplied metadata is not free, or
+                its generation space is exhausted.
         """
         if meta.allocation_state is not PageAllocationState.FREE:
             raise InvariantViolationError("only a free page can start a new generation")
+        if meta.generation >= MAX_HANDLE_GENERATION:
+            raise InvariantViolationError(
+                "page generation space exhausted; rebuild the KV owner instead of wrapping"
+            )
         meta.generation += 1
         meta.request_refs = 0
         meta.cache_refs = 0

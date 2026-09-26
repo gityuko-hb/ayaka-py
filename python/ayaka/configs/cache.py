@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ayaka.configs.base import ConfigError, ConfigMixin
+from ayaka.kvcache.storage.layout import DEFAULT_KV_ALIGNMENT_BYTES
 from ayaka.types import DType, KVLayoutKind
 from ayaka.utils.math_utils import align_down, div_ceil
 
@@ -380,6 +381,10 @@ class CacheGroupGeometry(ConfigMixin):
     state_elements_per_layer: int = 0
     conv_state_elements_per_layer: int = 0
     state_tp_sharded: bool = False
+    #: Optional per-group token page size. ``None`` uses ``CacheConfig.block_size``
+    #: for this group. Grouped caches may mix page sizes; the scheduler uses the
+    #: minimum and every group keeps its own allocator namespace.
+    page_size: int | None = None
 
     def __post_init__(self) -> None:
         if not self.group_id:
@@ -439,6 +444,25 @@ class CacheGroupGeometry(ConfigMixin):
                 "STATE_ON_ATTENTION_GROUP",
                 "recurrent state geometry only applies to Mamba groups",
             )
+        if self.page_size is not None:
+            if isinstance(self.page_size, bool) or not isinstance(self.page_size, int):
+                raise ConfigError(
+                    f"model.cache_groups.{self.group_id}.page_size",
+                    "CACHE_GROUP_PAGE_SIZE_INVALID",
+                    "page_size must be an integer number of tokens",
+                )
+            if self.page_size < 1 or self.page_size & (self.page_size - 1):
+                raise ConfigError(
+                    f"model.cache_groups.{self.group_id}.page_size",
+                    "CACHE_GROUP_PAGE_SIZE_INVALID",
+                    "page_size must be a power of two",
+                )
+            if self.page_size > 256:
+                raise ConfigError(
+                    f"model.cache_groups.{self.group_id}.page_size",
+                    "CACHE_GROUP_PAGE_SIZE_TOO_LARGE",
+                    "page_size must not exceed 256",
+                )
 
     def local_kv_heads(self, tp_size: int) -> int:
         if self.kind is CacheLayerKind.MAMBA:
@@ -553,6 +577,10 @@ class PhysicalCachePlan(ConfigMixin):
     max_sequences: int
     max_model_len: int
     groups: tuple[PhysicalCacheGroupPlan, ...]
+    #: Alignment the planner charged every group with. The materializer must
+    #: use this exact value, otherwise a slab allocates to a different size than
+    #: the capacity snapshot was frozen from.
+    alignment_bytes: int = DEFAULT_KV_ALIGNMENT_BYTES
 
     def __post_init__(self) -> None:
         if self.allocated_bytes + self.unallocated_bytes != self.device_kv_budget_bytes:
@@ -566,6 +594,16 @@ class PhysicalCachePlan(ConfigMixin):
                 "cache.physical.groups",
                 "PHYSICAL_CACHE_GROUP_SUM_MISMATCH",
                 "group capacities must sum to allocated bytes",
+            )
+        if (
+            isinstance(self.alignment_bytes, bool)
+            or not isinstance(self.alignment_bytes, int)
+            or self.alignment_bytes <= 0
+        ):
+            raise ConfigError(
+                "cache.physical.alignment_bytes",
+                "PHYSICAL_CACHE_ALIGNMENT_INVALID",
+                "cache alignment must be a positive integer number of bytes",
             )
 
     def group(self, group_id: str) -> PhysicalCacheGroupPlan:
@@ -646,14 +684,15 @@ def plan_cache(
     )
     plans: list[CacheGroupPlan] = []
     for geometry in groups:
+        page_size = config.block_size if geometry.page_size is None else geometry.page_size
         bytes_per_token = geometry.token_bytes(config.kv_dtype, tp_size)
         plans.append(
             CacheGroupPlan(
                 geometry=geometry,
-                page_size=config.block_size,
+                page_size=page_size,
                 dtype=config.kv_dtype,
                 bytes_per_token=bytes_per_token,
-                bytes_per_page=bytes_per_token * config.block_size,
+                bytes_per_page=bytes_per_token * page_size,
                 state_bytes_per_sequence=geometry.sequence_state_bytes(config.kv_dtype, tp_size),
                 prefix_reusable=prefix_reusable,
                 layout=config.layout,

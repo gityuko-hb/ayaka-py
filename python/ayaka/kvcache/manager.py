@@ -17,7 +17,11 @@ from ayaka.kvcache.retention.range import retained_page_range
 from ayaka.memory.capacity import CapacitySnapshot, ResourceGeneration
 from ayaka.memory.ledger import MemoryLedger
 from ayaka.memory.manager import RuntimeMemoryManager
-from ayaka.memory.pressure import MemoryPressureResult, SequencePreemptionResult
+from ayaka.memory.pressure import (
+    MemoryPressureResult,
+    SequencePreemptionResult,
+    SequenceTruncationResult,
+)
 from ayaka.memory.sequence import GroupedSequenceSnapshot, SequenceMemorySnapshot
 from ayaka.memory.state import ReleaseStatus, ReservationFailure
 from ayaka.memory.views import (
@@ -105,14 +109,20 @@ class LogicalKVManager:
     def fingerprint(self) -> tuple[str, ...]:
         """Immutable identity of the bound physical slabs.
 
-        Group name, ledger label and geometry; a capacity snapshot must carry
-        exactly this fingerprint before it can be frozen onto this manager.
+        One entry per group naming the group, its ledger claim, the full storage
+        compatibility key (family, local head/latent geometry, page size, dtype,
+        layout, quantization), the layer count and the materialized capacity. A
+        capacity snapshot must carry exactly this fingerprint before it can be
+        frozen onto this manager: a geometry change that keeps page size and
+        page count identical (dtype, layout, local heads, quantization) still
+        changes the identity.
         """
-        return tuple(
-            f"{name}:{lease.label}:{lease.storage.spec.capacity_pages}:"
-            f"{lease.storage.spec.page_size}"
-            for name, lease in sorted(self.storages.items())
-        )
+        entries: list[str] = []
+        for name, lease in sorted(self.storages.items()):
+            spec = lease.storage.spec
+            key = "|".join(str(part) for part in spec.compatibility_key)
+            entries.append(f"{name}:{lease.label}:{key}:{spec.num_layers}:{spec.capacity_pages}")
+        return tuple(entries)
 
     @property
     def generation(self) -> ResourceGeneration | None:
@@ -186,6 +196,24 @@ class LogicalKVManager:
         """Release request-owned KV while preserving sequence identity."""
         self._require_open()
         return self.backend.preempt_sequence(sequence, safe_epoch=safe_epoch)
+
+    def truncate_sequence(
+        self,
+        sequence: SequenceHandle,
+        num_tokens: int,
+        *,
+        safe_epoch: int | None = None,
+    ) -> SequenceTruncationResult:
+        """Release a sequence's committed suffix above ``num_tokens``.
+
+        Suffix-only on the homogeneous and full-retention grouped paths: pages
+        still shared with a fork sibling, prefix cache, or pin stay allocated
+        under their remaining owners while this sequence's request reference
+        is dropped. The sequence version bumps, so frozen plans and execution
+        views become stale and are rejected by :meth:`validate_view`.
+        """
+        self._require_open()
+        return self.backend.truncate_sequence(sequence, num_tokens, safe_epoch=safe_epoch)
 
     @property
     def current_epoch(self) -> int:

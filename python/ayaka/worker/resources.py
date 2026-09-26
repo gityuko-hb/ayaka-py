@@ -38,6 +38,7 @@ from ayaka.kvcache.resize import (
     ResizeRejectionReason,
 )
 from ayaka.kvcache.storage.geometry import MHAStorageSpec
+from ayaka.kvcache.storage.layout import DEFAULT_KV_ALIGNMENT_BYTES
 from ayaka.memory.caching import CachingAllocator
 from ayaka.memory.capacity import (
     CapacityFreeze,
@@ -85,6 +86,9 @@ class WorkerResourcePlan:
     max_num_requests: int | None = None
     tiering: TieringConfig | None = None
     max_inflight_bytes: int | None = None
+    #: Alignment the KV slab is charged with; must match the planner's cost
+    #: model for this geometry.
+    alignment_bytes: int = DEFAULT_KV_ALIGNMENT_BYTES
 
     @property
     def lane(self) -> MemoryLane:
@@ -92,7 +96,8 @@ class WorkerResourcePlan:
 
     def budget(self) -> tuple[int, int, int]:
         """Return policy, KV and total budgets before materializing anything."""
-        slab = self.storage_spec.aligned_total_bytes(256) + LEDGER_OVERHEAD_BYTES
+        require_int(self.alignment_bytes, "alignment_bytes", minimum=1)
+        slab = self.storage_spec.aligned_total_bytes(self.alignment_bytes) + LEDGER_OVERHEAD_BYTES
         if self.lane is MemoryLane.CUDA:
             total = self.device_total_bytes
             if total is None:
@@ -179,6 +184,7 @@ class WorkerResourcePlan:
                 label="serving.kv",
                 device=str(self.device),
                 zero_initialize=True,
+                alignment_bytes=self.alignment_bytes,
             )
             rollback.callback(storage.close)
             tier_release: Callable[[], None] | None = None
@@ -202,7 +208,8 @@ class WorkerResourcePlan:
                     tier=claim_tier(
                         MemoryOwner.WORKSPACE,
                         lane=self.lane,
-                        pinned_host=self.lane is MemoryLane.CUDA,
+                        pinned_host=host_mirror.pinned,
+                        pageable_host=not host_mirror.pinned,
                     ),
                     device_index=index,
                 )
@@ -281,8 +288,8 @@ class WorkerResourcePlan:
                 lane=self.lane,
                 dtype=str(self.storage_spec.dtype).removeprefix("torch."),
                 kv_dtype=str(self.storage_spec.dtype).removeprefix("torch."),
-                page_size=self.storage_spec.page_size,
                 group_pages={"default": self.storage_spec.capacity_pages},
+                group_page_sizes={"default": self.storage_spec.page_size},
                 max_model_len=self.max_model_len,
                 max_num_seqs=self.max_num_seqs,
                 max_num_batched_tokens=self.max_num_batched_tokens,
@@ -295,7 +302,11 @@ class WorkerResourcePlan:
                 kv_budget_bytes=kv_budget,
                 weights_bytes=self.weights_bytes,
                 ledger=ledger,
-                staging_pinned=self.lane is MemoryLane.CUDA,
+                staging_tier=(
+                    MemoryTier.HOST_PAGEABLE
+                    if host_mirror is not None and not host_mirror.pinned
+                    else MemoryTier.HOST_PINNED
+                ),
                 runner_buffer_bytes=self.buffer_spec.device_bytes,
             )
             kv.bind_capacity(capacity)
@@ -503,6 +514,7 @@ def build_configured_resources(
                                 MemoryOwner.WORKSPACE,
                                 lane=lane,
                                 pinned_host=mirror.pinned,
+                                pageable_host=not mirror.pinned,
                             ),
                             device_index=device_index,
                         )
@@ -544,8 +556,8 @@ def build_configured_resources(
             lane=lane,
             dtype=compute_dtype.label,
             kv_dtype=cache_config.kv_dtype.label,
-            page_size=plan.storage_specs[0][1].page_size,
             group_pages={group.group_id: group.num_pages for group in plan.physical.groups},
+            group_page_sizes={group_id: spec.page_size for group_id, spec in plan.storage_specs},
             max_model_len=plan.max_model_len,
             max_num_seqs=scheduler.max_num_seqs,
             max_num_batched_tokens=scheduler.max_num_batched_tokens,
@@ -558,7 +570,7 @@ def build_configured_resources(
             kv_budget_bytes=plan.memory.kv_cache_bytes,
             weights_bytes=profile.weights_bytes if profile else 0,
             ledger=ledger,
-            staging_pinned=mirror_pinned,
+            staging_tier=(MemoryTier.HOST_PINNED if mirror_pinned else MemoryTier.HOST_PAGEABLE),
         )
         kv.bind_capacity(capacity)
         resources = WorkerResources(ledger, kv, leases, capacity, tier_release=tier_release)
