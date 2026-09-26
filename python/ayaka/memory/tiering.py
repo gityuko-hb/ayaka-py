@@ -39,6 +39,7 @@ from ayaka.memory.state import PageAllocationState
 from ayaka.obs import runtime_event
 from ayaka.prefix.identity import PrefixBlockIdentity, PrefixCacheContext
 from ayaka.prefix.interface import CachedBlockInfo
+from ayaka.types import MemoryTier
 from ayaka.utils.torch_utils import require_torch
 
 
@@ -215,6 +216,11 @@ class HostKVStorage:
     Pinned memory is used whenever CUDA is available, because only pinned
     staging buffers give asynchronous, overlap-capable copies; on a CPU-only
     host the mirror degrades to ordinary CPU tensors and stays functional.
+
+    ``allow_pageable_fallback`` is the allocation-time half of the host memory
+    policy: a pinned mirror whose allocation fails may retry pageable only when
+    the policy allows it. ``actual_tier`` reports what the attempt produced, so
+    the ledger charge follows the machine rather than the request.
     """
 
     def __init__(
@@ -223,6 +229,7 @@ class HostKVStorage:
         *,
         capacity_pages: int,
         pin_memory: bool | None = None,
+        allow_pageable_fallback: bool = True,
     ) -> None:
         if capacity_pages <= 0:
             raise ValueError("host capacity_pages must be positive")
@@ -248,7 +255,7 @@ class HostKVStorage:
             )
             pinned = requested_pinned
         except RuntimeError as exc:  # pragma: no cover - real failure is host-dependent
-            if not requested_pinned:
+            if not requested_pinned or not allow_pageable_fallback:
                 raise StorageUnavailableError("host KV mirror allocation failed") from exc
             try:
                 first, second = self._allocate_all(
@@ -313,6 +320,11 @@ class HostKVStorage:
     def pinned(self) -> bool:
         """Whether the mirror is page-locked and therefore DMA-capable."""
         return self._pinned
+
+    @property
+    def actual_tier(self) -> MemoryTier:
+        """The tier this mirror actually is; never a copy of the request."""
+        return MemoryTier.HOST_PINNED if self._pinned else MemoryTier.HOST_PAGEABLE
 
     @property
     def bytes_per_page(self) -> int:
@@ -831,8 +843,130 @@ class HostTierSnapshot:
         return self.device_blocks + self.host_blocks + self.evicting_blocks + self.promoting_blocks
 
 
+@dataclass(frozen=True, slots=True)
+class TieringMetrics:
+    """Aggregate tiering observability across one or more cache groups.
+
+    ``HostTierSnapshot`` is the per-group placement report; this type adds the
+    transfer byte counters, the host pin kind and the shared in-flight budget,
+    so a metrics exporter can read one value per declared series per scrape.
+    """
+
+    host_capacity_pages: int
+    host_used_slots: int
+    device_blocks: int
+    host_blocks: int
+    evicting_blocks: int
+    promoting_blocks: int
+    quarantined_blocks: int
+    spills_total: int
+    promotions_total: int
+    spill_aborts_total: int
+    promotion_aborts_total: int
+    dropped_host_blocks_total: int
+    submitted_total: int
+    completed_total: int
+    failed_total: int
+    bytes_to_host_total: int
+    bytes_to_device_total: int
+    pending_transfers: int
+    host_pinned: bool
+    host_mirror_bytes: int
+    transfer_limit_bytes: int
+    transfer_held_bytes: int
+
+    def __post_init__(self) -> None:
+        counts = (
+            self.host_capacity_pages,
+            self.host_used_slots,
+            self.device_blocks,
+            self.host_blocks,
+            self.evicting_blocks,
+            self.promoting_blocks,
+            self.quarantined_blocks,
+            self.spills_total,
+            self.promotions_total,
+            self.spill_aborts_total,
+            self.promotion_aborts_total,
+            self.dropped_host_blocks_total,
+            self.submitted_total,
+            self.completed_total,
+            self.failed_total,
+            self.bytes_to_host_total,
+            self.bytes_to_device_total,
+            self.pending_transfers,
+            self.host_mirror_bytes,
+            self.transfer_limit_bytes,
+            self.transfer_held_bytes,
+        )
+        if any(value < 0 for value in counts):
+            raise ValueError("tiering-metric counts must be non-negative")
+        if self.host_used_slots > self.host_capacity_pages:
+            raise ValueError("host used slots exceed host capacity")
+        if self.transfer_limit_bytes > 0 and self.transfer_held_bytes > self.transfer_limit_bytes:
+            raise ValueError("transfer credits held exceed the transfer limit")
+
+    @property
+    def host_free_slots(self) -> int:
+        return self.host_capacity_pages - self.host_used_slots
+
+    @property
+    def host_utilization(self) -> float:
+        if self.host_capacity_pages == 0:
+            return 0.0
+        return self.host_used_slots / self.host_capacity_pages
+
+    @property
+    def bytes_moved_total(self) -> int:
+        return self.bytes_to_host_total + self.bytes_to_device_total
+
+    @classmethod
+    def from_snapshots(
+        cls,
+        snapshots: Sequence[HostTierSnapshot],
+        *,
+        host_pinned: bool,
+        host_mirror_bytes: int,
+        transfer_limit_bytes: int,
+        transfer_held_bytes: int,
+    ) -> TieringMetrics:
+        """Sum per-group placement reports into one tiering reading."""
+        if not snapshots:
+            raise ValueError("tiering metrics need at least one tier snapshot")
+        return cls(
+            host_capacity_pages=sum(snapshot.host_capacity_pages for snapshot in snapshots),
+            host_used_slots=sum(snapshot.host_used_slots for snapshot in snapshots),
+            device_blocks=sum(snapshot.device_blocks for snapshot in snapshots),
+            host_blocks=sum(snapshot.host_blocks for snapshot in snapshots),
+            evicting_blocks=sum(snapshot.evicting_blocks for snapshot in snapshots),
+            promoting_blocks=sum(snapshot.promoting_blocks for snapshot in snapshots),
+            quarantined_blocks=sum(snapshot.quarantined_blocks for snapshot in snapshots),
+            spills_total=sum(snapshot.spills_total for snapshot in snapshots),
+            promotions_total=sum(snapshot.promotions_total for snapshot in snapshots),
+            spill_aborts_total=sum(snapshot.spill_aborts_total for snapshot in snapshots),
+            promotion_aborts_total=sum(snapshot.promotion_aborts_total for snapshot in snapshots),
+            dropped_host_blocks_total=sum(
+                snapshot.dropped_host_blocks_total for snapshot in snapshots
+            ),
+            submitted_total=sum(snapshot.transfers.submitted_total for snapshot in snapshots),
+            completed_total=sum(snapshot.transfers.completed_total for snapshot in snapshots),
+            failed_total=sum(snapshot.transfers.failed_total for snapshot in snapshots),
+            bytes_to_host_total=sum(
+                snapshot.transfers.bytes_to_host_total for snapshot in snapshots
+            ),
+            bytes_to_device_total=sum(
+                snapshot.transfers.bytes_to_device_total for snapshot in snapshots
+            ),
+            pending_transfers=sum(snapshot.transfers.pending for snapshot in snapshots),
+            host_pinned=host_pinned,
+            host_mirror_bytes=host_mirror_bytes,
+            transfer_limit_bytes=transfer_limit_bytes,
+            transfer_held_bytes=transfer_held_bytes,
+        )
+
+
 class TierManager:
-    """Single authority over where each cached block's bytes live (A11-02).
+    """Single authority over where each cached block's bytes live.
 
     It owns no scheduler-visible surface: it never sees requests, never
     touches sequence page tables, and reaches the allocator only through the

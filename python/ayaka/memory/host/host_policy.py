@@ -28,6 +28,7 @@ import os
 from dataclasses import dataclass
 from typing import Protocol
 
+from ayaka.types import MemoryTier
 from ayaka.utils.host_info import (
     cgroup_memory,
     host_available_bytes,
@@ -39,35 +40,38 @@ from ayaka.utils.host_info import (
 __all__ = [
     "HostMemoryFacts",
     "HostMemoryPolicy",
-    "HostTierSettings",
+    "HostLimitsSettings",
+    "MirrorDecision",
     "PinDecision",
     "PinRefusal",
     "probe_host_memory",
 ]
 
 
-class HostTierSettings(Protocol):
-    """The five ``CacheConfig`` fields this policy reads.
+class HostLimitsSettings(Protocol):
+    """The four operator ceilings this policy reads.
 
-    A Protocol rather than importing ``CacheConfig``: ``ayaka.memory`` has no
-    business depending on the config schema for one constructor, and structural
-    typing means mypy still checks the shape at every call site.
+    A Protocol rather than importing the config schema: ``ayaka.memory`` has no
+    business depending on it, and structural typing still checks the shape at
+    every call site. The values come from ``MemoryConfig.host``
+    (``HostMemoryLimits``); the requested tier size comes from
+    ``CacheConfig.tiering.host_bytes``.
     """
 
     @property
-    def host_tier_bytes(self) -> int: ...
+    def pinned_max_bytes(self) -> int | None: ...
 
     @property
-    def host_pinned_max_bytes(self) -> int | None: ...
+    def pinned_max_ratio(self) -> float: ...
 
     @property
-    def host_pinned_max_ratio(self) -> float: ...
+    def min_available_bytes(self) -> int: ...
 
     @property
-    def host_min_available_bytes(self) -> int: ...
+    def min_available_ratio(self) -> float: ...
 
     @property
-    def host_min_available_ratio(self) -> float: ...
+    def allow_pageable_fallback(self) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +168,39 @@ class PinDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class MirrorDecision:
+    """Where one host KV mirror should actually be allocated.
+
+    ``tier`` is ``None`` only when the request is refused. A fallback decision
+    is still an allowed decision: the caller must build the mirror at
+    ``tier`` and charge the ledger there, while logging ``reason``.
+    """
+
+    allowed: bool
+    tier: MemoryTier | None = None
+    fallback: bool = False
+    reason: PinRefusal | None = None
+    requested_bytes: int = 0
+    headroom_bytes: int = 0
+
+    def __bool__(self) -> bool:
+        return self.allowed
+
+    def __post_init__(self) -> None:
+        if self.allowed and self.tier is None:
+            raise ValueError("an allowed mirror decision must name a tier")
+        if not self.allowed and self.tier is not None:
+            raise ValueError("a refused mirror decision cannot name a tier")
+        if self.fallback and not self.allowed:
+            raise ValueError("a refused mirror decision cannot be a fallback")
+        if self.tier is not None and self.tier not in (
+            MemoryTier.HOST_PINNED,
+            MemoryTier.HOST_PAGEABLE,
+        ):
+            raise ValueError(f"{self.tier} is not a host tier")
+
+
+@dataclass(frozen=True, slots=True)
 class HostMemoryPolicy:
     """Resolves config plus facts into one number, and gates runtime pinning.
 
@@ -177,6 +214,10 @@ class HostMemoryPolicy:
     host_pinned_max_ratio: float = 0.25
     host_min_available_bytes: int = 4 << 30
     host_min_available_ratio: float = 0.10
+    #: Whether a refused pinned mirror may degrade to pageable memory. A
+    #: pageable mirror keeps the tier functional at reduced DMA throughput;
+    #: ``False`` makes the pin ceiling a hard startup refusal.
+    allow_pageable_fallback: bool = True
     facts: HostMemoryFacts = HostMemoryFacts()
 
     def __post_init__(self) -> None:
@@ -192,18 +233,33 @@ class HostMemoryPolicy:
             )
         if self.host_pinned_max_bytes is not None and self.host_pinned_max_bytes < 0:
             raise ValueError("host_pinned_max_bytes must be non-negative")
+        if not isinstance(self.allow_pageable_fallback, bool):
+            raise TypeError("allow_pageable_fallback must be a bool")
 
     @classmethod
-    def from_cache_config(
-        cls, cache: HostTierSettings, facts: HostMemoryFacts | None = None
+    def from_limits(
+        cls,
+        host_tier_bytes: int,
+        limits: HostLimitsSettings,
+        facts: HostMemoryFacts | None = None,
+        *,
+        allow_pageable_fallback: bool | None = None,
     ) -> HostMemoryPolicy:
-        """Build from a ``CacheConfig`` (or anything with the same five fields)."""
+        """Combine the requested tier size with the operator ceilings.
+
+        ``limits`` is ``MemoryConfig.host`` (a ``HostMemoryLimits``); the
+        machine facts are probed once here and refreshed only when a caller
+        explicitly re-probes through :meth:`can_pin`.
+        """
+        if allow_pageable_fallback is None:
+            allow_pageable_fallback = limits.allow_pageable_fallback
         return cls(
-            host_tier_bytes=cache.host_tier_bytes,
-            host_pinned_max_bytes=cache.host_pinned_max_bytes,
-            host_pinned_max_ratio=cache.host_pinned_max_ratio,
-            host_min_available_bytes=cache.host_min_available_bytes,
-            host_min_available_ratio=cache.host_min_available_ratio,
+            host_tier_bytes=host_tier_bytes,
+            host_pinned_max_bytes=limits.pinned_max_bytes,
+            host_pinned_max_ratio=limits.pinned_max_ratio,
+            host_min_available_bytes=limits.min_available_bytes,
+            host_min_available_ratio=limits.min_available_ratio,
+            allow_pageable_fallback=allow_pageable_fallback,
             facts=facts if facts is not None else probe_host_memory(),
         )
 
@@ -232,13 +288,20 @@ class HostMemoryPolicy:
         return max(available - self.available_floor_bytes, 0)
 
     def effective_pinned_limit(self) -> int:
-        """The minimum over every constraint.
+        """The total pinned-memory ceiling: the minimum of every real constraint.
 
-        When the machine is unknown (no ``/proc``, no cgroup) the system ceiling
-        drops out and the operator's request stands — refusing to run because a
-        probe failed would be worse than trusting the number a human typed.
+        ``host_tier_bytes`` is the *requested mirror size*, not a ceiling: a
+        resize may briefly hold the replacement mirror while the old one is
+        still pinned, and a SWAP must be allowed when the machine ceiling has
+        room for both. The request itself is bounded by :meth:`can_pin`, which
+        compares the actual bytes against this limit.
+
+        When the machine is unknown (no ``/proc``, no cgroup) no system ceiling
+        exists and the operator's requested tier size stands — refusing to run
+        because a probe failed would be worse than trusting the number a human
+        typed.
         """
-        limits = [self.host_tier_bytes]
+        limits: list[int] = []
         if self.host_pinned_max_bytes is not None:
             limits.append(self.host_pinned_max_bytes)
         scope = self.facts.scope_total_bytes
@@ -246,6 +309,8 @@ class HostMemoryPolicy:
             limits.append(int(scope * self.host_pinned_max_ratio))
         if self.facts.scope_available_bytes is not None:
             limits.append(self.physical_headroom_bytes)
+        if not limits:
+            return max(self.host_tier_bytes, 0)
         return max(min(limits), 0)
 
     def explain(self) -> str:
@@ -366,6 +431,64 @@ class HostMemoryPolicy:
                 headroom,
             )
         return PinDecision(True, None, nbytes, headroom)
+
+    def decide_mirror(
+        self,
+        nbytes: int,
+        *,
+        requested_tier: MemoryTier,
+        already_pinned_bytes: int,
+        facts: HostMemoryFacts | None = None,
+    ) -> MirrorDecision:
+        """Resolve the tier a host KV mirror is actually allowed to use.
+
+        A pageable request never consults the pin ceiling: pageable memory is
+        reclaimable and carries no host-OOM risk. A pinned request that the
+        ceiling refuses degrades to pageable only when the caller's policy
+        allows it; otherwise the mirror is refused and the caller decides
+        between a startup error and a retryable rejection.
+        """
+        if requested_tier is MemoryTier.HOST_PAGEABLE:
+            return MirrorDecision(
+                True,
+                tier=MemoryTier.HOST_PAGEABLE,
+                fallback=False,
+                requested_bytes=nbytes,
+                headroom_bytes=self.effective_pinned_limit(),
+            )
+        if requested_tier is not MemoryTier.HOST_PINNED:
+            raise ValueError(f"{requested_tier} is not a host tier")
+        decision = self.can_pin(
+            nbytes,
+            already_pinned_bytes=already_pinned_bytes,
+            facts=facts,
+        )
+        if decision:
+            return MirrorDecision(
+                True,
+                tier=MemoryTier.HOST_PINNED,
+                fallback=False,
+                reason=None,
+                requested_bytes=nbytes,
+                headroom_bytes=decision.headroom_bytes,
+            )
+        if self.allow_pageable_fallback:
+            return MirrorDecision(
+                True,
+                tier=MemoryTier.HOST_PAGEABLE,
+                fallback=True,
+                reason=decision.reason,
+                requested_bytes=nbytes,
+                headroom_bytes=decision.headroom_bytes,
+            )
+        return MirrorDecision(
+            False,
+            tier=None,
+            fallback=False,
+            reason=decision.reason,
+            requested_bytes=nbytes,
+            headroom_bytes=decision.headroom_bytes,
+        )
 
 
 # ────────────────────────────── probes ───────────────────────────────────────

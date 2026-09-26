@@ -19,6 +19,7 @@ machine in :mod:`ayaka.memory.transaction` but not the manager itself.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from threading import RLock
@@ -45,7 +46,11 @@ from ayaka.memory.pressure import (
     MemoryPressureResult,
     PreemptionStatus,
     PressureAction,
+    PressureOutcome,
+    PressurePolicy,
+    PressureSnapshot,
     PressureStatus,
+    PressureStopReason,
     SequencePreemptionResult,
     SequenceTruncationResult,
 )
@@ -62,6 +67,7 @@ from ayaka.memory.tiering import (
     PromotedBlock,
     ReadinessState,
     TieringConfig,
+    TieringMetrics,
     TierManager,
     TransferBudget,
     TransferBudgetExhausted,
@@ -140,6 +146,7 @@ class RuntimeMemoryManager:
         self.storage = storage
         self._validate_storage(storage, total_pages=total_pages, page_size=page_size)
         self.host_storage = host_storage
+        self._transfer_budget = transfer_budget
 
         # Tiering is strictly opt-in: with no config the manager keeps the
         # GPU-only code path, allocations included.
@@ -357,6 +364,93 @@ class RuntimeMemoryManager:
                     self._pressure_prefix_eviction_progress_total
                 ),
                 pressure_preemptions_total=self._pressure_preemptions_total,
+            )
+
+    def tier_metrics(self) -> TieringMetrics | None:
+        """Aggregate host-tier placement, transfer and budget accounting.
+
+        Returns ``None`` when tiering is off, so a metrics scrape needs no
+        capability check.
+        """
+        with self._lock:
+            if self._tier is None:
+                return None
+            snapshot = self._tier.snapshot()
+            budget = self._transfer_budget
+            mirror = self.host_storage
+            return TieringMetrics.from_snapshots(
+                (snapshot,),
+                host_pinned=False if mirror is None else bool(mirror.pinned),
+                host_mirror_bytes=0 if mirror is None else int(mirror.total_bytes),
+                transfer_limit_bytes=int(getattr(budget, "limit", 0) or 0),
+                transfer_held_bytes=int(getattr(budget, "held", 0) or 0),
+            )
+
+    def pressure_snapshot(
+        self,
+        *,
+        host_pin_limit_bytes: int = 0,
+        timestamp_ns: int | None = None,
+    ) -> PressureSnapshot:
+        """Return one advisory capacity reading across device and host tiers.
+
+        The reading is a report, never a reservation. ``host_pin_limit_bytes``
+        is the effective pin ceiling resolved by the host policy; the manager
+        cannot know it because it is derived from machine facts at bootstrap.
+        """
+        if not isinstance(host_pin_limit_bytes, int) or isinstance(host_pin_limit_bytes, bool):
+            raise TypeError("host_pin_limit_bytes must be an integer")
+        if host_pin_limit_bytes < 0:
+            raise ValueError("host_pin_limit_bytes must be non-negative")
+        with self._lock:
+            capacity = self.snapshot()
+            tier = None if self._tier is None else self._tier.snapshot()
+            budget = self._transfer_budget
+            transfer_limit = int(getattr(budget, "limit", 0) or 0)
+            transfer_held = int(getattr(budget, "held", 0) or 0)
+            mirror = self.host_storage
+            if tier is None:
+                host_capacity_pages = 0
+                host_used_slots = 0
+                host_pinned = False
+                host_mirror_bytes = 0
+                inflight_transfers = 0
+                quarantined_blocks = 0
+            else:
+                host_capacity_pages = tier.host_capacity_pages
+                host_used_slots = tier.host_used_slots
+                host_pinned = False if mirror is None else bool(mirror.pinned)
+                host_mirror_bytes = 0 if mirror is None else int(mirror.total_bytes)
+                inflight_transfers = tier.evicting_blocks + tier.promoting_blocks
+                quarantined_blocks = tier.quarantined_blocks
+            return PressureSnapshot(
+                generation=self.current_epoch,
+                timestamp_ns=time.monotonic_ns() if timestamp_ns is None else timestamp_ns,
+                page_size=capacity.page_size,
+                total_pages=capacity.total_pages,
+                usable_pages=capacity.usable_pages,
+                free_pages=capacity.free_pages,
+                reserved_pages=capacity.reserved_pages,
+                live_pages=capacity.live_pages,
+                reclaim_pending_pages=capacity.deferred_free_pages,
+                permanent_pages=capacity.permanent_pages,
+                request_owned_pages=capacity.request_owned_pages,
+                cache_owned_pages=capacity.cache_owned_pages,
+                shared_pages=capacity.shared_pages,
+                inflight_pages=capacity.inflight_pages,
+                cache_evictable_pages=capacity.cache_evictable_pages,
+                open_transactions=capacity.open_transactions,
+                active_leases=capacity.active_leases,
+                host_capacity_pages=host_capacity_pages,
+                host_used_slots=host_used_slots,
+                host_free_slots=host_capacity_pages - host_used_slots,
+                host_pinned=host_pinned,
+                host_mirror_bytes=host_mirror_bytes,
+                host_pin_limit_bytes=host_pin_limit_bytes,
+                transfer_limit_bytes=transfer_limit,
+                transfer_held_bytes=transfer_held,
+                inflight_transfers=inflight_transfers,
+                quarantined_blocks=quarantined_blocks,
             )
 
     @property
@@ -847,7 +941,12 @@ class RuntimeMemoryManager:
                 cached_pages_after=after_cache.cached_blocks,
             )
 
-    def evict_prefixes_for_pressure(self, required_pages: int) -> MemoryPressureResult:
+    def evict_prefixes_for_pressure(
+        self,
+        required_pages: int,
+        *,
+        max_spill_pages: int | None = None,
+    ) -> MemoryPressureResult:
         """Evict deterministic LRU cache ownership until capacity is gained.
 
         ``required_pages`` is additional free capacity desired by the caller,
@@ -857,6 +956,8 @@ class RuntimeMemoryManager:
 
         Args:
             required_pages: Additional free pages the caller wants.
+            max_spill_pages: Bound on how many pages this call may demote to
+                the host; ``None`` lets the missing-capacity target decide.
 
         Returns:
             A capacity-only outcome report.
@@ -866,6 +967,11 @@ class RuntimeMemoryManager:
             raise TypeError("required_pages must be an integer")
         if required_pages < 0:
             raise ValueError("required_pages must be non-negative")
+        if max_spill_pages is not None:
+            if not isinstance(max_spill_pages, int) or isinstance(max_spill_pages, bool):
+                raise TypeError("max_spill_pages must be an integer or None")
+            if max_spill_pages < 0:
+                raise ValueError("max_spill_pages must be non-negative")
         with self._lock:
             # Landing pending transfers first turns already-spilled blocks
             # into free capacity before anything is dropped outright.
@@ -887,7 +993,11 @@ class RuntimeMemoryManager:
                 # never makes pressure handling weaker than GPU-only mode.
                 missing = desired_free_pages - self.allocator.available_pages()
                 if missing > 0:
-                    self._spill_prefixes_locked(missing)
+                    spill_target = (
+                        missing if max_spill_pages is None else min(missing, max_spill_pages)
+                    )
+                    if spill_target > 0:
+                        self._spill_prefixes_locked(spill_target)
                     evicted += self._land_spills_locked()
                     reclaimed += self.allocator.reclaim_completed()
             # Evict one cache page at a time and reclaim immediately. Stops
@@ -926,6 +1036,109 @@ class RuntimeMemoryManager:
                 cached_pages_before=before_cache.cached_blocks,
                 cached_pages_after=after_cache.cached_blocks,
             )
+
+    def relieve_pressure(
+        self,
+        required_pages: int,
+        *,
+        policy: PressurePolicy | None = None,
+    ) -> PressureOutcome:
+        """Resolve missing capacity in bounded, observable rounds.
+
+        The order is fixed: reclaim pages whose safe epoch completed, demote
+        eligible cold cache pages to the host (bounded by the host watermark),
+        then drop cache-only pages. A round that changes nothing ends the
+        sequence instead of spinning on the owner thread.
+        """
+        if not isinstance(required_pages, int) or isinstance(required_pages, bool):
+            raise TypeError("required_pages must be an integer")
+        if required_pages < 0:
+            raise ValueError("required_pages must be non-negative")
+        policy = policy or PressurePolicy()
+        if not isinstance(policy, PressurePolicy):
+            raise TypeError("policy must be a PressurePolicy")
+        with self._lock:
+            initial = self.allocator.snapshot()
+            target = min(initial.usable_pages, initial.free_pages + required_pages)
+            tier_before = None if self._tier is None else self._tier.snapshot()
+            results: list[MemoryPressureResult] = []
+            blocked_by_host = False
+            for _ in range(policy.max_rounds):
+                reached = self.allocator.available_pages()
+                if reached >= target:
+                    return self._pressure_outcome(
+                        required_pages,
+                        target,
+                        results,
+                        PressureStopReason.SATISFIED,
+                        tier_before,
+                    )
+                reclaim = self.reclaim_deferred()
+                spill_budget: int | None = None
+                if self._tier is not None:
+                    tier = self._tier.snapshot()
+                    free_slots = tier.host_capacity_pages - tier.host_used_slots
+                    headroom = free_slots - policy.host_low_watermark_slots
+                    if headroom <= 0:
+                        blocked_by_host = True
+                        spill_budget = 0
+                    else:
+                        spill_budget = headroom
+                evict = self.evict_prefixes_for_pressure(
+                    min(required_pages, policy.max_pages_per_round),
+                    max_spill_pages=spill_budget,
+                )
+                results.append(evict)
+                if reclaim.made_progress:
+                    results.append(reclaim)
+                if self.allocator.available_pages() >= target:
+                    return self._pressure_outcome(
+                        required_pages,
+                        target,
+                        results,
+                        PressureStopReason.SATISFIED,
+                        tier_before,
+                    )
+                if not evict.made_progress and not reclaim.made_progress:
+                    reason = (
+                        PressureStopReason.HOST_BACKPRESSURE
+                        if blocked_by_host
+                        else PressureStopReason.NO_PROGRESS
+                    )
+                    return self._pressure_outcome(
+                        required_pages,
+                        target,
+                        results,
+                        reason,
+                        tier_before,
+                    )
+            return self._pressure_outcome(
+                required_pages,
+                target,
+                results,
+                PressureStopReason.ROUND_LIMIT,
+                tier_before,
+            )
+
+    def _pressure_outcome(
+        self,
+        requested_pages: int,
+        target: int,
+        results: list[MemoryPressureResult],
+        stop_reason: PressureStopReason,
+        tier_before: HostTierSnapshot | None,
+    ) -> PressureOutcome:
+        demotions = 0
+        if tier_before is not None and self._tier is not None:
+            demotions = max(0, self._tier.snapshot().spills_total - tier_before.spills_total)
+        return PressureOutcome(
+            requested_pages=requested_pages,
+            target_pages=target,
+            reached_pages=self.allocator.available_pages(),
+            results=tuple(results),
+            stop_reason=stop_reason,
+            host_demotions=demotions,
+        )
 
     def spill_prefixes_to_host(self, target_pages: int) -> int:
         """Start moving up to ``target_pages`` LRU cache blocks to the host.
