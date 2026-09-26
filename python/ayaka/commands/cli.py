@@ -1,4 +1,4 @@
-"""Launch a native Ayaka HTTP server from a local QWen, GPT-2, Phi or LLaMA checkpoint."""
+"""Launch a native Ayaka HTTP server from a local QWen, Qwen3, GPT-2, Phi or LLaMA checkpoint."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="ayaka")
     commands = parser.add_subparsers(dest="command", required=True)
     serve = commands.add_parser(
-        "serve", help="serve a native QWen, GPT-2, Phi or LLaMA safetensors checkpoint"
+        "serve", help="serve a native QWen, Qwen3, GPT-2, Phi or LLaMA safetensors checkpoint"
     )
     serve.add_argument("model_path", type=Path)
     serve.add_argument("--tokenizer", type=Path)
@@ -58,6 +58,7 @@ def main(argv=None) -> None:
     from ayaka.models.phi import PhiConfig, PhiForCausalLM, load_phi_weights
     from ayaka.models.qwen import QwenConfig, QwenForCausalLM, load_qwen_weights
     from ayaka.models.qwen2 import Qwen2Config, Qwen2ForCausalLM, load_qwen2_weights
+    from ayaka.models.qwen3 import Qwen3Config, Qwen3ForCausalLM, load_qwen3_weights
     from ayaka.runtime.serving import ServingRuntime
 
     values = json.loads((args.model_path / "config.json").read_text(encoding="utf-8"))
@@ -71,6 +72,11 @@ def main(argv=None) -> None:
             QwenConfig.from_dict(values), device=args.device, dtype=dtype, backend=backend
         )
         load_qwen_weights(model, args.model_path)
+    elif model_type == "qwen3":
+        model = Qwen3ForCausalLM(
+            Qwen3Config.from_dict(values), device=args.device, dtype=dtype, backend=backend
+        )
+        load_qwen3_weights(model, args.model_path)
     elif model_type == "qwen2":
         model = Qwen2ForCausalLM(
             Qwen2Config.from_dict(values), device=args.device, dtype=dtype, backend=backend
@@ -93,7 +99,8 @@ def main(argv=None) -> None:
         load_llama_weights(model, args.model_path)
     else:
         parser.error(
-            "this native runner currently supports model_type in {qwen, qwen2, gpt2, phi, llama}"
+            "this native runner currently supports model_type in "
+            "{qwen, qwen2, qwen3, gpt2, phi, llama}"
         )
     model.eval()
     keys = args.api_key if args.api_key is not None else os.getenv("AYAKA_API_KEY", "")

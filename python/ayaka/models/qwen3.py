@@ -220,6 +220,7 @@ def load_qwen3_weights(
         checkpoint_dir,
         expected=lambda dtype: qwen3_expected_weights(config, dtype),
         bindings=bindings,
+        tolerate_tied_in_checkpoint=True,
         device=device,
         validate=validate,
     )

@@ -297,16 +297,18 @@ class CausalLM[ConfigT: ModelConfigMixin](nn.Module):
         tokens = token_ids.shape[0]
         if positions is None:
             positions = torch.arange(tokens, device=token_ids.device, dtype=torch.int64)
+        key_positions = torch.arange(tokens, device=token_ids.device, dtype=torch.int64)
+        attn_mask = key_positions.unsqueeze(0) <= positions.unsqueeze(1) if is_causal else None
 
         def attention(index: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
-            q = query.transpose(0, 1).unsqueeze(0)
-            k = key.transpose(0, 1).unsqueeze(0)
-            v = value.transpose(0, 1).unsqueeze(0)
+            q = query.transpose(0, 1).unsqueeze(0).contiguous()
+            k = key.transpose(0, 1).unsqueeze(0).contiguous()
+            v = value.transpose(0, 1).unsqueeze(0).contiguous()
             out = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                is_causal=is_causal,
+                attn_mask=attn_mask,
                 scale=self.config.scaling,
                 enable_gqa=q.shape[1] != k.shape[1],
             )
