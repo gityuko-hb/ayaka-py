@@ -266,7 +266,7 @@ def _load_with_extern_mapping(
     return frozenset(consumed)
 
 
-def load_module_weights(
+def _load_module_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
@@ -328,6 +328,35 @@ def load_module_weights(
             if isinstance(owner, BaseLayer):
                 owner.process_weights_after_loading()
     return frozenset(consumed)
+
+
+def load_module_weights(
+    module: nn.Module,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    bindings: Mapping[str, WeightBinding] | ExternMapping | None = None,
+    quantize_mapping: QuantizeMapping | None = None,
+    device: torch.device | str | None = None,
+    finalize: bool = True,
+) -> frozenset[str]:
+    """Load and attest finalized storage, invalidating any earlier load proof.
+
+    Failed or partial loading leaves no readiness proof. CUDA packing is
+    ordered at this bootstrap boundary before any warmup/capture can begin.
+    """
+    from ayaka.execution.model_bootstrap import finalize_loaded_weights
+
+    object.__setattr__(module, "_ayaka_weight_readiness", None)
+    consumed = _load_module_weights(
+        module,
+        weights,
+        bindings=bindings,
+        quantize_mapping=quantize_mapping,
+        device=device,
+        finalize=finalize,
+    )
+    finalize_loaded_weights(module, finalized=finalize)
+    return consumed
 
 
 def _read_plan(

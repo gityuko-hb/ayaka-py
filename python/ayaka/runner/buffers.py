@@ -348,6 +348,8 @@ class FlightBuffers:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if len(token_ids) != len(positions):
             raise ValueError("token ids and positions must have the same length")
+        if any(type(value) is not int or value < 0 for value in (*token_ids, *positions)):
+            raise ValueError("token ids and positions must be non-negative integers")
         return self._tokens.fill(token_ids), self._positions.fill(positions)
 
     def stage_sampling_rows(self, rows: Sequence[int]) -> torch.Tensor:
@@ -401,6 +403,23 @@ class FlightBuffers:
         for table in tables:
             if len(table) != width:
                 raise ValueError("every block-table row must be padded to the staged width")
+        if type(width) is not int or width < 0:
+            raise ValueError("block-table width must be non-negative")
+        for values in (starts, lengths, computed, positions, *(tuple(row) for row in tables)):
+            if any(type(value) is not int or not 0 <= value < 2**31 for value in values):
+                raise ValueError("metadata must contain non-negative int32 values")
+        if (
+            not starts
+            or starts[0] != 0
+            or any(a > b for a, b in zip(starts, starts[1:], strict=False))
+        ):
+            raise ValueError("query offsets must start at zero and be monotonic")
+        if any(c > length for c, length in zip(computed, lengths, strict=True)):
+            raise ValueError("computed lengths cannot exceed sequence lengths")
+        # -1 is an explicit masked store slot on certified backends; no other
+        # negative address is valid. Backend eligibility owns that capability.
+        if any(type(slot) is not int or not -1 <= slot < 2**31 for slot in slots):
+            raise ValueError("slots must be int32 addresses or the masked -1 sentinel")
         query_start_loc = group.query_start_loc.fill(starts)
         seq_lens = group.seq_lens.fill(lengths)
         computed_lens = group.computed_lens.fill(computed)
@@ -457,6 +476,10 @@ class RunnerBufferLease:
         if self._ticket_id is not None and self._ticket_id != ticket_id:
             raise ValueError("runner buffer lease already belongs to another ticket")
         self._ticket_id = ticket_id
+
+    def belongs_to(self, pool: RunnerBuffers) -> bool:
+        """Generation numbers alone cannot distinguish unrelated pool owners."""
+        return self._pool is pool and not self._released
 
     def release(self) -> None:
         """Return the slot to the pool; idempotent."""

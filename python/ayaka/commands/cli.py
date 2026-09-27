@@ -43,7 +43,13 @@ def main(argv=None) -> None:
     serve.add_argument(
         "--decode-graph",
         action="store_true",
+        default=None,
         help="capture pure-decode CUDA graphs at bootstrap (CUDA + triton backend only)",
+    )
+    serve.add_argument(
+        "--execution-config",
+        type=Path,
+        help="versioned per-phase execution JSON (prefill graphs are opt-in)",
     )
     serve.add_argument(
         "--graph-buckets",
@@ -57,6 +63,11 @@ def main(argv=None) -> None:
         help="explicit graph-private reserve; 0 auto-sizes it on the triton backend",
     )
     args = parser.parse_args(argv)
+    from ayaka.execution.phase_config import RequestedOverrides
+
+    execution = None
+    if args.execution_config is not None:
+        execution = RequestedOverrides.parse(args.execution_config.read_text(encoding="utf-8"))
     import torch
     import uvicorn
 
@@ -115,7 +126,7 @@ def main(argv=None) -> None:
     graph_buckets = None
     if args.graph_buckets:
         try:
-            graph_buckets = tuple(sorted({int(part) for part in args.graph_buckets.split(",")}))
+            graph_buckets = tuple(int(part) for part in args.graph_buckets.split(","))
         except ValueError:
             parser.error("--graph-buckets must be a comma-separated list of positive integers")
         if not graph_buckets or graph_buckets[0] < 1:
@@ -134,6 +145,7 @@ def main(argv=None) -> None:
             structured_outputs=not args.disable_structured_outputs,
             decode_graph=args.decode_graph,
             graph_buckets=graph_buckets,
+            execution=execution,
         ),
         pages=args.kv_pages,
         page_size=args.page_size,

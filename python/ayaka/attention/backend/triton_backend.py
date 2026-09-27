@@ -573,6 +573,15 @@ class TritonAttentionMetadataBuilder(BaseAttentionMetadataBuilder[TritonAttentio
             f"window={self.spec.sliding_window}",
             f"heads={self.spec.num_qo_heads}/{self.spec.num_kv_heads}",
             f"dims={self.spec.head_dim_qk}/{self.spec.head_dim_vo}",
+            # Same sizes with new backing still require recapture. Values and
+            # tensor versions are intentionally excluded: staging updates them.
+            repr(
+                tuple(
+                    (name, value.data_ptr(), tuple(value.shape), value.stride())
+                    for name, value in sorted(vars(self).items())
+                    if name.startswith("_graph_") and isinstance(value, torch.Tensor)
+                )
+            ),
         )
         return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:16]
 
