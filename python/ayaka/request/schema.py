@@ -62,7 +62,14 @@ class Request:
     # scheduler breaks ties on arrival_ns so ordering is total and stable.
     priority: int = 0
     arrival_ns: int = 0
+    #: Absolute monotonic nanoseconds by which the request must finish; a
+    #: watchdog over the whole lifecycle.
     deadline_ns: int | None = None
+    #: Absolute monotonic nanoseconds by which the request must leave the
+    #: admission queue.  Distinct from ``deadline_ns``: a request that starts
+    #: running before this bound is allowed to finish under the absolute
+    #: deadline.
+    queue_deadline_ns: int | None = None
 
     # Set at the API edge, carried unchanged to
     # every span the request produces.

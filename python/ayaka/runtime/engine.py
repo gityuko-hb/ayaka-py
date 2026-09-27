@@ -24,6 +24,7 @@ from ayaka.metrics import IterationStats, StatLogger, StatLoggerManager
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.parallel import expand_parallel_request
 from ayaka.request.schema import Request
+from ayaka.request.states import RequestState
 from ayaka.runtime.output import FinishDecision, OutputProcessor
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import DeadlineExceededError, SequenceAllocator
@@ -32,6 +33,19 @@ from ayaka.sched.plan import BatchStepPlan
 from ayaka.serving.router import RemoteKVPending
 
 __all__ = ["Engine"]
+
+#: States in which a request is still queued for admission or first compute.
+#: A queue deadline only expires requests here; once first compute starts, the
+#: absolute request deadline governs instead.
+QUEUED_STATES: frozenset[RequestState] = frozenset(
+    {
+        RequestState.WAITING,
+        RequestState.WAITING_KV,
+        RequestState.WAITING_REMOTE_KV,
+        RequestState.RETRYING,
+        RequestState.ADMITTED,
+    }
+)
 
 
 class Engine:
@@ -89,6 +103,11 @@ class Engine:
         deadline = request.deadline_ns
         if deadline is not None and deadline <= self._clock():
             raise DeadlineExceededError(f"{request.request_id}: deadline elapsed before admission")
+        queue_deadline = request.queue_deadline_ns
+        if queue_deadline is not None and queue_deadline <= self._clock():
+            raise DeadlineExceededError(
+                f"{request.request_id}: queue timeout elapsed before admission"
+            )
         children = expand_parallel_request(request) if request.sampling.n > 1 else None
         if children is None:
             self._output.register(request)
@@ -129,15 +148,30 @@ class Engine:
             return False
         return self._remote_kv.abandon(request_id)
 
-    def abort(self, request_id: str) -> bool:
-        """Abort one request; parallel parents fan out to every child."""
-        children = self._scheduler.children_of(request_id)
-        if children is not None:
-            did = False
-            for child in children:
-                did = self._scheduler.abort(child) or did
-            return did
-        return self._scheduler.abort(request_id)
+    def abort(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        finish_reason: FinishReason | None = None,
+    ) -> bool:
+        """Abort one request; parallel parents fan out to every child.
+
+        A remote-KV park entry is forgotten here so an aborted parked request
+        cannot leak a pending-id tracking entry.
+        """
+        if self._remote_kv is not None:
+            self._remote_kv.discard(request_id)
+            children = self._scheduler.children_of(request_id)
+            if children is not None:
+                for child in children:
+                    self._remote_kv.discard(child)
+        kwargs: dict = {}
+        if reason is not None:
+            kwargs["reason"] = reason
+        if finish_reason is not None:
+            kwargs["finish_reason"] = finish_reason
+        return self._scheduler.abort(request_id, **kwargs)
 
     def step(self) -> bool:
         """One serialized iteration; True when any owner changed state."""
@@ -147,7 +181,20 @@ class Engine:
         now_ns = self._clock()
         for lifecycle in self._requests:
             if lifecycle.token.is_cancelled:
-                if self._scheduler.abort(lifecycle.request_id):
+                if self.abort(lifecycle.request_id):
+                    did = True
+                continue
+            queue_deadline = lifecycle.request.queue_deadline_ns
+            if (
+                queue_deadline is not None
+                and now_ns >= queue_deadline
+                and lifecycle.state in QUEUED_STATES
+            ):
+                if self.abort(
+                    lifecycle.request_id,
+                    reason="queue timeout",
+                    finish_reason=FinishReason.QUEUE_TIMEOUT,
+                ):
                     did = True
                 continue
             deadline = lifecycle.request.deadline_ns
@@ -155,7 +202,7 @@ class Engine:
                 # Expiry cancels publication through the shared abort path: the
                 # executor discards sampled tokens for a cancelled token, and
                 # the terminal cause survives ticket settlement exactly once.
-                if self._scheduler.abort(
+                if self.abort(
                     lifecycle.request_id,
                     reason="deadline exceeded",
                     finish_reason=FinishReason.TIMEOUT,

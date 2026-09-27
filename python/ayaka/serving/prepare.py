@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from ayaka.request.schema import CacheHints, Request, RequestId, StopCriteria
 from ayaka.sampling.params import SamplingParams
 from ayaka.serving.errors import (
     ContextLengthExceededError,
+    DeadlineExceededError,
     InvalidRequestError,
     ModelNotFoundError,
     OverloadedError,
@@ -237,8 +239,15 @@ def chat_messages(messages: list[dict]) -> list[dict]:
 class RequestProcessor:
     """Tokenization stays in its bounded service before scheduler admission."""
 
-    def __init__(self, tokenizer: TokenizerService, config: ServingConfig):
+    def __init__(
+        self,
+        tokenizer: TokenizerService,
+        config: ServingConfig,
+        *,
+        clock: Callable[[], int] | None = None,
+    ):
         self.tokenizer, self.config = tokenizer, config
+        self._clock = clock or time.monotonic_ns
 
     def prepare(
         self,
@@ -248,7 +257,13 @@ class RequestProcessor:
         timings: PrepareTimings | None = None,
     ) -> Request:
         if timings is not None and not timings.ingress_ns:
-            timings.ingress_ns = time.monotonic_ns()
+            timings.ingress_ns = self._clock()
+        # The deadline origin is service ingress, not the end of tokenization:
+        # protocol duration is converted to an absolute monotonic deadline once,
+        # and staging time counts against it.
+        anchor_ns = (
+            timings.ingress_ns if timings is not None and timings.ingress_ns else self._clock()
+        )
         if spec.model != self.config.model:
             raise ModelNotFoundError(f"unknown model: {spec.model}", param="model")
         constraint = constraint_for(spec)
@@ -279,7 +294,7 @@ class RequestProcessor:
             )
         namespace = hashlib.sha256(tenant.encode()).hexdigest()
         if timings is not None:
-            timings.validation_done_ns = time.monotonic_ns()
+            timings.validation_done_ns = self._clock()
         try:
             encoded = self.tokenizer.encode(
                 source,
@@ -293,17 +308,23 @@ class RequestProcessor:
                 raise ContextLengthExceededError(str(exc)) from exc
             raise InvalidRequestError(str(exc)) from exc
         if timings is not None:
-            timings.tokenize_done_ns = time.monotonic_ns()
+            timings.tokenize_done_ns = self._clock()
         if any(t >= self.tokenizer.model_vocab_size for t in spec.stop_token_ids):
             raise InvalidRequestError("stop token ID exceeds model vocabulary")
         stops = (spec.stop,) if isinstance(spec.stop, str) else tuple(spec.stop or ())
-        # Freeze the deadline once, in the monotonic clock domain.  A protocol
+        # Freeze the deadlines once, in the monotonic clock domain.  A protocol
         # duration and the process clock are never compared across domains, and
-        # downstream owners only ever read the absolute ``deadline_ns``.
+        # downstream owners only ever read the absolute values.
         timeout = spec.timeout
         if timeout is None:
             timeout = self.config.default_request_timeout_seconds
-        deadline_ns = None if timeout is None else time.monotonic_ns() + int(timeout * 1e9)
+        deadline_ns = None if timeout is None else anchor_ns + int(timeout * 1e9)
+        queue_timeout = self.config.default_queue_timeout_seconds
+        queue_deadline_ns = None if queue_timeout is None else anchor_ns + int(queue_timeout * 1e9)
+        if queue_deadline_ns is not None and deadline_ns is not None:
+            queue_deadline_ns = min(queue_deadline_ns, deadline_ns)
+        if deadline_ns is not None and self._clock() >= deadline_ns:
+            raise DeadlineExceededError("deadline elapsed during request staging")
         return Request(
             RequestId("req_" + uuid4().hex),
             tuple(encoded.token_ids),
@@ -327,6 +348,7 @@ class RequestProcessor:
             cache=CacheHints(cache_salt=namespace),
             tenant_id=tenant,
             constraint=constraint,
-            arrival_ns=time.monotonic_ns(),
+            arrival_ns=self._clock(),
             deadline_ns=deadline_ns,
+            queue_deadline_ns=queue_deadline_ns,
         )

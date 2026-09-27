@@ -98,6 +98,21 @@ class AccessMiddleware:
                         status_code=413,
                     )
                     return await response(scope, receive, send)
+                if len(messages) >= self.config.max_request_chunks:
+                    # A chunked upload can stay under the byte cap with an
+                    # unbounded number of tiny frames; cap the buffered frame
+                    # count so host memory cannot grow without limit.
+                    self._reject("request_chunks")
+                    response = JSONResponse(
+                        {
+                            "error": {
+                                "type": "request_too_large",
+                                "message": "too many request body chunks",
+                            }
+                        },
+                        status_code=413,
+                    )
+                    return await response(scope, receive, send)
                 messages.append(message)
                 if not message.get("more_body", False):
                     break
@@ -111,9 +126,9 @@ class AccessMiddleware:
 class GenerationResponse(StreamingResponse):
     """Release admission even when the connection disappears during HTTP headers."""
 
-    def __init__(self, *args, pipeline, handle, **kwargs):
+    def __init__(self, *args, pipeline, handle, stats=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.pipeline, self.handle = pipeline, handle
+        self.pipeline, self.handle, self.stats = pipeline, handle, stats
 
     async def __call__(self, scope, receive, send):
         async def stamp_first_write(message):
@@ -123,12 +138,36 @@ class GenerationResponse(StreamingResponse):
                 and message.get("body")
             ):
                 self.handle.first_socket_write_ns = time.monotonic_ns()
+                if self.stats is not None:
+                    self.stats.observe_client_ttft(self.handle.ingress_ns)
             await send(message)
 
         try:
             return await super().__call__(scope, receive, stamp_first_write)
         finally:
             self.pipeline.release(self.handle)
+
+
+class GenerationJSONResponse(JSONResponse):
+    """Non-streaming counterpart: stamp and observe the first socket write."""
+
+    def __init__(self, content, *, handle, stats=None, **kwargs):
+        super().__init__(content, **kwargs)
+        self.handle, self.stats = handle, stats
+
+    async def __call__(self, scope, receive, send):
+        async def stamp_first_write(message):
+            if (
+                not self.handle.first_socket_write_ns
+                and message.get("type") == "http.response.body"
+                and message.get("body")
+            ):
+                self.handle.first_socket_write_ns = time.monotonic_ns()
+                if self.stats is not None:
+                    self.stats.observe_client_ttft(self.handle.ingress_ns)
+            await send(message)
+
+        return await super().__call__(scope, receive, stamp_first_write)
 
 
 async def _body(request):
@@ -232,7 +271,10 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
             "frontend_active": pipeline.active,
             "outstanding": service.outstanding,
             "conservation": service.stats.conservation(outstanding=service.outstanding),
-            "slo": service.stats.slo_summary(),
+            "slo": service.stats.slo_summary(targets=processor.config.slo_targets),
+            "slo_groups": service.stats.slo_groups(),
+            "graph": service.stats.graph_snapshot(),
+            "scheduler": service.stats.scheduler_snapshot(),
             "recent_requests": service.stats.recent(),
         }
 
@@ -287,6 +329,7 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
                 stream(),
                 pipeline=pipeline,
                 handle=handle,
+                stats=getattr(service, "stats", None),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -302,8 +345,11 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
                         result.add(event)
 
                 await _while_connected(request, collect())
-            return JSONResponse(
-                result.response(protocol), headers={"X-Request-ID": str(handle.request.request_id)}
+            return GenerationJSONResponse(
+                result.response(protocol),
+                handle=handle,
+                stats=getattr(service, "stats", None),
+                headers={"X-Request-ID": str(handle.request.request_id)},
             )
         finally:
             pipeline.release(handle)

@@ -39,6 +39,7 @@ class FinishReason(enum.StrEnum):
     ABORT = "abort"
     ERROR = "error"
     TIMEOUT = "timeout"  # request deadline elapsed
+    QUEUE_TIMEOUT = "queue_timeout"  # queued past its admission deadline
 
 
 @dataclass(frozen=True, slots=True)

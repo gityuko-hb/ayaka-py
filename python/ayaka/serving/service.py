@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future
 
 from ayaka.configs.serving import ServingConfig
@@ -19,6 +20,7 @@ from ayaka.kvcache.resize import (
 from ayaka.kvcache.status import CacheStatus
 from ayaka.request.schema import Request
 from ayaka.request.states import RequestState
+from ayaka.sched.outcome import FinishReason
 from ayaka.serving.errors import (
     DeadlineExceededError,
     EngineUnavailableError,
@@ -68,6 +70,32 @@ class _EngineQuarantined(RuntimeError):
 
 class _WorkerFailed(RuntimeError):
     """The device worker left READY; admission must stop."""
+
+
+def _cancel_reason_label(lifecycle) -> str:
+    """Map an internal cancellation cause to a bounded telemetry label."""
+    finish = lifecycle.finish_reason
+    if finish is FinishReason.TIMEOUT:
+        return "deadline"
+    if finish is FinishReason.QUEUE_TIMEOUT:
+        return "queue_timeout"
+    reason = lifecycle.token.reason
+    if reason is None:
+        return "unknown"
+    text = str(reason).lower()
+    if "disconnect" in text:
+        return "disconnect"
+    if "client" in text:
+        return "client"
+    if "deadline" in text:
+        return "deadline"
+    if "queue timeout" in text:
+        return "queue_timeout"
+    if "shutdown" in text or "closing" in text or "stopping" in text:
+        return "shutdown"
+    if "cancel" in text:
+        return "cancel"
+    return "other"
 
 
 class GenerationHandle:
@@ -170,11 +198,14 @@ class ServingService:
         controller=None,
         router=None,
         migration: MigrationController | None = None,
+        clock: Callable[[], int] | None = None,
     ):
         self.engine, self.config = engine, config
-        self.stats = stats or ServingStats()
+        self._clock = clock or time.monotonic_ns
+        self.stats = stats or ServingStats(clock=self._clock, history_size=config.slo_history_size)
         self._commands: queue.Queue = queue.Queue(maxsize=config.max_pending_commands)
-        self._controls: queue.Queue = queue.Queue(maxsize=config.max_pending_commands)
+        control_limit = config.max_pending_controls or config.max_pending_commands
+        self._controls: queue.Queue = queue.Queue(maxsize=control_limit)
         self._handles: dict[str, GenerationHandle] = {}
         self._closing = threading.Event()
         self._stopped = threading.Event()
@@ -326,8 +357,12 @@ class ServingService:
 
     def _admit(self, request, spec, future, timings=None):
         if not future.set_running_or_notify_cancel():
+            # The submitter withdrew before the owner picked the command up;
+            # the request was already counted as submitted.
+            self.stats.record_rejection("withdrawn")
             return
         if not self.ready:
+            self.stats.record_rejection("engine")
             future.set_exception(EngineUnavailableError("engine is closing"))
             return
         admitted_limit = self.config.max_admitted_requests
@@ -336,6 +371,13 @@ class ServingService:
             # ever allocated for a request the service cannot track.
             self.stats.record_rejection("admitted")
             future.set_exception(OverloadedError("too many admitted requests"))
+            return
+        queue_deadline = request.queue_deadline_ns
+        if queue_deadline is not None and queue_deadline <= self._clock():
+            # The request waited past its admission bound in the service queue:
+            # refuse before the engine can allocate anything.
+            self.stats.record_rejection("queue_timeout")
+            future.set_exception(DeadlineExceededError("queue timeout elapsed before admission"))
             return
         try:
             decision = self._router.route(request) if self._router is not None else None
@@ -358,19 +400,22 @@ class ServingService:
             from ayaka.sched.interfaces import OverloadedError as SchedulerOverloaded
 
             if isinstance(exc, SchedulerDeadline):
+                self.stats.record_rejection("deadline")
                 error = DeadlineExceededError(str(exc))
             elif isinstance(exc, SchedulerOverloaded):
                 self.stats.record_rejection("scheduler")
                 error = OverloadedError(str(exc))
             elif isinstance(exc, (ValueError, TypeError)):
+                self.stats.record_rejection("invalid")
                 error = InvalidRequestError(str(exc))
             else:
+                self.stats.record_rejection("engine")
                 _LOG.exception("engine admission failed")
                 error = EngineUnavailableError("engine admission failed")
             future.set_exception(error)
             return
         handle = GenerationHandle(request, spec, self.config)
-        handle.admitted_ns = time.monotonic_ns()
+        handle.admitted_ns = self._clock()
         if timings is not None:
             handle.ingress_ns = timings.ingress_ns
             handle.validation_done_ns = timings.validation_done_ns
@@ -382,12 +427,12 @@ class ServingService:
         for request_id, handle in tuple(self._handles.items()):
             lifecycle = self.engine.requests.get(request_id)
             if handle.cancelled.is_set() and not lifecycle.is_terminal:
-                self.engine.abort(request_id)
+                self.engine.abort(request_id, reason="client cancelled")
             events = self.engine.events(request_id)
             for event in events[handle.cursor :]:
                 handle.cursor += 1
                 if event.usage.completion_tokens:
-                    now_ns = time.monotonic_ns()
+                    now_ns = self._clock()
                     if handle.first_token is None:
                         handle.first_token = time.monotonic() - handle.started
                         handle.first_published_ns = now_ns
@@ -412,7 +457,13 @@ class ServingService:
             status = reason.value if reason is not None else ("cancelled" if cancelled else "error")
             if handle.cancelled.is_set():
                 status = "cancelled"
-            if not handle.error and status not in ("cancelled", "abort", "error", "timeout"):
+            if not handle.error and status not in (
+                "cancelled",
+                "abort",
+                "error",
+                "timeout",
+                "queue_timeout",
+            ):
                 try:
                     for parsed in handle.parser.finish():
                         if not handle.put(parsed):
@@ -438,13 +489,17 @@ class ServingService:
                     else "tool_call"
                     if handle.parser.had_tools
                     else "timeout"
-                    if status == "timeout"
+                    if status in ("timeout", "queue_timeout")
                     else "length"
                     if status == "length"
                     else "stop"
                 )
                 terminal = GenerationFinished(finish, usage)
-            terminal_ns = time.monotonic_ns()
+            cancel_reason = ""
+            if status in ("cancelled", "abort"):
+                cancel_reason = _cancel_reason_label(lifecycle)
+                self.stats.record_cancellation(cancel_reason)
+            terminal_ns = self._clock()
             self.engine.forget(request_id)
             self.engine.executor.runner.forget_request(request_id)
             self.engine.requests.forget(request_id)
@@ -476,9 +531,10 @@ class ServingService:
                     first_socket_write_ns=handle.first_socket_write_ns,
                     last_published_ns=handle.last_published_ns,
                     terminal_ns=terminal_ns,
-                    cleanup_done_ns=time.monotonic_ns(),
+                    cleanup_done_ns=self._clock(),
                     itl_p50_ns=int(itl_p50_ns),
                     itl_p95_ns=int(itl_p95_ns),
+                    cancel_reason=cancel_reason,
                 ),
                 first_token=handle.first_token,
                 itl_samples_ns=tuple(lm_timing.inter_token_intervals_ns),
@@ -494,6 +550,12 @@ class ServingService:
     def _gauges(self):
         self.stats.running.set(self.engine.scheduler.num_running)
         self.stats.waiting.set(self.engine.scheduler.num_waiting)
+        scheduler_stats = getattr(self.engine.scheduler, "stats", None)
+        if scheduler_stats is not None:
+            self.stats.update_scheduler_stats(scheduler_stats)
+        runner = getattr(self.engine.executor, "runner", None)
+        graph_snapshot = getattr(runner, "graph_stats", None)
+        self.stats.update_graph_stats(graph_snapshot() if graph_snapshot is not None else None)
         if self.engine.kv.closed:
             self.stats.kv_free.set(0)
             self.stats.kv_total.set(0)
@@ -588,6 +650,7 @@ class ServingService:
                     except queue.Empty:
                         break
                     if not future.done():
+                        self.stats.record_rejection("engine")
                         future.set_exception(EngineUnavailableError("engine owner stopped"))
                 while True:
                     try:

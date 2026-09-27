@@ -39,6 +39,7 @@ from ayaka.request.schema import Request
 from ayaka.request.stream import OutputEvent
 from ayaka.runtime.collection import OutputCollector, OutputStream
 from ayaka.runtime.llm import AyakaLLM
+from ayaka.sched.interfaces import OverloadedError
 
 __all__ = [
     "CoreOutputClosed",
@@ -55,10 +56,26 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class CoreSubmitResult:
-    """Admission outcome for one submitted request id."""
+    """Admission outcome for one submitted request id.
+
+    ``error_type`` preserves the overload contract across the wire so a host
+    caller can still distinguish a bounded-ingress refusal from an execution
+    failure; ``None`` means the request was admitted.
+    """
 
     request_id: str
     error: str | None = None
+    error_type: str | None = None
+
+
+def _wire_error_type(exc: BaseException) -> str | None:
+    return "overloaded" if isinstance(exc, OverloadedError) else None
+
+
+def _admission_error(result: CoreSubmitResult) -> Exception:
+    if result.error_type == "overloaded":
+        return OverloadedError(result.error or "engine command queue is full")
+    return RuntimeError(result.error or "admission failed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,8 +108,14 @@ class InprocEngineCoreClient(EngineCoreClient):
         *,
         stream_limit: int = 1024,
         idle_interval: float = 0.05,
+        max_pending_commands: int = 256,
     ) -> None:
-        self._llm = AyakaLLM(engine, stream_limit=stream_limit, idle_interval=idle_interval)
+        self._llm = AyakaLLM(
+            engine,
+            stream_limit=stream_limit,
+            idle_interval=idle_interval,
+            max_pending_commands=max_pending_commands,
+        )
 
     def submit(self, request: Request) -> Future[OutputStream]:
         return self._llm.submit(request)
@@ -123,6 +146,7 @@ class EngineCoreServer:
         *,
         idle_interval: float = 0.05,
         stream_limit: int = 1024,
+        max_pending_commands: int = 256,
         context: zmq.Context | None = None,
         bind: bool = True,
         control_endpoint: str | None = None,
@@ -155,6 +179,7 @@ class EngineCoreServer:
             engine,
             stream_limit=stream_limit,
             idle_interval=idle_interval,
+            max_pending_commands=max_pending_commands,
             on_settled=self._on_settled,
             collector_downstream=self,
         )
@@ -198,7 +223,11 @@ class EngineCoreServer:
             try:
                 future = self._llm.submit(request)
             except BaseException as exc:
-                self._send_wire(pickle.dumps(CoreSubmitResult(str(request.request_id), str(exc))))
+                self._send_wire(
+                    pickle.dumps(
+                        CoreSubmitResult(str(request.request_id), str(exc), _wire_error_type(exc))
+                    )
+                )
                 return
             future.add_done_callback(
                 lambda done, rid=str(request.request_id): self._admission_done(rid, done)
@@ -220,7 +249,11 @@ class EngineCoreServer:
             return
         exc = future.exception()
         error = None if exc is None else str(exc)
-        self._send_wire(pickle.dumps(CoreSubmitResult(request_id, error)))
+        self._send_wire(
+            pickle.dumps(
+                CoreSubmitResult(request_id, error, None if exc is None else _wire_error_type(exc))
+            )
+        )
 
     def _send_wire(self, raw: bytes) -> None:
         with self._push_lock:
@@ -370,7 +403,7 @@ class ZmqEngineCoreClient(EngineCoreClient):
         if result.error is not None:
             self._collector.drop(result.request_id)
             self._parallel.pop(result.request_id, None)
-            admission.set_exception(RuntimeError(result.error))
+            admission.set_exception(_admission_error(result))
         else:
             admission.set_result(result)
 
@@ -387,7 +420,7 @@ class ZmqEngineCoreClient(EngineCoreClient):
             return
         result = admission.result()
         if result.error is not None:
-            future.set_exception(RuntimeError(result.error))
+            future.set_exception(_admission_error(result))
             return
         stream = self._collector.get(request_id)
         if stream is None:
@@ -401,6 +434,7 @@ def start_threaded_engine_core(
     *,
     idle_interval: float = 0.05,
     stream_limit: int = 1024,
+    max_pending_commands: int = 256,
     context: zmq.Context | None = None,
 ) -> ZmqEngineCoreClient:
     """Run the engine core on a local thread and return a wired client."""
@@ -408,6 +442,7 @@ def start_threaded_engine_core(
         engine,
         idle_interval=idle_interval,
         stream_limit=stream_limit,
+        max_pending_commands=max_pending_commands,
         context=context,
     )
     return ZmqEngineCoreClient(
@@ -424,6 +459,7 @@ def run_engine_core_process(
     *,
     idle_interval: float = 0.05,
     stream_limit: int = 1024,
+    max_pending_commands: int = 256,
     diagnostics_path: str | None = None,
 ) -> None:
     """Child-process entry: build the engine, bind, report endpoints, serve.
@@ -442,7 +478,12 @@ def run_engine_core_process(
     diag("entry")
     engine = engine_factory()
     diag("engine built")
-    server = EngineCoreServer(engine, idle_interval=idle_interval, stream_limit=stream_limit)
+    server = EngineCoreServer(
+        engine,
+        idle_interval=idle_interval,
+        stream_limit=stream_limit,
+        max_pending_commands=max_pending_commands,
+    )
     diag("bound")
     context = zmq.Context.instance()
     push = context.socket(zmq.PUSH)
@@ -478,6 +519,7 @@ def _engine_core_child(
     bootstrap_endpoint: str,
     idle_interval: float,
     stream_limit: int,
+    max_pending_commands: int,
     diagnostics_path: str | None,
 ) -> None:
     """torch.multiprocessing entry (rank prepended)."""
@@ -486,6 +528,7 @@ def _engine_core_child(
         bootstrap_endpoint,
         idle_interval=idle_interval,
         stream_limit=stream_limit,
+        max_pending_commands=max_pending_commands,
         diagnostics_path=diagnostics_path,
     )
 
@@ -496,6 +539,7 @@ def _spawn_engine_core_process(
     *,
     idle_interval: float,
     stream_limit: int,
+    max_pending_commands: int,
     diagnostics_path: str | None = None,
 ):
     """Spawn the child via ``torch.multiprocessing.spawn``.
@@ -518,6 +562,7 @@ def _spawn_engine_core_process(
             bootstrap_endpoint,
             idle_interval,
             stream_limit,
+            max_pending_commands,
             diagnostics_path,
         ),
         nprocs=1,
@@ -531,6 +576,7 @@ def start_multiproc_engine_core(
     *,
     idle_interval: float = 0.05,
     stream_limit: int = 1024,
+    max_pending_commands: int = 256,
     start_timeout: float = 100.0,
     spawn_timeout: float | None = None,
     diagnostics_path: str | None = None,
@@ -554,6 +600,7 @@ def start_multiproc_engine_core(
             bootstrap_endpoint,
             idle_interval=idle_interval,
             stream_limit=stream_limit,
+            max_pending_commands=max_pending_commands,
             diagnostics_path=diagnostics_path,
         )
         try:

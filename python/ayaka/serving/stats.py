@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
@@ -12,12 +14,29 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, gene
 from ayaka.utils.math_utils import percentiles
 
 if TYPE_CHECKING:
+    from ayaka.configs.serving import SloTargets
     from ayaka.memory.pressure import MemoryPressureMetrics
     from ayaka.memory.tiering import TieringMetrics
 
 #: Prompt-size buckets reported in the SLO summary and fairness test lanes.
 SMALL_PROMPT_TOKENS = 128
 MEDIUM_PROMPT_TOKENS = 1024
+
+#: Terminal statuses counted in the conservation equation.  ``eos`` is the
+#: model's natural stop and ``tool_call`` is accepted for a tool-parser finish;
+#: every settlement status falls in exactly one bucket, and an unknown status
+#: is conservatively bucketed as failed so the equation cannot silently drift.
+_COMPLETED_STATUSES = frozenset({"stop", "length", "eos", "tool_call"})
+_CANCELLED_STATUSES = frozenset({"cancelled", "abort"})
+_TIMED_OUT_STATUSES = frozenset({"timeout", "queue_timeout"})
+_GOODPUT_EXCLUDED_STATUSES = _CANCELLED_STATUSES | _TIMED_OUT_STATUSES | {"error"}
+
+#: Rejection reasons that are counted outside ``submit``: these are refused by
+#: the frontend before a request ever enters the submitted equation.  Every
+#: other reason is an admission-stream refusal by construction.
+_FRONTEND_REJECTION_REASONS = frozenset(
+    {"auth", "request_bytes", "request_chunks", "concurrent", "control"}
+)
 
 
 def _latency_ns(start: int, end: int) -> int | None:
@@ -59,6 +78,7 @@ class UsageRecord:
     cleanup_done_ns: int = 0
     itl_p50_ns: int = 0
     itl_p95_ns: int = 0
+    cancel_reason: str = ""
 
     @property
     def prompt_bucket(self) -> str:
@@ -99,19 +119,34 @@ class UsageRecord:
             return None
         return span // (self.completion_tokens - 1)
 
+    @property
+    def e2e_ns(self) -> int | None:
+        """Service ingress to terminal settlement; the request-visible span."""
+        return _latency_ns(self.ingress_ns, self.terminal_ns)
+
     def as_dict(self) -> dict:
         data = asdict(self)
         data["prompt_bucket"] = self.prompt_bucket
         data["queue_latency_ns"] = self.queue_latency_ns
+        data["tokenizer_latency_ns"] = self.tokenizer_latency_ns
+        data["model_ttft_ns"] = self.model_ttft_ns
         data["service_ttft_ns"] = self.service_ttft_ns
+        data["client_ttft_ns"] = self.client_ttft_ns
+        data["e2e_ns"] = self.e2e_ns
         data["tpot_ns"] = self.tpot_ns
         return data
 
 
 class ServingStats:
-    def __init__(self, *, history_size=128):
+    def __init__(
+        self,
+        *,
+        history_size: int = 128,
+        clock: Callable[[], int] | None = None,
+    ):
         self.registry = CollectorRegistry()
         self._lock = threading.Lock()
+        self._clock = clock or time.monotonic_ns
         self._history: deque[UsageRecord] = deque(maxlen=history_size)
         self.requests = Counter(
             "ayaka_requests", "Finished admitted requests", ["status"], registry=self.registry
@@ -230,11 +265,67 @@ class ServingStats:
             buckets=buckets,
             registry=self.registry,
         )
+        self.client_ttft = Histogram(
+            "ayaka_client_ttft_seconds",
+            "Service ingress to the first socket write",
+            buckets=buckets,
+            registry=self.registry,
+        )
         self.goodput = Counter(
             "ayaka_goodput_requests_total",
             "Requests that finished with a usable completion",
             registry=self.registry,
         )
+        self.prefix_hits = Counter(
+            "ayaka_prefix_cache_hits_total",
+            "Settled requests that consumed a cached prefix",
+            registry=self.registry,
+        )
+        self.prefix_misses = Counter(
+            "ayaka_prefix_cache_misses_total",
+            "Settled requests that forwarded a full prompt",
+            registry=self.registry,
+        )
+        self.cancellations = Counter(
+            "ayaka_cancellations_total",
+            "Terminal cancellations by bounded reason",
+            ["reason"],
+            registry=self.registry,
+        )
+        # Engine-side cumulative counters are published as gauges (one owner
+        # thread sets them idempotently, exactly like the tiering readings).
+        self.preemptions = Gauge(
+            "ayaka_preemptions_total", "Recompute preemptions observed", registry=self.registry
+        )
+        self.recomputed_tokens = Gauge(
+            "ayaka_recomputed_tokens_total",
+            "Prompt tokens forwarded again after preemption",
+            registry=self.registry,
+        )
+        self.wasted_compute_tokens = Gauge(
+            "ayaka_wasted_compute_tokens_total",
+            "Forwarded tokens discarded before publication",
+            registry=self.registry,
+        )
+        self.graph_hits = Gauge(
+            "ayaka_graph_hits_total", "Decode-graph replay hits", registry=self.registry
+        )
+        self.graph_misses = Gauge(
+            "ayaka_graph_misses_total", "Decode-graph replay misses", registry=self.registry
+        )
+        self.graph_captures = Gauge(
+            "ayaka_graph_captures_total", "Decode-graph bucket captures", registry=self.registry
+        )
+        self.graph_eager_fallbacks = Gauge(
+            "ayaka_graph_eager_fallbacks_total",
+            "Decode steps routed back to eager",
+            registry=self.registry,
+        )
+        self.graph_capture_bytes = Gauge(
+            "ayaka_graph_capture_bytes", "Bytes reserved by captured graphs", registry=self.registry
+        )
+        self._graph: dict = {}
+        self._scheduler: dict = {}
         self.conservation_submitted = Counter(
             "ayaka_submitted_requests_total",
             "Requests offered to admission",
@@ -249,6 +340,52 @@ class ServingStats:
     def record_rejection(self, reason: str) -> None:
         """Count one finite admission refusal with a bounded reason label."""
         self.rejected.labels(reason).inc()
+
+    def record_cancellation(self, reason: str) -> None:
+        """Count one terminal cancellation with a bounded reason label."""
+        self.cancellations.labels(reason).inc()
+
+    def observe_client_ttft(self, ingress_ns: int) -> None:
+        """First socket write for a request whose ingress boundary is known."""
+        if ingress_ns <= 0:
+            return
+        elapsed = self._clock() - ingress_ns
+        if elapsed >= 0:
+            self.client_ttft.observe(elapsed / 1e9)
+
+    def update_scheduler_stats(self, stats) -> None:
+        """Publish cumulative scheduler counters; never mutates scheduling."""
+        self.preemptions.set(int(getattr(stats, "preemptions", 0)))
+        self.recomputed_tokens.set(int(getattr(stats, "recomputed_tokens", 0)))
+        self.wasted_compute_tokens.set(int(getattr(stats, "wasted_compute_tokens", 0)))
+        self._scheduler = {
+            "preemptions": int(getattr(stats, "preemptions", 0)),
+            "recomputed_tokens": int(getattr(stats, "recomputed_tokens", 0)),
+            "wasted_compute_tokens": int(getattr(stats, "wasted_compute_tokens", 0)),
+            "transient_prepare_failures": int(getattr(stats, "transient_prepare_failures", 0)),
+            "admission_rejections": int(getattr(stats, "admission_rejections", 0)),
+            "bypasses": int(getattr(stats, "bypasses", 0)),
+        }
+
+    def update_graph_stats(self, stats) -> None:
+        """Publish a runner graph snapshot; the runner keeps the authority."""
+        if stats is None:
+            self._graph = {}
+            return
+        self.graph_hits.set(int(stats.hits))
+        self.graph_misses.set(int(stats.misses))
+        self.graph_captures.set(int(stats.captures))
+        self.graph_eager_fallbacks.set(int(stats.eager_fallbacks))
+        self.graph_capture_bytes.set(int(stats.capture_bytes))
+        self._graph = stats.as_dict()
+
+    def graph_snapshot(self) -> dict:
+        """Latest runner graph view, or empty while graphs are disabled."""
+        return dict(self._graph)
+
+    def scheduler_snapshot(self) -> dict:
+        """Latest cumulative scheduler counters."""
+        return dict(self._scheduler)
 
     def record(
         self,
@@ -265,8 +402,12 @@ class ServingStats:
         self.tokens.labels("completion").inc(record.completion_tokens)
         self.tokens.labels("cached").inc(record.cached_tokens)
         self.duration.observe(record.duration_seconds)
-        if record.status not in ("cancelled", "abort", "error", "timeout"):
+        if record.status not in _GOODPUT_EXCLUDED_STATUSES:
             self.goodput.inc()
+        if record.prefix_hit:
+            self.prefix_hits.inc()
+        else:
+            self.prefix_misses.inc()
         queue = record.queue_latency_ns
         if queue is not None:
             self.queue_latency.observe(queue / 1e9)
@@ -294,28 +435,28 @@ class ServingStats:
     def conservation(self, *, outstanding: int) -> dict[str, int]:
         """Submitted = rejected + admitted; admitted = terminals + outstanding.
 
-        Only admission-stream rejections (ingress/admitted/scheduler) are part
-        of the submitted equation; frontend refusals (auth, body size,
-        concurrency) happen before ``submit`` and are reported separately.
-        Counters and terminals come from the same owner-thread settlement
-        stream, so a passed check is an observed equation, not an estimate.
+        Only admission-stream rejections (ingress/admitted/scheduler/deadline/
+        invalid/engine/withdrawn) are part of the submitted equation; frontend
+        refusals (auth, body size, concurrency, control) happen before
+        ``submit`` and are reported separately.  Counters and terminals come
+        from the same owner-thread settlement stream, so a passed check is an
+        observed equation, not an estimate.
         """
         submitted = int(self.conservation_submitted._value.get())
         admitted = int(self.conservation_admitted._value.get())
-        counts = self.rejection_counts()
-        stream_rejected = int(
-            counts.get("ingress", 0.0)
-            + counts.get("admitted", 0.0)
-            + counts.get("scheduler", 0.0)
+        rejection_counts = self.rejection_counts()
+        total_rejected = int(sum(rejection_counts.values()))
+        frontend_rejected = int(
+            sum(rejection_counts.get(reason, 0.0) for reason in _FRONTEND_REJECTION_REASONS)
         )
-        frontend_rejected = int(sum(counts.values()) - stream_rejected)
-        completed = int(self.requests.labels("stop")._value.get())
-        completed += int(self.requests.labels("length")._value.get())
-        completed += int(self.requests.labels("tool_call")._value.get())
-        cancelled = int(self.requests.labels("cancelled")._value.get())
-        cancelled += int(self.requests.labels("abort")._value.get())
-        failed = int(self.requests.labels("error")._value.get())
-        timed_out = int(self.requests.labels("timeout")._value.get())
+        stream_rejected = total_rejected - frontend_rejected
+        status_counts = self._terminal_counts()
+        completed = sum(status_counts.get(status, 0) for status in _COMPLETED_STATUSES)
+        cancelled = sum(status_counts.get(status, 0) for status in _CANCELLED_STATUSES)
+        timed_out = sum(status_counts.get(status, 0) for status in _TIMED_OUT_STATUSES)
+        failed = status_counts.get("error", 0)
+        classified = completed + cancelled + timed_out + failed
+        failed += sum(status_counts.values()) - classified
         return {
             "submitted": submitted,
             "rejected": stream_rejected,
@@ -328,34 +469,41 @@ class ServingStats:
             "outstanding": outstanding,
         }
 
-    def slo_summary(self) -> dict[str, float | int]:
-        """p50/p95 latency summary over the bounded recent-request history.
+    def _terminal_counts(self) -> dict[str, int]:
+        """Settled terminal counts by status, read from the metric registry."""
+        counts: dict[str, int] = {}
+        for metric in self.requests.collect():
+            for sample in metric.samples:
+                if sample.name == "ayaka_requests_total":
+                    counts[sample.labels["status"]] = int(sample.value)
+        return counts
 
-        Every value comes from raw monotonic boundaries in ``UsageRecord``;
-        requests without a measured boundary are excluded instead of counted
-        as zero.  Buckets are not mixed: TTFT starts at service ingress.
-        """
-        records = list(self._history)
+    @staticmethod
+    def _percentile_summary(records: list[UsageRecord]) -> dict[str, float | int]:
+        """Latency percentiles over one record slice; unmeasured keys are absent."""
         if not records:
             return {"sample_count": 0}
-        queue = [r.queue_latency_ns for r in records if r.queue_latency_ns is not None]
-        tokenizer = [r.tokenizer_latency_ns for r in records if r.tokenizer_latency_ns is not None]
-        service_ttft = [r.service_ttft_ns for r in records if r.service_ttft_ns is not None]
-        itl = [r.itl_p50_ns for r in records if r.itl_p50_ns]
-        tpot = [r.tpot_ns for r in records if r.tpot_ns is not None]
-        e2e = [r.duration_seconds * 1e9 for r in records]
-        summary: dict[str, float | int] = {
-            "sample_count": len(records),
-            "goodput": int(self.goodput._value.get()),
-        }
-        for name, values in (
-            ("queue_latency", queue),
-            ("tokenizer", tokenizer),
-            ("service_ttft", service_ttft),
-            ("itl", itl),
-            ("tpot", tpot),
-            ("e2e", e2e),
-        ):
+        groups = (
+            (
+                "queue_latency",
+                [r.queue_latency_ns for r in records if r.queue_latency_ns is not None],
+            ),
+            (
+                "tokenizer",
+                [r.tokenizer_latency_ns for r in records if r.tokenizer_latency_ns is not None],
+            ),
+            (
+                "service_ttft",
+                [r.service_ttft_ns for r in records if r.service_ttft_ns is not None],
+            ),
+            ("model_ttft", [r.model_ttft_ns for r in records if r.model_ttft_ns is not None]),
+            ("client_ttft", [r.client_ttft_ns for r in records if r.client_ttft_ns is not None]),
+            ("itl", [r.itl_p50_ns for r in records if r.itl_p50_ns]),
+            ("tpot", [r.tpot_ns for r in records if r.tpot_ns is not None]),
+            ("e2e", [r.duration_seconds * 1e9 for r in records]),
+        )
+        summary: dict[str, float | int] = {"sample_count": len(records)}
+        for name, values in groups:
             if not values:
                 continue
             stats = percentiles([float(value) for value in values])
@@ -363,6 +511,93 @@ class ServingStats:
             summary[f"{name}_p95_ms"] = stats["p95"] / 1e6
             summary[f"{name}_p99_ms"] = stats["p99"] / 1e6
         return summary
+
+    @staticmethod
+    def _evaluate_targets(summary: dict, targets: SloTargets) -> None:
+        """Record PASS/FAIL_PERFORMANCE for measured p95s; never gates serving."""
+        outcomes: list[bool] = []
+        for name in ("queue_latency", "tokenizer", "service_ttft", "itl", "tpot", "e2e"):
+            target_ms = getattr(targets, f"{name}_p95_ms", None)
+            value = summary.get(f"{name}_p95_ms")
+            if target_ms is None or value is None:
+                continue
+            meets = float(value) <= float(target_ms)
+            summary[f"{name}_meets_target"] = meets
+            outcomes.append(meets)
+        summary["performance_status"] = (
+            "PASS"
+            if outcomes and all(outcomes)
+            else "FAIL_PERFORMANCE"
+            if outcomes
+            else "NO_TARGET"
+        )
+
+    def slo_summary(
+        self,
+        *,
+        skip_records: int = 0,
+        targets: SloTargets | None = None,
+    ) -> dict[str, float | int | bool | str]:
+        """p50/p95 latency summary over the bounded recent-request history.
+
+        Every value comes from raw monotonic boundaries in ``UsageRecord``;
+        requests without a measured boundary are excluded instead of counted
+        as zero.  Buckets are not mixed: TTFT starts at service ingress.
+        ``skip_records`` drops the first N settled requests so a warmup or
+        capture phase is never averaged into steady-state latency.  ``targets``
+        only classifies performance: a breach is never a correctness failure.
+        """
+        records = list(self._history)[max(0, skip_records) :]
+        summary: dict[str, float | int | bool | str] = {}
+        for key, value in self._percentile_summary(records).items():
+            summary[key] = value
+        if not records:
+            return summary
+        summary["goodput"] = int(self.goodput._value.get())
+        hits = int(self.prefix_hits._value.get())
+        misses = int(self.prefix_misses._value.get())
+        if hits + misses:
+            summary["prefix_hit_ratio"] = hits / (hits + misses)
+        prompt_total = sum(r.prompt_tokens for r in records)
+        completion_total = sum(r.completion_tokens for r in records)
+        summary["prompt_tokens"] = prompt_total
+        summary["completion_tokens"] = completion_total
+        measured = [r for r in records if r.ingress_ns and r.terminal_ns >= r.ingress_ns]
+        if measured:
+            start = min(r.ingress_ns for r in measured)
+            end = max(r.terminal_ns for r in measured)
+            span_seconds = (end - start) / 1e9
+            if span_seconds > 0:
+                summary["prompt_tokens_per_second"] = prompt_total / span_seconds
+                summary["generation_tokens_per_second"] = completion_total / span_seconds
+        if targets is not None:
+            self._evaluate_targets(summary, targets)
+        return summary
+
+    def slo_groups(self) -> dict[str, dict[str, dict[str, float | int]]]:
+        """Latency percentiles grouped by finite keys: priority, bucket, prefix.
+
+        Grouping is advisory reporting over the same bounded history; it never
+        changes scheduling.  Priority is bucketed into high/default/low because
+        the raw value is an open integer and metric labels must stay finite.
+        """
+        records = list(self._history)
+        buckets: dict[str, dict[str, list[UsageRecord]]] = {
+            "priority": {"high": [], "default": [], "low": []},
+            "prompt_bucket": {"small": [], "medium": [], "large": []},
+            "prefix": {"hit": [], "miss": []},
+        }
+        for record in records:
+            priority = (
+                "high" if record.priority > 0 else "low" if record.priority < 0 else "default"
+            )
+            buckets["priority"][priority].append(record)
+            buckets["prompt_bucket"][record.prompt_bucket].append(record)
+            buckets["prefix"]["hit" if record.prefix_hit else "miss"].append(record)
+        return {
+            kind: {name: self._percentile_summary(group) for name, group in groups.items()}
+            for kind, groups in buckets.items()
+        }
 
     def update_tiering(self, metrics: TieringMetrics) -> None:
         """Publish one host-tier reading; never reserves or mutates memory."""

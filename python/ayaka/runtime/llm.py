@@ -45,6 +45,9 @@ class AyakaLLM:
         self._collector = OutputCollector(limit=stream_limit, downstream=collector_downstream)
         engine.output.set_listener(self._collector)
         self._commands: queue.Queue = queue.Queue(maxsize=max_pending_commands)
+        #: Cumulative bounded-ingress refusals; the SDK counterpart of the
+        #: serving admission rejection metric.
+        self.rejected_commands = 0
         self._closing = threading.Event()
         self._stopped = threading.Event()
         self._signal = threading.Event()
@@ -77,6 +80,7 @@ class AyakaLLM:
             try:
                 self._commands.put_nowait((request, future))
             except queue.Full as exc:
+                self.rejected_commands += 1
                 raise OverloadedError("engine SDK command queue is full") from exc
         self._signal.set()
         return future

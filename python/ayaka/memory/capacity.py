@@ -344,6 +344,8 @@ def build_capacity_snapshot(
     ledger: MemoryLedger,
     staging_tier: MemoryTier = MemoryTier.HOST_PINNED,
     runner_buffer_bytes: int = 0,
+    mirror_bytes: int = 0,
+    mirror_pinned: bool = False,
 ) -> CapacitySnapshot:
     """Freeze one generation's owner table from the resolved budgets.
 
@@ -354,6 +356,9 @@ def build_capacity_snapshot(
     HOST_PAGEABLE rather than the pinned tier it asked for. On the CPU lane the
     claim collapses to HOST_PAGEABLE regardless. ``runner_buffer_bytes`` widens
     the WORKSPACE claim by the persistent per-flight metadata footprint.
+    ``mirror_bytes`` is a separate WORKSPACE host claim for the KV host mirror;
+    it is declared in the tier the mirror actually landed on, independently of
+    the staging backing, because the two can degrade separately.
     """
     if staging_tier not in (MemoryTier.HOST_PINNED, MemoryTier.HOST_PAGEABLE):
         raise ValueError("staging_tier must be a host tier")
@@ -383,6 +388,19 @@ def build_capacity_snapshot(
                     pageable_host=staging_tier is MemoryTier.HOST_PAGEABLE,
                 ),
                 staging_bytes,
+            )
+        )
+    if mirror_bytes:
+        owners.append(
+            OwnerClaim(
+                MemoryOwner.WORKSPACE,
+                claim_tier(
+                    MemoryOwner.WORKSPACE,
+                    lane=lane,
+                    pinned_host=mirror_pinned,
+                    pageable_host=not mirror_pinned,
+                ),
+                mirror_bytes,
             )
         )
     # On the CPU lane staging and workspace share HOST_PAGEABLE; merge so the

@@ -355,16 +355,14 @@ class WorkerResourcePlan:
                 activation_bytes=allocator.bytes_by_owner().get(MemoryOwner.ACTIVATION, 0),
                 workspace_ceiling_bytes=self.workspace_ceiling_bytes,
                 graph_bytes=self.graph_bytes,
-                staging_bytes=self.staging_bytes + mirror_bytes,
+                staging_bytes=self.staging_bytes,
+                staging_tier=MemoryTier.HOST_PINNED,
+                mirror_bytes=mirror_bytes,
+                mirror_pinned=host_mirror is not None and host_mirror.pinned,
                 budget_bytes=budget,
                 kv_budget_bytes=kv_budget,
                 weights_bytes=self.weights_bytes,
                 ledger=ledger,
-                staging_tier=(
-                    MemoryTier.HOST_PAGEABLE
-                    if host_mirror is not None and not host_mirror.pinned
-                    else MemoryTier.HOST_PINNED
-                ),
                 runner_buffer_bytes=self.buffer_spec.device_bytes,
             )
             kv.bind_capacity(capacity)

@@ -9,6 +9,7 @@ freed, so a rejected resize keeps the old caches serving.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from ayaka.configs.memory import MemoryConfig
 from ayaka.configs.scheduler import PreemptionMode, SchedulerCapabilities, SchedulerConfig
 from ayaka.configs.serving import ServingConfig
 from ayaka.configs.tokenizer import TokenizerConfig
+from ayaka.execution.runner_factory import ModelRunner as PagedModelRunner
 from ayaka.kvcache.manager import LogicalKVManager
 from ayaka.kvcache.materialize import KVStorageLease
 from ayaka.kvcache.resize import (
@@ -47,7 +49,7 @@ from ayaka.obs import runtime_event
 from ayaka.plan import ComputePlan, ExecutionPlan, GraphMode, MemoryPlan
 from ayaka.prefix.identity import build_prefix_context
 from ayaka.runner.buffers import RunnerBuffers, RunnerBufferSpec
-from ayaka.runner.paged_runner import PagedModelRunner
+from ayaka.runtime.kv import ChunkPressurePolicy
 from ayaka.runtime.output import OutputProcessor
 from ayaka.runtime.resident import ResidentKVEngine
 from ayaka.sampling.engine import SamplingCoordinator
@@ -144,6 +146,8 @@ class ServingRuntime:
         staging_bytes: int = 0,
         device_total_bytes: int | None = None,
         tiering: TieredCacheConfig | None = None,
+        chunk_pressure: ChunkPressurePolicy | None = None,
+        clock: Callable[[], int] | None = None,
     ):
         """Build model bindings and materialize the initial KV slab.
 
@@ -199,16 +203,25 @@ class ServingRuntime:
         half-captured graph path.
         """
         self.config = config or ServingConfig()
+        #: Monotonic nanosecond source shared by deadline enforcement, SLO
+        #: boundaries and telemetry; tests inject a fake clock.
+        self._clock = clock or time.monotonic_ns
         self._closed = False
         self._decode_graph = bool(self.config.decode_graph)
-        configured_buckets = self.config.graph_buckets
-        if self._decode_graph and configured_buckets is not None:
-            resolved_buckets = tuple(int(bucket) for bucket in configured_buckets)
-        else:
-            resolved_buckets = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-        self._graph_buckets = resolved_buckets
+        from ayaka.execution.cuda_graph_config import DecodeCudaGraphConfig
+
+        self.execution_config = DecodeCudaGraphConfig.resolve(
+            self.config, max_requests=max_requests, max_tokens=batch_tokens
+        )
+        self._graph_buckets = self.execution_config.buckets
+        from ayaka.execution.model_bootstrap import adopt_model_weights
+
+        # Readiness precedes activation profiling as well as graph warmup.
+        adopt_model_weights(model)
         parameter = next(model.parameters())
         device, dtype, model_config = parameter.device, parameter.dtype, model.config
+        # RoPE scaling remaps frequencies but does not extend this runtime's
+        # position capacity, so the checkpoint value stays the hard ceiling.
         model_ceiling = model_config.max_position_embeddings
         if max_model_len is None:
             max_seq = model_ceiling
@@ -252,6 +265,7 @@ class ServingRuntime:
         self._weights_revision = weights_revision
         self._resize_safety_bytes = resize_safety_bytes
         self._resize_headroom_source = resize_headroom_bytes
+        self._chunk_pressure = chunk_pressure
         self._memory_config = memory_config or MemoryConfig()
         for name, value in (
             ("workspace_ceiling_bytes", workspace_ceiling_bytes),
@@ -383,12 +397,13 @@ class ServingRuntime:
                 )
             tail = self._build_tail(pages)
             self._bind_tail(tail)
-            self.processor = RequestProcessor(self.tokenizer, self.config)
+            self.processor = RequestProcessor(self.tokenizer, self.config, clock=self._clock)
             self.service = ServingService(
                 self.engine,
                 self.config,
                 constraints=self._constraints,
                 controller=self,
+                clock=self._clock,
             )
         except BaseException:
             try:
@@ -560,6 +575,7 @@ class ServingRuntime:
             backend=self._backend_name,
             force_reference=self._device.type == "cpu",
             buffers=buffers,
+            max_model_len=self._max_seq,
         )
         runner.set_valid_token_ids(self._valid_token_ids)
         return runner
@@ -591,6 +607,8 @@ class ServingRuntime:
             workspace=workspace,
             buffers=buffers,
             worker=LocalWorker(kv, runner, max_inflight=plan.max_inflight, resources=resources),
+            chunk_pressure=self._chunk_pressure,
+            clock=self._clock,
         )
         if self._constraints is not None:
             runner.set_request_source(engine.requests.get, constraints=self._constraints)
@@ -628,6 +646,7 @@ class ServingRuntime:
             if self._decode_graph:
                 runner.enable_graph(self._decode_graph_config(kv))
             engine = self._build_engine(kv, runner, ledger, workspace, buffers, resources)
+            runner.mark_worker_ready()
             if self._decode_graph and runner.graph_pool is not None:
                 runner.graph_pool.attach_metrics(engine.executor.metrics)
         except BaseException:
@@ -652,6 +671,31 @@ class ServingRuntime:
             buffers=buffers,
             runner=runner,
             engine=engine,
+        )
+
+    @property
+    def execution_report(self):
+        """Requested, resolved and actually captured policy for the current tail."""
+        from ayaka.execution.cuda_graph_config import ExecutionStartupReport
+
+        tail = self._tail
+        runner = None if tail is None else tail.runner
+        stats = None if runner is None else runner.graph_stats()
+        return ExecutionStartupReport(
+            requested=self.execution_config.requested,
+            requested_buckets=self.execution_config.requested_buckets,
+            resolved_buckets=self.execution_config.buckets,
+            captured_buckets=() if stats is None else stats.captured_buckets,
+            provenance=self.execution_config.provenance,
+            graph_backend="full" if self._decode_graph else "eager",
+            attention_backend=self._backend_name,
+            device=str(self._device),
+            flight_slots=self._max_inflight,
+            reserve_bytes=self._graph_bytes,
+            capture_bytes=0 if stats is None else stats.capture_bytes,
+            capture_seconds=0.0 if stats is None else stats.capture_seconds,
+            state="closed" if runner is None else runner.bootstrap_stage.value,
+            fallback_reason="disabled" if stats is None else stats.last_reason,
         )
 
     def _decode_graph_config(self, kv: LogicalKVManager):
@@ -698,7 +742,10 @@ class ServingRuntime:
             output_dtype=self._dtype,
             sliding_window=spec.sliding_window,
         )
-        return (persistent + self._activation_bytes) * self._max_inflight
+        # Graph pools reserve allocator segments, not just tensor payloads.
+        # Keep a per-slot floor so a small model also admits a cold recapture
+        # after resize (without relying on another owner's cached segments).
+        return max(32 << 20, persistent + self._activation_bytes) * self._max_inflight
 
     def _bind_tail(self, tail: _KVTail) -> None:
         """Point every public attribute at the new owner set."""

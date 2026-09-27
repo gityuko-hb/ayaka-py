@@ -38,6 +38,7 @@ from ayaka.runner.buffers import RunnerBuffers
 from ayaka.runner.sampling_runner import SampleRunner
 from ayaka.runtime.engine import Engine
 from ayaka.runtime.kv import (
+    ChunkPressurePolicy,
     KVRequestPreparer,
     KVSequenceAllocator,
     KVStepRuntime,
@@ -167,6 +168,8 @@ class ResidentKVEngine(Engine):
         workspace: WorkspaceManager | None = None,
         buffers: RunnerBuffers | None = None,
         worker: StepWorker | None = None,
+        chunk_pressure: ChunkPressurePolicy | None = None,
+        clock: Callable[[], int] | None = None,
     ) -> None:
         kind = kind.strip().lower().replace("-", "_")
         if (
@@ -196,6 +199,7 @@ class ResidentKVEngine(Engine):
             allocator,
             prefix_context=prefix_context,
             chunk_cap=(plan.max_prefill_chunk_tokens if plan.enable_chunked_prefill else None),
+            chunk_pressure=chunk_pressure,
         )
         # The worker owns the device context, streams, runner and fences; the
         # engine only composes it and the executor adapter drives tickets.
@@ -234,6 +238,7 @@ class ResidentKVEngine(Engine):
             coordinator=self.coordinator,
             output=output,
             allocator=allocator,
+            clock=clock,
         )
         self.kv = kv
         self.allocator = allocator
@@ -272,6 +277,8 @@ class ResidentKVEngine(Engine):
         kind: str = "continuous",
         max_model_len: int | None = None,
         zero_initialize: bool = False,
+        chunk_pressure: ChunkPressurePolicy | None = None,
+        clock: Callable[[], int] | None = None,
         sampling: SamplingCoordinator | None = None,
         prefix_context: PrefixContextProvider | None = None,
         worker_factory: Callable[[object, LogicalKVManager, SampleRunner, int], StepWorker]
@@ -365,6 +372,8 @@ class ResidentKVEngine(Engine):
                 sampling=sampling,
                 prefix_context=prefix_context,
                 worker=worker,
+                chunk_pressure=chunk_pressure,
+                clock=clock,
             )
         except BaseException:
             try:
