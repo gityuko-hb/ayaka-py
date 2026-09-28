@@ -30,9 +30,10 @@ from ayaka.plan import GraphMode
 from ayaka.request.lifecycle import RequestLifecycle
 from ayaka.request.schema import Request
 from ayaka.runner.buffers import RunnerBufferLease, RunnerBuffers, StagedGroup
+from ayaka.runner.dense_runner import DenseModelRunner
+from ayaka.runner.execution_result import ForwardResult
 from ayaka.runner.graph.padding import pad_decode_addressing
 from ayaka.runner.graph.pool import CaptureProgram, DecodeGraphConfig, DecodeGraphPool
-from ayaka.runner.model_runner import ModelRunner, _ForwardResult
 from ayaka.runner.paged_inputs import PagedGroupBinding, validate_paged_inputs
 from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sched.plan import BatchMode, Phase, PreparedStep
@@ -47,8 +48,8 @@ from ayaka.types import (
 from ayaka.utils.math_utils import div_ceil
 
 if TYPE_CHECKING:
-    from ayaka.execution.base_runner import PreparedInvocation
-    from ayaka.execution.forward_context import ForwardContext
+    from ayaka.attention.forward_context import ForwardContext
+    from ayaka.runner.base_runner import PreparedInvocation
     from ayaka.serving.constraints import GrammarConstraints
 
 
@@ -230,7 +231,7 @@ class PagedForwardTrace:
     kv_groups: tuple[str, ...] = ()
 
 
-class PagedModelRunner(ModelRunner):
+class PagedModelRunner(DenseModelRunner):
     """Forward every scheduled query against resident KV, then sample last rows.
 
     groups maps manager names to static attention geometry. Every model layer
@@ -545,7 +546,7 @@ class PagedModelRunner(ModelRunner):
 
     def _model_forward(self, tokens, positions, metadata) -> Callable[[], Any]:
         """Pure device forward + LM head for the padded bucket, no host branch."""
-        from ayaka.execution.forward_context import ForwardContext, forward_context
+        from ayaka.attention.forward_context import ForwardContext, forward_context
 
         context = ForwardContext(self.backends, self.layers, metadata)
 
@@ -570,7 +571,7 @@ class PagedModelRunner(ModelRunner):
         for name, metadata_builder in self.builders.items():
             common = self._capture_common(buffers, name, bucket)
             metadata[name] = metadata_builder.build_for_capture(common, bucket)
-        from ayaka.execution.graph_program import model_program
+        from ayaka.runner.graph.program import model_program
 
         assert self._graph_config is not None
         return model_program(
@@ -728,7 +729,7 @@ class PagedModelRunner(ModelRunner):
             mode=ForwardMode.DECODE,
         )
 
-    def _forward_tail(self, prepared: PreparedStep) -> _ForwardResult:
+    def _forward_tail(self, prepared: PreparedStep) -> ForwardResult:
         pool = self._graph_pool
         if pool is not None and prepared.step.graph.mode is GraphMode.REPLAY:
             lease = prepared.buffers
@@ -738,7 +739,7 @@ class PagedModelRunner(ModelRunner):
 
     def _graph_tail(
         self, prepared: PreparedStep, lease: RunnerBufferLease, *, staged: bool = False
-    ) -> _ForwardResult:
+    ) -> ForwardResult:
         step = prepared.step
         bucket = step.graph.bucket
         pool = self._graph_pool
@@ -758,7 +759,7 @@ class PagedModelRunner(ModelRunner):
             graph_bucket=bucket,
             graph_key=step.graph.graph_key,
         )
-        return _ForwardResult(logits=logits, sampling_count=len(step.sampling_rows))
+        return ForwardResult(logits=logits, sampling_count=len(step.sampling_rows))
 
     def _observe_forward(
         self,
@@ -964,7 +965,7 @@ class PagedModelRunner(ModelRunner):
 
     def _prepare_eager_inputs(self, prepared: PreparedStep) -> StagedEagerInputs:
         """Stage all inputs/attention metadata without running model or sampler."""
-        from ayaka.execution.forward_context import ForwardContext
+        from ayaka.attention.forward_context import ForwardContext
 
         step = prepared.step
         metadata = {
@@ -988,7 +989,7 @@ class PagedModelRunner(ModelRunner):
 
     def _execute_eager_inputs(self, prepared: PreparedStep, inputs: StagedEagerInputs):
         """Enqueue model work against a validated, already staged invocation."""
-        from ayaka.execution.forward_context import forward_context
+        from ayaka.attention.forward_context import forward_context
 
         step = prepared.step
         tokens, positions, context = inputs.tokens, inputs.positions, inputs.context

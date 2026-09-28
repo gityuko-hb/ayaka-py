@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from ayaka.execution.execution_capabilities import DeviceIdentity
+from ayaka.device.capabilities import DeviceIdentity
 from ayaka.utils.validation import require_int
 
 __all__ = [

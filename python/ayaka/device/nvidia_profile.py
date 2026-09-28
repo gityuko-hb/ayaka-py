@@ -22,11 +22,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final
 
-from ayaka.execution.execution_capabilities import (
+from ayaka.configs.base import validate_buckets
+from ayaka.device.capabilities import (
     ExecutionCapabilityReport,
     SupportTier,
 )
-from ayaka.execution.shape_key import validate_buckets
 from ayaka.utils.validation import require_int
 
 __all__ = [

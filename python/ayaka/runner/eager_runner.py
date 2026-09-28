@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ayaka.execution.base_runner import (
+from ayaka.runner.base_runner import (
     PreparedInvocation,
     RunnerSupport,
     claim_invocation,
     load_invocation,
 )
-from ayaka.execution.execution_batch import ExecutionBatch
-from ayaka.execution.execution_result import ExecutionResult, OutputLifetime
+from ayaka.runner.execution_batch import ExecutionBatch
+from ayaka.runner.execution_result import ExecutionResult, OutputLifetime
 
 if TYPE_CHECKING:
     from ayaka.runner.paged_runner import PagedModelRunner

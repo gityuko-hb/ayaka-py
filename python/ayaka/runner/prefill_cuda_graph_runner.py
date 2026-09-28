@@ -18,24 +18,23 @@ import torch
 
 from ayaka.attention.backend.triton_backend import TritonAttentionMetadata
 from ayaka.attention.metadata import CommonAttentionMetadata
-from ayaka.execution.base_runner import (
+from ayaka.configs.phase import PhaseConfig
+from ayaka.runner.base_runner import (
     FallbackReason,
     PreparedInvocation,
     RunnerSupport,
     claim_invocation,
     load_invocation,
 )
-from ayaka.execution.execution_batch import ExecutionBatch
-from ayaka.execution.execution_result import ExecutionResult, OutputLifetime
-from ayaka.execution.graph_program import compiler_report, model_program
-from ayaka.execution.input_buffers import TensorBinding
-from ayaka.execution.phase_config import PhaseConfig
-from ayaka.execution.shape_key import select_bucket
 from ayaka.runner.buffers import _Stage1D
+from ayaka.runner.execution_batch import ExecutionBatch
+from ayaka.runner.execution_result import ExecutionResult, ForwardResult, OutputLifetime
 from ayaka.runner.graph.backend import BreakableGraphBackend, FullGraphBackend
 from ayaka.runner.graph.graph import GraphBackend, ShapeKey
 from ayaka.runner.graph.pool import execution_enqueue_gate
-from ayaka.runner.model_runner import _ForwardResult
+from ayaka.runner.graph.program import compiler_report, model_program
+from ayaka.runner.graph.runner import select_bucket
+from ayaka.runner.input_buffers import TensorBinding
 from ayaka.sched.plan import Phase, PreparedStep
 from ayaka.types import ForwardMode
 
@@ -191,7 +190,7 @@ class PrefillCudaGraphRunner:
             raise ValueError("prefill graphs require CUDA and one Triton attention group")
         if owner.buffers is None or owner.buffers.live or self.instances or self.closed:
             raise RuntimeError("prefill capture requires a fresh, drained buffer owner")
-        from ayaka.execution.model_bootstrap import require_ready_weights
+        from ayaka.model_loader.readiness import require_ready_weights
 
         require_ready_weights(owner._model)
         with execution_enqueue_gate(), torch.random.fork_rng(devices=[owner.device.index or 0]):
@@ -335,7 +334,7 @@ class PrefillCudaGraphRunner:
             graph_key=f"prefill:{self.config.backend}:{bucket}:{lease.index}",
         )
         return ExecutionResult(
-            _ForwardResult(logits=logits, sampling_count=len(step.sampling_rows)),
+            ForwardResult(logits=logits, sampling_count=len(step.sampling_rows)),
             OutputLifetime.OWNED,
             lease.index,
             bucket,

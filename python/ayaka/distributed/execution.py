@@ -36,8 +36,8 @@ from ayaka.distributed.process_group import (
     DistributedStepError,
 )
 from ayaka.distributed.step_envelope import DistributedStepEnvelope
-from ayaka.distributed.worker import RankLocalKVWorker, RankLocalKVWorkerState
 from ayaka.exceptions import InvariantViolationError
+from ayaka.worker.rank_local import RankLocalKVWorker, RankLocalKVWorkerState
 
 if TYPE_CHECKING:
     from ayaka.sched.plan import PreparedStep

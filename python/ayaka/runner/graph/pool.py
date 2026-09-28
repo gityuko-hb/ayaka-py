@@ -93,7 +93,7 @@ class DecodeGraphConfig:
     compile_seconds: int = 120
 
     def __post_init__(self) -> None:
-        from ayaka.execution.shape_key import validate_buckets
+        from ayaka.configs.base import validate_buckets
         from ayaka.utils.validation import require_int
 
         validate_buckets(self.buckets)
@@ -149,7 +149,7 @@ class DecodeGraphPool:
             raise DecodeGraphPoolError("decode graphs require a CUDA device")
         if not callable(kernel_binding):
             raise DecodeGraphPoolError("kernel_binding must be a zero-argument callable")
-        from ayaka.execution.shape_key import validate_buckets
+        from ayaka.configs.base import validate_buckets
 
         resolved = tuple(buckets)
         validate_buckets(resolved)
@@ -217,7 +217,7 @@ class DecodeGraphPool:
         return runner.can_run(bucket)
 
     def compilation_report(self) -> tuple[dict, ...]:
-        from ayaka.execution.graph_program import compiler_report
+        from ayaka.runner.graph.program import compiler_report
 
         return tuple(
             {"slot": slot, "bucket": bucket, **report}

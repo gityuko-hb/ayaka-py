@@ -11,7 +11,7 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from ayaka.execution.shape_key import validate_buckets
+from ayaka.configs.base import validate_buckets
 from ayaka.utils.validation import require_int
 
 BACKENDS = ("eager", "full", "breakable", "torch_compile_piecewise")

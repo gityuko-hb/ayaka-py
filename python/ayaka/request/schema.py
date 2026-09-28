@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import NewType
 
-from ayaka.execution.execution_variant import AdapterIdentity
+from ayaka.lora.variant import AdapterIdentity
 from ayaka.request.input import ConstraintSpec, MultimodalEmbedding
 from ayaka.sampling.params import SamplingParams
 from ayaka.utils.validation import require_frozen, require_int, require_text

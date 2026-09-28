@@ -9,10 +9,10 @@ from ayaka.distributed.completion import CompletionFence
 from ayaka.distributed.metadata import DistributedKVMetadata
 from ayaka.distributed.process_group import DistributedStepError, TorchDistributedKVProcessGroup
 from ayaka.distributed.transfer import TensorParallelKVStorage, build_replicated_transfer_engine
-from ayaka.distributed.worker import RankLocalKVWorker
 from ayaka.exceptions import InvariantViolationError
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.tiering import HostKVStorage, TieringConfig, TransferEngine
+from ayaka.worker.rank_local import RankLocalKVWorker
 
 
 class DistributedKVCoordinator:

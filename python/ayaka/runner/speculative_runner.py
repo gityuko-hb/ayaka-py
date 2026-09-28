@@ -16,19 +16,16 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ayaka.execution.model_bootstrap import adopt_model_weights, weight_binding
-from ayaka.execution.speculative_execution_batch import (
-    SpeculativeConfig,
-    SpeculativeExecutionBatch,
-    SpeculativeRole,
-    accept_greedy,
-)
+from ayaka.configs.speculative import SpeculativeConfig
 from ayaka.memory.views import ExecutionMemoryView
+from ayaka.model_loader.readiness import adopt_model_weights, weight_binding
 from ayaka.request.schema import Request
+from ayaka.runner.execution_result import ForwardResult
 from ayaka.runner.graph.backend import FullGraphBackend
 from ayaka.runner.graph.graph import ShapeKey
 from ayaka.runner.graph.pool import execution_enqueue_gate
-from ayaka.runner.model_runner import _ForwardResult
+from ayaka.runner.speculative_batch import SpeculativeExecutionBatch, SpeculativeRole
+from ayaka.sampling.acceptance import accept_greedy
 from ayaka.sched.plan import PreparedStep, RequestStepInput
 from ayaka.types import MaskKind
 
@@ -301,7 +298,7 @@ class SpeculativeRunner:
         ) or self.draft.identity != weight_binding(self.draft.model):
             raise RuntimeError("speculative model binding changed; drain and rebuild")
 
-    def execute(self, prepared: PreparedStep) -> _ForwardResult:
+    def execute(self, prepared: PreparedStep) -> ForwardResult:
         self.validate_binding()
         if not prepared.step.is_pure_decode or not isinstance(
             prepared.memory_view, ExecutionMemoryView
@@ -334,7 +331,7 @@ class SpeculativeRunner:
                 )
             if scheduled.sample_last_query:
                 rows.append(state.logits[offset : offset + 1].clone())
-        return _ForwardResult(torch.cat(rows), len(rows))
+        return ForwardResult(torch.cat(rows), len(rows))
 
     def forget(self, request_id: str) -> None:
         self.pending.pop(request_id, None)

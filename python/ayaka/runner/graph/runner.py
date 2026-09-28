@@ -25,9 +25,11 @@ from typing import Any
 
 import torch
 
+from ayaka.configs.base import validate_buckets
 from ayaka.runner.graph.backend import BreakableGraphBackend, FullGraphBackend, slice_rows
 from ayaka.runner.graph.graph import CanRun, GraphBackend, GraphCapabilityError, ShapeKey
 from ayaka.utils.math_utils import align_down
+from ayaka.utils.validation import require_int
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,15 @@ def pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
         )
     index = bisect.bisect_left(buckets, raw_size)
     return buckets[index]
+
+
+def select_bucket(requests: int, buckets: tuple[int, ...]) -> int | None:
+    """Return the ceil bucket; idle and over-ceiling invocations have no graph."""
+    require_int(requests, "requests", minimum=0)
+    validate_buckets(buckets)
+    if requests == 0 or requests > buckets[-1]:
+        return None
+    return buckets[bisect.bisect_left(buckets, requests)]
 
 
 def build_buckets(

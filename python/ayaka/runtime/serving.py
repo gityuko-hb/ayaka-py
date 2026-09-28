@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ayaka.execution.execution_capabilities import ExecutionCapabilityReport
+    from ayaka.device.capabilities import ExecutionCapabilityReport
 
 from ayaka.attention.spec import AttentionGroupSpec, AttentionSpec
 from ayaka.configs.cache import TieredCacheConfig
@@ -24,7 +24,6 @@ from ayaka.configs.memory import MemoryConfig
 from ayaka.configs.scheduler import PreemptionMode, SchedulerCapabilities, SchedulerConfig
 from ayaka.configs.serving import ServingConfig
 from ayaka.configs.tokenizer import TokenizerConfig
-from ayaka.execution.runner_factory import ModelRunner as PagedModelRunner
 from ayaka.kvcache.manager import LogicalKVManager
 from ayaka.kvcache.materialize import KVStorageLease
 from ayaka.kvcache.resize import (
@@ -53,6 +52,7 @@ from ayaka.obs import runtime_event
 from ayaka.plan import ComputePlan, ExecutionPlan, GraphMode, MemoryPlan
 from ayaka.prefix.identity import build_prefix_context
 from ayaka.runner.buffers import RunnerBuffers, RunnerBufferSpec
+from ayaka.runner.model_runner import ModelRunner
 from ayaka.runtime.kv import ChunkPressurePolicy
 from ayaka.runtime.output import OutputProcessor
 from ayaka.runtime.resident import ResidentKVEngine
@@ -109,7 +109,7 @@ class _KVTail:
     workspace_allocator: CachingAllocator
     capacity: CapacitySnapshot
     buffers: RunnerBuffers
-    runner: PagedModelRunner
+    runner: ModelRunner
     engine: ResidentKVEngine
 
 
@@ -233,7 +233,7 @@ class ServingRuntime:
         self._clock = clock or time.monotonic_ns
         self._closed = False
         self._decode_graph = bool(self.config.decode_graph)
-        from ayaka.execution.cuda_graph_config import DecodeCudaGraphConfig
+        from ayaka.configs.cuda_graph import DecodeCudaGraphConfig
 
         self.execution_config = DecodeCudaGraphConfig.resolve(
             self.config, max_requests=max_requests, max_tokens=batch_tokens
@@ -258,7 +258,7 @@ class ServingRuntime:
                 provenance="phases.decode",
             )
         self._graph_buckets = self.execution_config.buckets
-        from ayaka.execution.model_bootstrap import adopt_model_weights
+        from ayaka.model_loader.readiness import adopt_model_weights
 
         # Readiness precedes activation profiling as well as graph warmup.
         adopt_model_weights(model)
@@ -681,13 +681,13 @@ class ServingRuntime:
             )
         return TieringConfig(host_capacity_pages=host_pages), self._tiering.max_inflight_bytes
 
-    def _build_runner(self, kv: LogicalKVManager, buffers: RunnerBuffers) -> PagedModelRunner:
+    def _build_runner(self, kv: LogicalKVManager, buffers: RunnerBuffers) -> ModelRunner:
         """Bind a fresh paged runner to the slab, this model and its buffers."""
         if self.config.lora is not None and self.lora is None:
-            from ayaka.execution.lora_execution_binding import LoRAExecutionBinding
+            from ayaka.lora.binding import LoRAExecutionBinding
 
             self.lora = LoRAExecutionBinding(self._model, self.config.lora)
-        runner = PagedModelRunner(
+        runner = ModelRunner(
             self._sampling,
             self._model,
             kv,
@@ -704,7 +704,7 @@ class ServingRuntime:
     def _build_engine(
         self,
         kv: LogicalKVManager,
-        runner: PagedModelRunner,
+        runner: ModelRunner,
         ledger: MemoryLedger,
         workspace: WorkspaceManager,
         buffers: RunnerBuffers,
@@ -793,7 +793,7 @@ class ServingRuntime:
             if self.config.speculative is not None:
                 runner.enable_speculative(self._draft_model, self.config.speculative)
             if self.config.execution_lanes is not None:
-                from ayaka.execution.prefill_decode_multiplexer import PrefillDecodeMultiplexer
+                from ayaka.worker.multiplexer import PrefillDecodeMultiplexer
 
                 other = self._build_runner(kv, buffers)
                 if self.phase_config is not None:
@@ -859,7 +859,7 @@ class ServingRuntime:
     @property
     def execution_report(self):
         """Requested, resolved and actually captured policy for the current tail."""
-        from ayaka.execution.cuda_graph_config import ExecutionStartupReport
+        from ayaka.configs.cuda_graph import ExecutionStartupReport
 
         tail = self._tail
         runner = None if tail is None else tail.runner
@@ -918,7 +918,7 @@ class ServingRuntime:
     def _phase_report(self, runner) -> dict:
         from dataclasses import asdict
 
-        from ayaka.execution.graph_capabilities import CAPABILITIES
+        from ayaka.runner.graph.capabilities import CAPABILITIES
 
         if self.phase_config is None:
             return {}
@@ -963,8 +963,8 @@ class ServingRuntime:
         if self.phase_config is not None:
             # Explicit EP2 reservations/buckets already admitted before capture.
             return
-        from ayaka.execution.cuda_graph_config import DecodeCudaGraphConfig
-        from ayaka.execution.nvidia_execution_profile import resolve_profile
+        from ayaka.configs.cuda_graph import DecodeCudaGraphConfig
+        from ayaka.device.nvidia_profile import resolve_profile
 
         profile = self.execution_config.profile
         explicit = self.execution_config.requested_buckets
@@ -1045,8 +1045,8 @@ class ServingRuntime:
         supplies memory capacity, because NVML describes the parent card while
         CUDA describes the partition this process was given.
         """
-        from ayaka.execution.execution_capabilities import resolve_capabilities  # noqa: F401
-        from ayaka.execution.execution_capacity import resolve_device_capacity
+        from ayaka.device.capabilities import resolve_capabilities  # noqa: F401
+        from ayaka.device.capacity import resolve_device_capacity
 
         device_index = self._device.index if self._device.type == "cuda" else 0
         snapshot = hardware
@@ -1078,7 +1078,7 @@ class ServingRuntime:
         answers "can it capture", and a report that answered both from an
         unbound state would have to guess.
         """
-        from ayaka.execution.execution_capabilities import compute_dtype, resolve_capabilities
+        from ayaka.device.capabilities import compute_dtype, resolve_capabilities
 
         # On the first pass the attribute is still being assigned by the caller,
         # so the device is detected here rather than reused from a report that
@@ -1148,7 +1148,7 @@ class ServingRuntime:
         """
         if self._backend_name != "triton":
             return None
-        from ayaka.execution.execution_capacity import triton_graph_state_pricer
+        from ayaka.device.capacity import triton_graph_state_pricer
 
         spec = self._group.spec
         return triton_graph_state_pricer(

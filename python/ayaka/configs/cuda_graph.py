@@ -5,12 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from ayaka.configs.base import validate_buckets
 from ayaka.configs.serving import ServingConfig
-from ayaka.execution.nvidia_execution_profile import (
+from ayaka.device.nvidia_profile import (
     NvidiaExecutionProfile,
     ResolvedExecutionProfile,
 )
-from ayaka.execution.shape_key import validate_buckets
 from ayaka.utils.validation import require_int
 
 
@@ -37,7 +37,7 @@ class DecodeCudaGraphConfig:
 
         This runs before the device is known, so it can only apply capacity
         ceilings. ``admission`` carries the budget-resolved set from
-        :mod:`~ayaka.execution.nvidia_execution_profile` once the device and
+        :mod:`~ayaka.device.nvidia_profile` once the device and
         memory plan exist; passing it is what replaces the old fixed ladder with
         a decision the device and budget actually justify.
 
@@ -87,7 +87,7 @@ class DecodeCudaGraphConfig:
 
 
 #: Capacity-only fallback ladders, used before a device is known. The real
-#: policy lives in :mod:`~ayaka.execution.nvidia_execution_profile`; keeping a
+#: policy lives in :mod:`~ayaka.device.nvidia_profile`; keeping a
 #: copy here would be a second authority, so this only mirrors the same names
 #: for the pre-bootstrap window.
 _CAPACITY_DEFAULTS: dict[NvidiaExecutionProfile, tuple[int, ...]] = {

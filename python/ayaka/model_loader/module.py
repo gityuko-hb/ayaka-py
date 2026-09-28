@@ -344,7 +344,7 @@ def load_module_weights(
     Failed or partial loading leaves no readiness proof. CUDA packing is
     ordered at this bootstrap boundary before any warmup/capture can begin.
     """
-    from ayaka.execution.model_bootstrap import finalize_loaded_weights
+    from ayaka.model_loader.readiness import finalize_loaded_weights
 
     object.__setattr__(module, "_ayaka_weight_readiness", None)
     consumed = _load_module_weights(

@@ -1,550 +1,349 @@
-"""Minimal real model runner for the sampling vertical slice (M1–M3).
-
-Each step re-forwards the full known-token stream of every slice that needs
-output with causal SDPA attention and projects only the needed hidden rows
-through the LM head (``LogitsProcessor``). This is a REAL model forward with
-real weights feeding the real sampling chain and the real
-executor/completion contracts — deliberately not the paged-KV runner:
-
-  * the paged runner (KV reuse, prefix cache, chunk-boundary carry) is a
-    separate milestone; the report contracts tested here do not depend on KV
-    reuse. For prompt scoring the dense path recomputes the predecessor rows
-    that a paged runner would carry from the previous chunk's workspace;
-  * ``known_tokens`` is the scheduler-owned snapshot (prompt + published
-    outputs), so recomputation is exactly the sequence the step continues;
-  * slices are forwarded when they sample OR carry prompt-logprob scoring.
-
-Deferred M3 items, with reasons pinned here so they are not rediscovered:
-  * workspace/buffer reuse — the snapshot/logprob tensors ESCAPE each call
-    (held by ``SampleOutputs`` until the completion boundary materializes
-    them), so a runner-global reuse pool would overwrite an unpublished
-    ticket's payload. Reuse belongs to the per-ticket ``ExecutionResources``
-    workspace of the paged runner.
-  * CUDA Graph capture — the dense recompute path has dynamic stream lengths
-    per slice; capture needs the paged runner's static shapes (the sampling
-    side is already graph-ready via ``coords_padded``).
-  * tensor-parallel sharded vocabulary — the vocabulary-parallel LM head
-    gathers and reorders its shards inside ``logits_from_hidden``, so this
-    runner and the sampler always see the full vocabulary; multi-rank serving
-    itself is still gated by the scheduler's single-process policy.
-
-Responsibility boundary (see ``runtime/logits.py``): the scheduler decided
-which positions get scored (``BatchStepPlan.prompt_logprobs``); this runner
-maps them to hidden rows; the LogitsProcessor produces logits; the
-LogprobProcessor only observes; only the Sampler transforms the distribution.
-
-Flow:
-    model forward -> hidden rows -> LogitsPlan -> LogitsProcessor -> raw logits
-    -> raw snapshot (FP32, raw-mode + prompt rows, before any transform)
-    -> Sampler -> device tokens
-    -> generation (raw + sampling modes) + prompt raw logprobs
-    -> SampleOutputs (device-resident until the completion boundary).
-"""
+"""Canonical EP0 facade, preserving PagedModelRunner's sampling and ownership API."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+import hashlib
+from collections.abc import Mapping
+from contextlib import nullcontext
+from dataclasses import replace
+from enum import StrEnum
 
 import torch
-import torch.nn.functional as F
 
-from ayaka.executor.ticket import SampleOutputs
-from ayaka.logits_processor import LogitsPlan, LogitsProcessor
-from ayaka.sampling.bans import BanApplier, BansProvider, LogitFillBanApplier
-from ayaka.sampling.engine import SamplingCoordinator
-from ayaka.sampling.logprobs import (
-    LogprobEntry,
-    LogprobMode,
-    LogprobPlan,
-    PromptLogprobSliceReport,
-    SampleLogprobTensors,
-    TokenIdsLogprobTensors,
-    compute_prompt_logprobs,
-    compute_raw_logprobs,
-    compute_sampling_logprobs,
-    compute_token_ids_raw_logprobs,
-    compute_token_ids_sampling_logprobs,
+from ayaka.attention.spec import AttentionGroupSpec
+from ayaka.configs.phase import PhaseConfig
+from ayaka.kvcache.manager import LogicalKVManager
+from ayaka.model_loader.readiness import (
+    adopt_model_weights,
+    require_ready_weights,
+    weight_binding,
 )
+from ayaka.plan import GraphMode
+from ayaka.runner.buffers import RunnerBuffers
+from ayaka.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
+from ayaka.runner.eager_runner import EagerRunner
+from ayaka.runner.execution_batch import ExecutionBatch
+from ayaka.runner.execution_result import ForwardResult
+from ayaka.runner.graph.pool import DecodeGraphConfig
+from ayaka.runner.input_buffers import TensorBinding
+from ayaka.runner.paged_runner import PagedModelRunner
+from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sched.plan import PreparedStep
-
-__all__ = ["ModelRunner"]
-
-
-@dataclass(frozen=True, slots=True)
-class _SamplingReportRow:
-    """One generation report row that scores the SAMPLING distribution."""
-
-    sampling_row: int
-    k: int
+from ayaka.worker.base import WorkerStep
 
 
-@dataclass(frozen=True, slots=True)
-class _IdsReportRow:
-    """One row requesting logprobs for specific token ids."""
-
-    sampling_row: int
-    tokens: tuple[int, ...]
-    mode: LogprobMode
-
-
-@dataclass(frozen=True, slots=True)
-class _GenerationReport:
-    """Generation report rows split by mode (the two distributions are
-    observed at different pipeline points: raw needs the pre-mutation
-    snapshot, sampling needs the post-mutation logits after the draw)."""
-
-    raw: tuple[LogprobEntry, ...]
-    sampling: tuple[_SamplingReportRow, ...]
-    ids: tuple[_IdsReportRow, ...] = ()
-    ids_raw_count: int = 0
+class BootstrapStage(StrEnum):
+    MODEL_LOADED = "model_loaded"
+    WEIGHTS_FINALIZED = "weights_finalized"
+    RESOURCES_BOUND = "resources_bound"
+    CAPTURE_READY = "capture_ready"
+    WORKER_READY = "worker_ready"
+    FAILED = "failed"
+    CLOSED = "closed"
 
 
-@dataclass(frozen=True, slots=True)
-class _ForwardResult:
-    """Logits for one step plus the reporting metadata that produced them.
+class ModelRunner(PagedModelRunner):
+    """Route one prepared batch through typed eager/decode phase adapters.
 
-    ``logits`` rows follow the packed order: sampling rows first, then
-    prompt-scored rows. A graph runner returns logits whose projection already
-    happened inside the captured graph, so the base class must not re-project.
+    Inherits the compatibility surface rather than wrapping another stateful
+    paged runner. KV, buffers, graph pool and sampling each retain one owner.
     """
-
-    logits: torch.Tensor
-    sampling_count: int
-    prompt_descriptors: tuple[PromptLogprobSliceReport, ...] = ()
-    prompt_targets: tuple[int, ...] = ()
-    prompt_ks: tuple[int, ...] = ()
-
-
-class ModelRunner:
-    """Run one real model forward + LogitsProcessor + Sampler per prepared step."""
-
-    __slots__ = ("_ban_applier", "_bans", "_coordinator", "_force_reference", "_logits", "_model")
 
     def __init__(
         self,
         coordinator: SamplingCoordinator,
         model,
+        kv: LogicalKVManager,
+        groups: Mapping[str, AttentionGroupSpec],
         *,
-        logit_scale: float = 1.0,
-        final_logit_softcapping: float | None = None,
+        backend: str = "triton",
         force_reference: bool = False,
-        bans: BansProvider | None = None,
-        ban_applier: BanApplier | None = None,
+        buffers: RunnerBuffers | None = None,
+        max_model_len: int | None = None,
+        lora=None,
     ) -> None:
-        self._coordinator = coordinator
-        self._model = model
-        self._logits = LogitsProcessor(
-            model, logit_scale=logit_scale, final_logit_softcapping=final_logit_softcapping
+        self.bootstrap_stage = BootstrapStage.MODEL_LOADED
+        adopt_model_weights(model)
+        self.bootstrap_stage = BootstrapStage.WEIGHTS_FINALIZED
+        super().__init__(
+            coordinator,
+            model,
+            kv,
+            groups,
+            backend=backend,
+            force_reference=force_reference,
+            buffers=buffers,
+            max_model_len=max_model_len,
         )
-        self._force_reference = force_reference
-        self._bans = bans
-        self._ban_applier = ban_applier if ban_applier is not None else LogitFillBanApplier()
+        self.bootstrap_stage = BootstrapStage.RESOURCES_BOUND
+        self.eager_runner = EagerRunner(self)
+        self.decode_runner = DecodeCudaGraphRunner(self)
+        self.prefill_runner = None
+        self.decode_max_padding_ratio = float("inf")
+        self.lora = lora
+        if lora is not None and buffers is not None:
+            if lora.working_bytes(buffers.spec.max_num_batched_tokens) > lora.config.memory_bytes:
+                raise MemoryError("LoRA working set exceeds memory reservation")
+        self.speculative_runner = None
+        self.plain_greedy = False
+        self._adapter_leases = {}
+        self._lora_rows = (
+            []
+            if lora is None or buffers is None
+            else [
+                torch.zeros(
+                    buffers.spec.max_num_batched_tokens, dtype=torch.long, device=self.device
+                )
+                for _ in range(buffers.spec.max_inflight)
+            ]
+        )
 
-    def set_bans(self, bans: BansProvider | None) -> None:
-        """Install the per-step ban provider (the engine's sampling masks)."""
-        self._bans = bans
+    def prepare_request(self, request) -> None:
+        if self.speculative_runner is not None or self.plain_greedy:
+            from ayaka.runner.speculative_runner import require_plain_greedy
 
-    def _apply_bans(self, prepared: PreparedStep, logits: torch.Tensor, rows: int) -> None:
-        if self._bans is None:
+            require_plain_greedy(request)
+            if request.adapter is not None:
+                raise ValueError("speculative x LoRA is not certified")
+            if (
+                self.speculative_runner is not None
+                and request.max_total_len
+                > self.speculative_runner.draft.model.config.max_position_embeddings
+            ):
+                raise ValueError("request exceeds the draft model context")
+        lease = None
+        if request.adapter is not None:
+            if self.lora is None:
+                raise ValueError("LoRA is disabled")
+            lease = self.lora.acquire(request.adapter)
+        retained = False
+        try:
+            if self.lora is not None:
+                self.lora.retain_request()
+                retained = True
+            super().prepare_request(request)
+        except BaseException:
+            if lease is not None:
+                lease.close()
+            if retained and self.lora is not None:
+                self.lora.release_request()
+            raise
+        if lease is not None:
+            self._adapter_leases[str(request.request_id)] = lease
+
+    def forget_request(self, request_id: str) -> None:
+        registered = request_id in self._request_ir
+        super().forget_request(request_id)
+        lease = self._adapter_leases.pop(request_id, None)
+        if lease is not None:
+            lease.close()
+        if self.speculative_runner is not None:
+            self.speculative_runner.forget(request_id)
+        if registered and self.lora is not None:
+            self.lora.release_request()
+
+    def enable_speculative(self, draft, config) -> None:
+        from ayaka.runner.speculative_runner import SpeculativeRunner
+
+        if self.lora is not None or self.speculative_runner is not None:
+            raise ValueError("incompatible or already enabled speculative runner")
+        if self.buffers is None or self.buffers.live:
+            raise RuntimeError("speculative bootstrap requires drained static buffers")
+        self.speculative_runner = SpeculativeRunner(self, draft, config)
+
+    def _stage_lora(self, prepared: PreparedStep) -> None:
+        if self.lora is None:
             return
-        bans = self._bans(prepared.step)
-        if len(bans) != rows:
-            raise ValueError(f"ban provider returned {len(bans)} sets for {rows} sampling rows")
-        self._ban_applier.apply(logits, bans)
+        if prepared.buffers is None:
+            raise ValueError("LoRA requires a ticket-owned flight buffer")
+        values = []
+        for scheduled in prepared.step.slices:
+            if scheduled.request_id not in self._request_ir:
+                raise ValueError("LoRA request was not admitted under an adapter lease")
+            lease = self._adapter_leases.get(scheduled.request_id)
+            if lease is not None:
+                lease.validate()
+            values.extend([0 if lease is None else lease.binding.slot] * scheduled.query_count)
+        rows = self._lora_rows[prepared.buffers.index]
+        rows.zero_()
+        rows[: len(values)].copy_(torch.tensor(values, dtype=torch.long, device=self.device))
 
-    def __call__(self, prepared: PreparedStep) -> SampleOutputs:
-        self._validate_prepared(prepared)
-        step = prepared.step
-        plan = step.sampling
-        self._coordinator.flush()
-
-        report = self._generation_report(step)
-        forward = self._forward_tail(prepared)
-        logits = forward.logits
-        sampling_count = forward.sampling_count
-        prompt_descriptors = forward.prompt_descriptors
-        prompt_targets = forward.prompt_targets
-        prompt_ks = forward.prompt_ks
-
-        if sampling_count != plan.num_rows:
-            raise RuntimeError(
-                f"model runner projected {sampling_count} sampling rows but the "
-                f"sampling plan declares {plan.num_rows}"
-            )
-        total_rows = logits.size(0)
-
-        token_ids: torch.Tensor
-        gen_logprobs = None
-        gen_rows: tuple[int, ...] = ()
-        prompt_logprobs = None
-        support = None
-        if total_rows > 0:
-            # RAW-mode rows (and all prompt rows) need the pre-mutation
-            # snapshot; SAMPLING-mode rows are scored from the post-mutation
-            # logits after the draw, so they never enter the snapshot.
-            snapshot = self._raw_snapshot(logits, report, sampling_count, prompt_descriptors)
-
-            if plan.num_rows:
-                # Sampler consumes only the sampling-row prefix of the packed
-                # logits (LogitsPlan contract); prompt rows live beyond it.
-                sampling_logits = logits.narrow(0, 0, plan.num_rows)
-                self._apply_bans(prepared, sampling_logits, plan.num_rows)
-                token_ids, support = self._coordinator.sample_with_support(
-                    sampling_logits,
-                    plan,
-                    force_reference=self._force_reference,
-                )
-            else:
-                token_ids = torch.empty(0, dtype=torch.long, device=logits.device)
-
-            gen_logprobs, gen_rows = self._generation_logprobs(logits, token_ids, report, snapshot)
-            ids_logprobs, ids_rows, ids_counts = self._ids_logprobs(
-                logits, token_ids, report, snapshot
-            )
-
-            prompt_rows = sum(len(entry.positions) for entry in step.prompt_logprobs)
-            if prompt_rows and snapshot is not None:
-                prompt_logprobs = compute_prompt_logprobs(
-                    snapshot[len(report.raw) + report.ids_raw_count :],
-                    torch.tensor(prompt_targets, dtype=torch.long, device=logits.device),
-                    prompt_ks,
-                )
-        else:
-            token_ids = torch.empty(0, dtype=torch.long, device=logits.device)
-            ids_logprobs, ids_rows, ids_counts = None, (), ()
-
-        return SampleOutputs(
-            token_ids=token_ids,
-            logprobs=gen_logprobs,
-            logprob_rows=gen_rows,
-            prompt_logprobs=prompt_logprobs,
-            prompt_logprob_slices=tuple(prompt_descriptors),
-            sampling_support=support,
-            token_ids_logprobs=ids_logprobs,
-            ids_logprob_rows=ids_rows,
-            ids_logprob_counts=ids_counts,
+    def model_variant_context(self, tokens):
+        if self.lora is None:
+            return nullcontext()
+        if self.buffers is None:
+            raise ValueError("LoRA requires static buffers")
+        index = next(
+            (
+                i
+                for i, pointers in enumerate(self.buffers.pointers())
+                if pointers[0] == tokens.data_ptr()
+            ),
+            None,
         )
+        if index is None:
+            raise ValueError("LoRA inputs are outside the flight backing")
+        return self.lora.select(self._lora_rows[index][: tokens.numel()])
 
-    def close(self) -> None:
+    def _model_forward(self, tokens, positions, metadata):
+        forward = super()._model_forward(tokens, positions, metadata)
+
+        def run():
+            with self.model_variant_context(tokens):
+                return forward()
+
+        return run
+
+    def _execute_eager_inputs(self, prepared, inputs):
+        with self.model_variant_context(inputs.tokens):
+            return super()._execute_eager_inputs(prepared, inputs)
+
+    def enable_prefill_graph(self, config: PhaseConfig) -> None:
+        from ayaka.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
+
+        if self.prefill_runner is not None:
+            raise RuntimeError("prefill graphs already enabled; drain and rebuild")
+        self.prefill_runner = PrefillCudaGraphRunner(self, config)
+        try:
+            self.prefill_runner.capture()
+        except BaseException:
+            self.bootstrap_stage = BootstrapStage.FAILED
+            raise
+
+    def on_workspace_growth(self) -> None:
+        super().on_workspace_growth()
+        if self.prefill_runner is not None:
+            self.prefill_runner.invalidated = True
+
+    def enable_graph(self, config: DecodeGraphConfig, *, stream=None) -> int:
+        if self.bootstrap_stage is BootstrapStage.FAILED:
+            raise RuntimeError("failed bootstrap requires a new execution owner")
+        require_ready_weights(self._model)
+        self.bootstrap_stage = BootstrapStage.CAPTURE_READY
+        try:
+            return super().enable_graph(config, stream=stream)
+        except BaseException:
+            self.bootstrap_stage = BootstrapStage.FAILED
+            raise
+
+    def _graph_binding_digest(self) -> str:
+        """Bind model, KV backing, static inputs and backend workspaces together."""
+        proof = getattr(self._model, "_ayaka_weight_readiness", None)
+        parts = [
+            "output=logits",
+            repr(self._graph_config),
+            str(getattr(proof, "revision", None)),
+            weight_binding(self._model),
+            super()._graph_binding_digest(),
+        ]
+        if self.lora is not None:
+            parts.extend(
+                (
+                    repr(self.lora.storage_identity),
+                    repr(tuple(row.data_ptr() for row in self._lora_rows)),
+                )
+            )
+        if self.buffers is not None:
+            parts.append(repr(self.buffers.pointers()))
+        for name, backend in self.backends.items():
+            cache = backend.kv_cache
+            parts.append(repr((name, id(backend), id(self.builders[name]))))
+            for layer in range(cache.num_layers):
+                parts.append(repr(TensorBinding.of(cache.key_cache(layer))))
+                parts.append(repr(TensorBinding.of(cache.value_cache(layer))))
+        return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:24]
+
+    def graph_unavailable_reason(self) -> str | None:
+        reason = super().graph_unavailable_reason()
+        if reason is not None:
+            return reason
+        if self._backend_name != "triton":
+            return "EP0 decode graphs are qualified for Triton attention only"
         return None
 
-    # ------------------------------------------------------------------
-    # internals
-    # ------------------------------------------------------------------
-
-    def _generation_report(self, step) -> _GenerationReport:
-        """Generation reporting rows from scheduler-owned parameters (host).
-
-        Per sampling slice: top-k and reporting mode come from the coordinator
-        host staging; rows split by mode because the two distributions are
-        observed at different pipeline points.
-        """
-        raw: list[LogprobEntry] = []
-        sampling: list[_SamplingReportRow] = []
-        ids: list[_IdsReportRow] = []
-        ids_raw_count = 0
-        row = 0
-        for scheduled in step.slices:
-            if not scheduled.sample_last_query:
-                continue
-            k = self._coordinator.logprob_k_for(scheduled.request_id)
-            if k is not None:
-                if self._coordinator.logprob_mode_for(scheduled.request_id) is LogprobMode.RAW:
-                    raw.append(LogprobEntry(sampling_row=row, k=k))
-                else:
-                    sampling.append(_SamplingReportRow(sampling_row=row, k=k))
-            ids_tokens = self._coordinator.token_ids_logprobs_for(scheduled.request_id)
-            if ids_tokens:
-                mode = self._coordinator.logprob_mode_for(scheduled.request_id)
-                ids.append(_IdsReportRow(sampling_row=row, tokens=ids_tokens, mode=mode))
-                if mode is LogprobMode.RAW:
-                    ids_raw_count += 1
-            row += 1
-        return _GenerationReport(
-            raw=tuple(raw), sampling=tuple(sampling), ids=tuple(ids), ids_raw_count=ids_raw_count
-        )
-
-    def _validate_prepared(self, prepared: PreparedStep) -> None:
-        """Validate host contracts before even flushing sampling device updates."""
-        prepared.validate()
-
-    def _forward_tail(self, prepared: PreparedStep) -> _ForwardResult:
-        """Produce logits for this step's packed sampling/report rows.
-
-        The default path forwards hidden rows and then runs the model's LM head
-        through ``LogitsPlan``. A runner whose model forward is captured inside
-        a CUDA graph overrides this to return the captured logits, so the LM
-        head never runs twice and the sampler stays outside the graph.
-        """
-        return self._project_forward_result(self._forward_prepared(prepared))
-
-    def _project_forward_result(self, result) -> _ForwardResult:
-        """Shared projection/report adapter for staged and legacy eager execution."""
-        (
-            hidden_packed,
-            sampling_count,
-            prompt_descriptors,
-            prompt_targets,
-            prompt_ks,
-        ) = result
-        total_rows = hidden_packed.size(0)
-        if total_rows:
-            logits_plan = LogitsPlan(
-                projection_rows=tuple(range(total_rows)), sampling_row_count=sampling_count
-            )
-            logits = self._logits(hidden_packed, logits_plan)
-        else:
-            logits = torch.empty((0, 0), dtype=torch.float32, device=hidden_packed.device)
-        return _ForwardResult(
-            logits=logits,
-            sampling_count=sampling_count,
-            prompt_descriptors=tuple(prompt_descriptors),
-            prompt_targets=tuple(prompt_targets),
-            prompt_ks=tuple(prompt_ks),
-        )
-
-    def _forward_prepared(self, prepared: PreparedStep):
-        """Forward hook for runners consuming execution-lease KV addresses."""
-        return self._forward_rows(prepared.step)
-
-    def _forward_rows(self, step):
-        """Forward every slice that samples or scores; gather its needed rows.
-
-        Returns (packed hidden ``[R, hidden]``, sampling-row count, prompt
-        descriptors, prompt targets, prompt ks). Packed order: sampling rows
-        first (packed sampling order), then prompt-scored rows ordered by
-        (slice_index, position) — matching the descriptors' contract.
-        """
-        device = next(self._model.parameters()).device
-        prompt_entries = {entry.slice_index: entry for entry in step.prompt_logprobs}
-
-        sampling_rows: list[torch.Tensor] = []
-        scoring_rows: list[torch.Tensor] = []
-        descriptors: list[PromptLogprobSliceReport] = []
-        targets: list[int] = []
-        ks: list[int] = []
-        for index, (scheduled, value) in enumerate(zip(step.slices, step.inputs, strict=True)):
-            entry = prompt_entries.get(index)
-            if not scheduled.sample_last_query and entry is None:
-                continue
-            stream = value.known_tokens[: scheduled.query_end]
-            tokens = torch.tensor(stream, dtype=torch.long, device=device)
-            positions = torch.arange(len(stream), dtype=torch.long, device=device)
-            attention = self._dense_attention()
-            with torch.no_grad():
-                hidden = self._model.forward_hidden(tokens, positions, attention)
-            assert isinstance(hidden, torch.Tensor)
-            if scheduled.sample_last_query:
-                sampling_rows.append(hidden[-1])
-            if entry is not None:
-                for position in entry.positions:
-                    scoring_rows.append(hidden[position - 1])
-                    targets.append(stream[position])
-                    ks.append(entry.k)
-                descriptors.append(
-                    PromptLogprobSliceReport(
-                        slice_index=index,
-                        start=scheduled.query_start,
-                        end=scheduled.query_end,
-                        scored_positions=entry.positions,
-                    )
-                )
-        return (
-            torch.stack([*sampling_rows, *scoring_rows]),
-            len(sampling_rows),
-            descriptors,
-            targets,
-            ks,
-        )
-
-    def _dense_attention(self):
-        """Causal SDPA callback over the full recomputed stream (oracle shape)."""
-        scale = self._model.config.scaling
-
-        def callback(layer_index: int, query, key, value):
-            q = query.transpose(0, 1).unsqueeze(0)
-            k = key.transpose(0, 1).unsqueeze(0)
-            v = value.transpose(0, 1).unsqueeze(0)
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
-            return out.squeeze(0).transpose(0, 1)
-
-        return callback
-
-    def _raw_snapshot(
-        self,
-        logits: torch.Tensor,
-        report: _GenerationReport,
-        sampling_count: int,
-        prompt_descriptors: Sequence[PromptLogprobSliceReport],
-    ):
-        """FP32 copy of the RAW-mode report rows' logits, before any transform.
-
-        SAMPLING-mode rows never enter the snapshot: their distribution is
-        read from the post-mutation logits after the draw. Order: raw
-        generation rows first (their sampling-row indices), then raw-ids
-        rows (same snapshot, scored for specific tokens), then prompt rows
-        in (slice, position) order — matching the compute helpers.
-        """
-        gen_rows = [entry.sampling_row for entry in report.raw]
-        gen_rows.extend(row.sampling_row for row in report.ids if row.mode is LogprobMode.RAW)
-        prompt_rows: list[int] = []
-        cursor = sampling_count
-        for prompt_report in prompt_descriptors:
-            for _ in prompt_report.scored_positions:
-                prompt_rows.append(cursor)
-                cursor += 1
-        if not gen_rows and not prompt_rows:
-            return None
-        rows = torch.tensor([*gen_rows, *prompt_rows], dtype=torch.long, device=logits.device)
-        return logits.index_select(0, rows).to(torch.float32)
-
-    def _ids_logprobs(
-        self,
-        logits: torch.Tensor,
-        token_ids: torch.Tensor,
-        report: _GenerationReport,
-        snapshot,
-    ) -> tuple[TokenIdsLogprobTensors | None, tuple[int, ...], tuple[int, ...]]:
-        """Logprob cho token cụ thể theo mode của từng row.
-
-        RAW rows đọc snapshot (sau các raw top-k rows); SAMPLING rows đọc
-        post-mutation packed logits. Trả (payload, rows sorted, counts).
-        """
-        if not report.ids:
-            return None, (), ()
-        md = self._coordinator.md
-        parts: list[tuple[int, tuple[int, ...], TokenIdsLogprobTensors, int]] = []
-        raw_index = 0
-        for entry in report.ids:
-            if entry.mode is LogprobMode.RAW:
-                assert snapshot is not None
-                offset = len(report.raw) + raw_index
-                z = snapshot[offset]
-                tensors = compute_token_ids_raw_logprobs(
-                    z.unsqueeze(0),
-                    (entry.tokens,),
-                    token_ids[entry.sampling_row : entry.sampling_row + 1],
-                )
-                raw_index += 1
+    def _forward_tail(self, prepared: PreparedStep) -> ForwardResult:
+        if self.kv is None:
+            raise RuntimeError("execution runner is closed")
+        self._stage_lora(prepared)
+        if self.speculative_runner is not None and prepared.step.is_pure_decode:
+            return self.speculative_runner.execute(prepared)
+        batch = ExecutionBatch.from_prepared(prepared, generation=self.kv.generation)
+        phase = self.eager_runner
+        if self.prefill_runner is not None and not prepared.step.is_pure_decode:
+            support = self.prefill_runner.supports(batch)
+            if support.supported:
+                phase = self.prefill_runner
             else:
-                processed = logits[entry.sampling_row : entry.sampling_row + 1]
-                tensors = compute_token_ids_sampling_logprobs(
-                    processed,
-                    (entry.tokens,),
-                    token_ids[entry.sampling_row : entry.sampling_row + 1],
-                    md.active("temperature").index_select(
-                        0, torch.tensor([entry.sampling_row], device=logits.device)
-                    ),
-                    md.active("top_k").index_select(
-                        0, torch.tensor([entry.sampling_row], device=logits.device)
-                    ),
-                    md.active("top_p").index_select(
-                        0, torch.tensor([entry.sampling_row], device=logits.device)
-                    ),
-                    md.active("min_p").index_select(
-                        0, torch.tensor([entry.sampling_row], device=logits.device)
-                    ),
-                )
-            parts.append((entry.sampling_row, entry.tokens, tensors, 0))
+                self.prefill_runner.fallbacks[str(support.reason)] += 1
+        pool = self._graph_pool
+        lease = prepared.buffers
+        # The canonical planner records fallback exactly once, before staging.
+        if (
+            pool is not None
+            and lease is not None
+            and prepared.step.graph.mode is GraphMode.REPLAY
+            and pool.should_replay(prepared.step, lease.index)
+            and self.decode_runner.supports(batch).supported
+            and prepared.step.graph.bucket / batch.token_count <= self.decode_max_padding_ratio
+        ):
+            phase = self.decode_runner
+        invocation = phase.load_batch(batch)
+        return phase.execute(invocation).forward
 
-        parts.sort(key=lambda part: part[0])
-        count = len(parts)
-        width = max(len(part[1]) for part in parts)
-        device = logits.device
-        merged = torch.full((count, width), float("-inf"), dtype=torch.float32, device=device)
-        merged_selected = torch.empty(count, dtype=torch.float32, device=device)
-        for index, (_row, tokens, tensors, _idx) in enumerate(parts):
-            length = len(tokens)
-            if length:
-                merged[index, :length] = tensors.logprobs[0, :length]
-            merged_selected[index] = tensors.token_logprob[0]
-        return (
-            TokenIdsLogprobTensors(logprobs=merged, token_logprob=merged_selected),
-            tuple(part[0] for part in parts),
-            tuple(len(part[1]) for part in parts),
-        )
+    def prepare_execution(self, step: WorkerStep) -> ExecutionBatch:
+        """Worker adapter validates before COW or any other mutating enqueue."""
+        batch = ExecutionBatch.from_worker(step)
+        self._validate_prepared(batch.prepared)
+        if self.lora is not None:
+            adapters = []
+            for scheduled in batch.prepared.step.slices:
+                if scheduled.request_id not in self._request_ir:
+                    raise ValueError("LoRA request was not admitted")
+                lease = self._adapter_leases.get(scheduled.request_id)
+                if lease is not None:
+                    lease.validate()
+                adapters.append(None if lease is None else lease.binding)
+            batch = replace(batch, variant=self.lora.variant, adapters=tuple(adapters))
+        if self.speculative_runner is not None:
+            self.speculative_runner.validate_binding()
+        return batch
 
-    def _generation_logprobs(
-        self,
-        logits: torch.Tensor,
-        token_ids: torch.Tensor,
-        report: _GenerationReport,
-        snapshot,
-    ) -> tuple[SampleLogprobTensors | None, tuple[int, ...]]:
-        """Merge raw + sampling mode results into one report payload.
+    def execute_batch(self, batch: ExecutionBatch):
+        batch.validate()
+        if self.lora is not None:
+            if batch.variant != self.lora.variant:
+                raise ValueError("execution variant changed before enqueue")
+            for scheduled, binding in zip(batch.prepared.step.slices, batch.adapters, strict=True):
+                lease = self._adapter_leases.get(scheduled.request_id)
+                if (None if lease is None else lease.binding) != binding:
+                    raise ValueError("adapter request binding changed before enqueue")
+                if binding is not None:
+                    self.lora.validate(binding)
+        if self.plain_greedy:
+            from ayaka.executor.ticket import SampleOutputs
 
-        Rows are merged by sampling_row; the top width is the max across
-        modes, padded with -1/-inf so materialization stays uniform. Raw rows
-        read the pre-mutation snapshot; sampling rows read the post-mutation
-        packed logits (the sampler already applied penalties/mask in place).
-        """
-        if not report.raw and not report.sampling:
-            return None, ()
-        parts: list[tuple[int, str, SampleLogprobTensors, int]] = []
-        if report.raw:
-            assert snapshot is not None, "raw-mode rows require the pre-mutation snapshot"
-            tensors = compute_raw_logprobs(
-                snapshot[: len(report.raw)], token_ids, LogprobPlan(entries=report.raw)
-            )
-            for index, entry in enumerate(report.raw):
-                parts.append((entry.sampling_row, "raw", tensors, index))
-        if report.sampling:
-            rows = torch.tensor(
-                [row.sampling_row for row in report.sampling],
-                dtype=torch.long,
-                device=logits.device,
-            )
-            md = self._coordinator.md
-            processed = logits.index_select(0, rows)
-            tensors = compute_sampling_logprobs(
-                processed,
-                token_ids.index_select(0, rows),
-                [row.k for row in report.sampling],
-                md.active("temperature").index_select(0, rows),
-                md.active("top_k").index_select(0, rows),
-                md.active("top_p").index_select(0, rows),
-                md.active("min_p").index_select(0, rows),
-            )
-            for index, row in enumerate(report.sampling):
-                parts.append((row.sampling_row, "sampling", tensors, index))
+            forward = self._forward_tail(batch.prepared)
+            if not forward.sampling_count:
+                return SampleOutputs(torch.empty(0, dtype=torch.long, device=self.device))
+            self._apply_bans(batch.prepared, forward.logits, forward.sampling_count)
+            return SampleOutputs(forward.logits.argmax(-1))
+        return self(batch.prepared)
 
-        parts.sort(key=lambda part: part[0])
-        count = len(parts)
-        top_width = max(part[2].top_token_ids.size(1) for part in parts)
-        device = logits.device
-        merged_lp = torch.empty(count, dtype=torch.float32, device=device)
-        merged_ids = torch.full((count, top_width), -1, dtype=torch.long, device=device)
-        merged_vals = torch.full(
-            (count, top_width), float("-inf"), dtype=torch.float32, device=device
-        )
-        for mode in ("raw", "sampling"):
-            positions = torch.tensor(
-                [slot for slot, part in enumerate(parts) if part[1] == mode],
-                dtype=torch.long,
-                device=device,
-            )
-            if positions.numel() == 0:
-                continue
-            first = next(part for part in parts if part[1] == mode)
-            width = first[2].top_token_ids.size(1)
-            source_lp = torch.stack(
-                [part[2].token_logprob[part[3]] for part in parts if part[1] == mode]
-            )
-            merged_lp.index_copy_(0, positions, source_lp)
-            if width and top_width:
-                source_ids = torch.stack(
-                    [part[2].top_token_ids[part[3]] for part in parts if part[1] == mode]
-                )
-                source_vals = torch.stack(
-                    [part[2].top_logprobs[part[3]] for part in parts if part[1] == mode]
-                )
-                merged_ids[:, :width].index_copy_(0, positions, source_ids)
-                merged_vals[:, :width].index_copy_(0, positions, source_vals)
-        rows_out = tuple(part[0] for part in parts)
-        return (
-            SampleLogprobTensors(
-                token_logprob=merged_lp, top_token_ids=merged_ids, top_logprobs=merged_vals
-            ),
-            rows_out,
-        )
+    def mark_worker_ready(self) -> None:
+        if self.bootstrap_stage in (BootstrapStage.FAILED, BootstrapStage.CLOSED):
+            raise RuntimeError("failed/closed execution bootstrap cannot become ready")
+        self.bootstrap_stage = BootstrapStage.WORKER_READY
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self.buffers is not None and self.buffers.live:
+            raise RuntimeError("cannot close execution while flight leases remain live")
+        if self.prefill_runner is not None:
+            self.prefill_runner.close()
+        if self.speculative_runner is not None:
+            self.speculative_runner.close()
+        super().close()
+        self.eager_runner.close()
+        self.decode_runner.close()
+        self.bootstrap_stage = BootstrapStage.CLOSED

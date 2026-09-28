@@ -19,8 +19,8 @@ from threading import RLock
 import torch
 from torch import nn
 
-from ayaka.execution.execution_variant import AdapterIdentity, ExecutionVariant
 from ayaka.layers.linear.core import LinearBase
+from ayaka.lora.variant import AdapterIdentity, ExecutionVariant
 from ayaka.utils.validation import require_int
 
 

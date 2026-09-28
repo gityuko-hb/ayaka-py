@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Ayaka is a Python LLM inference engine. Source lives in `python/ayaka/`: `configs/` defines configuration, `model_loader/` and `weights/` handle checkpoints, `memory/` and `kvcache/` manage storage, and `sched/`, `executor/`, and `attention/` define execution components. GPU operations live in `kernel/triton/`; shared helpers belong in `utils/`. Tests live in `tests/`, and contribution templates live in `.github/`.
+Ayaka is a Python LLM inference engine. Source lives in `python/ayaka/`: `configs/` defines configuration and execution phase policy, `model_loader/` and `weights/` handle checkpoints and weight readiness, `memory/` and `kvcache/` manage storage, while `sched/`, `executor/`, `worker/`, and `runner/` define execution components (phase adapters, graph programs, PDMux lanes). `device/` owns hardware qualification and profiles, `lora/` owns adapter bindings, `sampling/` owns samplers and speculative acceptance, and `attention/` owns the attention backend contract and scoped forward context. GPU operations live in `kernel/triton/`; shared helpers belong in `utils/`. Tests live in `tests/`, and contribution templates live in `.github/`. The former `execution/` package has been dissolved into these owners; import dependencies flow `runtime/worker → runner → configs/device/model_loader/attention`.
 
 ## Build, Test, and Development Commands
 

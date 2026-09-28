@@ -7,8 +7,8 @@ from typing import Any
 
 import torch
 
-from ayaka.execution.execution_lane import ExecutionLane, ExecutionLaneConfig
 from ayaka.memory.views import ExecutionMemoryView
+from ayaka.worker.execution_lane import ExecutionLane, ExecutionLaneConfig
 
 
 @dataclass(slots=True)

@@ -8,6 +8,8 @@ from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from ayaka.utils.validation import require_int
+
 
 class ConfigError(ValueError):
     """A validation failure with a stable code and a machine-readable path."""
@@ -91,3 +93,13 @@ class ConfigMixin:
     @property
     def fingerprint(self) -> str:
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+
+def validate_buckets(buckets: tuple[int, ...]) -> None:
+    """Reject coercion, duplicates and reordering of an operator's choices."""
+    if not isinstance(buckets, tuple) or not buckets:
+        raise ValueError("buckets must be a non-empty tuple")
+    for bucket in buckets:
+        require_int(bucket, "bucket", minimum=1)
+    if tuple(sorted(set(buckets))) != buckets:
+        raise ValueError("buckets must be ascending and deduplicated")

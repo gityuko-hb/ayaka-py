@@ -4,24 +4,13 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from enum import StrEnum
 from uuid import uuid4
 
 import torch
 from torch import nn
 
-from ayaka.execution.input_buffers import TensorBinding
 from ayaka.layers.base import BaseLayer
-
-
-class BootstrapStage(StrEnum):
-    MODEL_LOADED = "model_loaded"
-    WEIGHTS_FINALIZED = "weights_finalized"
-    RESOURCES_BOUND = "resources_bound"
-    CAPTURE_READY = "capture_ready"
-    WORKER_READY = "worker_ready"
-    FAILED = "failed"
-    CLOSED = "closed"
+from ayaka.runner.input_buffers import TensorBinding
 
 
 @dataclass(frozen=True, slots=True)

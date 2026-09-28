@@ -5,14 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ayaka.execution.execution_variant import ExecutionVariant
+from ayaka.lora.variant import ExecutionVariant
 from ayaka.memory.capacity import ResourceGeneration
 from ayaka.sched.plan import PreparedStep
 from ayaka.types import ForwardMode
 
 if TYPE_CHECKING:
-    from ayaka.execution.lora_execution_binding import AdapterBinding
     from ayaka.executor.ticket import TicketId
+    from ayaka.lora.binding import AdapterBinding
     from ayaka.worker.base import WorkerStep
 
 

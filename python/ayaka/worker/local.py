@@ -33,7 +33,7 @@ from ayaka.worker.lifecycle import FlightKey, WorkerLifecycle, WorkerState
 from ayaka.worker.resources import WorkerResources
 
 if TYPE_CHECKING:
-    from ayaka.execution.prefill_decode_multiplexer import PrefillDecodeMultiplexer
+    from ayaka.worker.multiplexer import PrefillDecodeMultiplexer
 
 __all__ = ["LocalWorker"]
 

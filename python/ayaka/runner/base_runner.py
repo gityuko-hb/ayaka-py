@@ -11,9 +11,9 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from ayaka.execution.execution_batch import ExecutionBatch
-from ayaka.execution.execution_result import ExecutionResult
-from ayaka.execution.input_buffers import InputBuffers
+from ayaka.runner.execution_batch import ExecutionBatch
+from ayaka.runner.execution_result import ExecutionResult
+from ayaka.runner.input_buffers import InputBuffers
 
 if TYPE_CHECKING:
     from ayaka.runner.paged_runner import PagedModelRunner, StagedEagerInputs

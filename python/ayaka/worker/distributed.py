@@ -43,7 +43,7 @@ from ayaka.distributed.execution import (
     RankLocalStepHost,
 )
 from ayaka.distributed.step_envelope import DistributedStepEnvelope
-from ayaka.distributed.worker import RankLocalKVWorkerState
+from ayaka.worker.rank_local import RankLocalKVWorkerState
 from ayaka.executor.ticket import CompletionFence as ExecutorCompletionFence
 from ayaka.executor.ticket import FenceResult, WorkState
 from ayaka.plan import ExecutionPlan

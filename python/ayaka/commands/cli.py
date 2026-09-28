@@ -63,7 +63,7 @@ def main(argv=None) -> None:
         help="explicit graph-private reserve; 0 auto-sizes it on the triton backend",
     )
     args = parser.parse_args(argv)
-    from ayaka.execution.phase_config import RequestedOverrides
+    from ayaka.configs.phase import RequestedOverrides
 
     execution = None
     if args.execution_config is not None:

@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from ayaka.execution.forward_context import ForwardContext, forward_context
+from ayaka.attention.forward_context import ForwardContext, forward_context
 from ayaka.runner.graph.backend import EagerSpan, Spans
 
 

@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from ayaka.execution.execution_lane import ExecutionLaneConfig
-    from ayaka.execution.lora_execution_binding import LoRAConfig
-    from ayaka.execution.phase_config import RequestedOverrides
-    from ayaka.execution.speculative_execution_batch import SpeculativeConfig
+    from ayaka.configs.phase import RequestedOverrides
+    from ayaka.configs.speculative import SpeculativeConfig
+    from ayaka.lora.binding import LoRAConfig
+    from ayaka.worker.execution_lane import ExecutionLaneConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,10 +75,10 @@ class ServingConfig:
     execution_lanes: ExecutionLaneConfig | None = None
 
     def __post_init__(self) -> None:
-        from ayaka.execution.execution_lane import ExecutionLaneConfig
-        from ayaka.execution.lora_execution_binding import LoRAConfig
-        from ayaka.execution.phase_config import RequestedOverrides
-        from ayaka.execution.speculative_execution_batch import SpeculativeConfig
+        from ayaka.configs.phase import RequestedOverrides
+        from ayaka.configs.speculative import SpeculativeConfig
+        from ayaka.lora.binding import LoRAConfig
+        from ayaka.worker.execution_lane import ExecutionLaneConfig
 
         if self.lora is not None and not isinstance(self.lora, LoRAConfig):
             raise TypeError("lora must be LoRAConfig or None")
