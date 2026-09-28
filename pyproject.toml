@@ -67,7 +67,7 @@ flash-attn = ["flash-attn>=2.7,<3"]
 
 
 [project.scripts]
-ayaka = "ayaka.entrypoints.cli:main"
+ayaka = "ayaka.commands.cli:main"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
@@ -88,9 +88,6 @@ torch = [
     { index = "pytorch-cu130", extra = "cuda" },
     { index = "pytorch-cpu", extra = "cpu" },
 ]
-
-[tool.scikit-build]
-wheel.packages = ["python/ayaka"]
 
 [tool.setuptools]
 package-dir = { "" = "python" }
@@ -136,6 +133,12 @@ dev = [
 test = ["psutil>=7.2.2"]
 
 [tool.setuptools.package-data]
+# nvidia_support_matrix.json is the declared hardware coverage. It ships so a
+# wheel can report what it has actually qualified. There is deliberately no
+# build-target file: architecture coverage is read from the installed framework
+# at runtime, because a project-maintained list could only ever disagree with
+# the wheel that is installed.
+"ayaka.execution" = ["nvidia_support_matrix.json"]
 "ayaka.kernel" = [
     "csrc/**/*.cpp",
     "csrc/**/*.cu",
