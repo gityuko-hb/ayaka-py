@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ayaka.configs.hardware import HardwareConfig
-from ayaka.distributed.device import DeviceRef, LinkKind
+from ayaka.device.spec import DeviceRef, LinkKind
 
 _LINK_COST: dict[LinkKind, int] = {
     LinkKind.SELF: 0,

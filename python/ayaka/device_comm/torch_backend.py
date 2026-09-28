@@ -8,7 +8,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ayaka.distributed.device import AsyncHandle, CommOpType, DeviceGroup
+from ayaka.device.spec import AsyncHandle, CommOpType, DeviceGroup
 from ayaka.distributed.parallel import RuntimeParallelContext
 
 

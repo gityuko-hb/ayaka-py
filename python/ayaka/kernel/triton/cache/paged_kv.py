@@ -253,7 +253,7 @@ def indexer_k_quant_and_cache_kernel(
         scale = next_power_of_2_f32(scale)
 
     # The sparse-indexer cache is intentionally fixed to E4M3.
-    q = quantize_if_fp8(x, scale, True, False)
+    q = quantize_if_fp8(x, scale, True, False)  # pyright: ignore[reportArgumentType]
 
     base = kv_cache_ptr + block_idx * cache_block_stride
     tl.store(base + block_off * head_dim + offs, q, mask=mask)
@@ -292,8 +292,8 @@ def cp_gather_indexer_k_quant_cache_kernel(
         cu_seq_lens_ptr,
         batch_size,
         num_iters,
-        False,
-        True,
+        False,  # pyright: ignore[reportArgumentType]
+        True,  # pyright: ignore[reportArgumentType]
     )
 
     logical = pos // cache_block_size
@@ -309,7 +309,7 @@ def cp_gather_indexer_k_quant_cache_kernel(
     row = blk_base + in_block.to(tl.int64) * head_dim
     dst_row = dst_k_ptr + tok.to(tl.int64) * dst_k_stride
 
-    for d0 in tl.static_range(0, HEAD_DIM, BLOCK_D):
+    for d0 in tl.static_range(0, HEAD_DIM, BLOCK_D):  # pyright: ignore[reportGeneralTypeIssues]
         d = d0 + tl.arange(0, BLOCK_D)
         m = ok[:, None] & (d < HEAD_DIM)[None, :]
         val = tl.load(row[:, None] + d[None, :], mask=m, other=0)
@@ -396,7 +396,7 @@ def gather_cache_kernel(
             num_reqs,
             num_iters,
             HAS_SEQ_STARTS,
-            True,
+            True,  # pyright: ignore[reportArgumentType]
         )
         logical = pos // block_size
         in_block = pos - logical * block_size
@@ -417,7 +417,7 @@ def gather_cache_kernel(
     else:
         scale = 1.0
 
-    for e0 in tl.static_range(0, ENTRY_SIZE, BLOCK_E):
+    for e0 in tl.static_range(0, ENTRY_SIZE, BLOCK_E):  # pyright: ignore[reportGeneralTypeIssues]
         e = e0 + tl.arange(0, BLOCK_E)
         m = ok[:, None] & (e < ENTRY_SIZE)[None, :]
         x = tl.load(src_row[:, None] + e[None, :], mask=m, other=0)
@@ -509,7 +509,7 @@ def _launch_batched_copy(src_addrs: torch.Tensor, dst_addrs: torch.Tensor, sizes
                 desc[2, off : off + cnt],
                 BLOCK=block,
                 WORD=word,
-                num_warps=4,
+                num_warps=4,  # pyright: ignore[reportCallIssue]
             ),
         )
 
@@ -690,7 +690,7 @@ def reshape_and_cache(
                 BLOCK_D=block_d,
                 KV_QUANTIZED=quantized,
                 IS_E5M2=is_e5m2,
-                num_warps=warps_for_tile(block_d),
+                num_warps=warps_for_tile(block_d),  # pyright: ignore[reportCallIssue]
             ),
         )
 
@@ -823,7 +823,7 @@ def reshape_and_cache_flash(
                 IS_E5M2=is_e5m2,
                 SCALAR_SCALES=scalar_scales,
                 INVERSE_SCALES=inverse_scales,
-                num_warps=warps_for_tile(block_d * heads_per_prog),
+                num_warps=warps_for_tile(block_d * heads_per_prog),  # pyright: ignore[reportCallIssue]
             ),
         )
 
@@ -895,7 +895,7 @@ def convert_fp8(
                 KV_QUANTIZED=quantized,
                 IS_E5M2=is_e5m2,
                 TO_CACHE=to_cache,
-                num_warps=4,
+                num_warps=4,  # pyright: ignore[reportCallIssue]
             ),
         )
 
@@ -944,7 +944,7 @@ def _gather_launch(
                 HAS_SEQ_STARTS=seq_starts is not None,
                 DIRECT_SLOTS=False,
                 SCALAR_SCALE=False,
-                num_warps=4,
+                num_warps=4,  # pyright: ignore[reportCallIssue]
             ),
         )
 
@@ -1118,7 +1118,7 @@ def indexer_k_quant_and_cache(
                 NUM_QBLOCKS=num_qblocks,
                 USE_UE8M0=scale_fmt == "ue8m0",
                 SCALE_DIVISOR=float(FP8_E4M3_MAX),
-                num_warps=warps_for_tile(block),
+                num_warps=warps_for_tile(block),  # pyright: ignore[reportCallIssue]
             ),
         )
 
@@ -1210,7 +1210,7 @@ def cp_gather_indexer_k_quant_cache(
                 BLOCK_T=block_t,
                 BLOCK_D=min(256, triton.next_power_of_2(head_dim)),
                 BLOCK_S=triton.next_power_of_2(num_qblocks),
-                num_warps=4,
+                num_warps=4,  # pyright: ignore[reportCallIssue]
             ),
         )
 

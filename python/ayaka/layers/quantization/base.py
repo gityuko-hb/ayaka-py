@@ -13,7 +13,7 @@ from ayaka.utils.import_utils import CapabilityError, has_module
 
 if TYPE_CHECKING:
     from ayaka.device.context import DeviceContext
-    from ayaka.distributed.device import DeviceGroup
+    from ayaka.device.spec import DeviceGroup
 
 
 def _positive_int(value: int, name: str) -> None:

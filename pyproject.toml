@@ -120,6 +120,19 @@ markers = [
 pythonVersion = "3.13"
 venvPath = "."
 venv = ".venv"
+# `python/` is the only tracked source root. Everything else is local scratch
+# (tests, benchmarks, docs, research, artifacts) and is excluded so a clean
+# `pyright .` reflects the shipped package.
+exclude = [
+    "artifacts",
+    "benchmarks",
+    "docs",
+    "main.py",
+    "research",
+    "tests",
+    "tools",
+    "**/__pycache__",
+]
 
 [dependency-groups]
 dev = [

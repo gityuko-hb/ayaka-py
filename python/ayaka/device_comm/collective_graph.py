@@ -17,15 +17,15 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ayaka.distributed.collective_backend import (
+from ayaka.device_comm.collective_backend import (
     CollectivePostLaunchError,
     CollectivePreLaunchError,
 )
-from ayaka.distributed.custom_all_reduce import _ordered_exchange
+from ayaka.device_comm.custom_all_reduce import _ordered_exchange
 from ayaka.kernel.comm_layout import STATUS_TIMEOUT
 
 if TYPE_CHECKING:
-    from ayaka.distributed.custom_all_reduce import CustomAllReduce
+    from ayaka.device_comm.custom_all_reduce import CustomAllReduce
 
 __all__ = ["CapturedCollective", "CollectiveGraphIdentity", "GraphCollectiveHandle"]
 

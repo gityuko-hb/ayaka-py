@@ -5,7 +5,7 @@ monotonic tickets, all-or-nothing outcomes, credit flow control) across nodes:
 
 - Same node: the two endpoints share memory — a descriptor is completed by
   reference; the intra-node CUDA peer matrix from
-  :class:`~ayaka.distributed.topology.PeerTopology` decides whether a real
+  :class:`~ayaka.device_comm.topology.PeerTopology` decides whether a real
   ``PeerPageMover``-style device copy can bypass staging.
 - Cross node: :class:`TcpRemoteChannel` frames chunks over sockets behind a
   geometry handshake; :class:`LoopbackRemoteChannel` pairs two engines
@@ -29,7 +29,7 @@ from itertools import count
 from threading import RLock
 from typing import Protocol, runtime_checkable
 
-from ayaka.distributed.topology import PeerTopology
+from ayaka.device_comm.topology import PeerTopology
 from ayaka.memory.tiering import TransferState
 from ayaka.prefix.transfer import TransferCredits
 

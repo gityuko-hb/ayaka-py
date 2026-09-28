@@ -8,7 +8,7 @@ from typing import Protocol
 
 import torch
 
-from ayaka.distributed.device import CommunicationBackend, DeviceGroup
+from ayaka.device.spec import CommunicationBackend, DeviceGroup
 from ayaka.utils.import_utils import CapabilityError
 from ayaka.utils.validation import require_int
 

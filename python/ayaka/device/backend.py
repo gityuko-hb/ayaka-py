@@ -5,7 +5,7 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Protocol, runtime_checkable
 
 from ayaka.configs.hardware import CC_LIMITS
-from ayaka.distributed.device import DeviceCapability
+from ayaka.device.spec import DeviceCapability
 from ayaka.utils.torch_utils import (
     compute_capability,
     cuda_available,

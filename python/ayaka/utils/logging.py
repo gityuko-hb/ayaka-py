@@ -174,7 +174,7 @@ class JSONFormatter(logging.Formatter):
     - ts: ISO 8601 timestamp with millisecond precision
     - level: Log level name (INFO, WARNING, etc.)
     - logger: Logger name
-    - rank: Process global rank from ``ayaka.distributed.rank()``
+    - rank: Process global rank from ``ayaka.distributed.env.rank()``
     - message: The formatted message
     - exception: Formatted traceback (if present)
     - Custom extra metadata attributes starting with ``ayaka_`` (stripped prefix).

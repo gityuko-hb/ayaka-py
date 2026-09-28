@@ -43,12 +43,12 @@ from ayaka.distributed.execution import (
     RankLocalStepHost,
 )
 from ayaka.distributed.step_envelope import DistributedStepEnvelope
-from ayaka.worker.rank_local import RankLocalKVWorkerState
 from ayaka.executor.ticket import CompletionFence as ExecutorCompletionFence
 from ayaka.executor.ticket import FenceResult, WorkState
 from ayaka.plan import ExecutionPlan
 from ayaka.worker.base import StepWorker, WorkerOutcome, WorkerStep
 from ayaka.worker.lifecycle import WorkerState
+from ayaka.worker.rank_local import RankLocalKVWorkerState
 
 __all__ = [
     "DistributedStepWorker",
@@ -455,11 +455,11 @@ def build_distributed_worker(
 
     Lifecycle: call :meth:`DistributedStepWorker.shutdown`/:meth:`~DistributedStepWorker.close`
     on every rank to run the coordinated group shutdown, then
-    :func:`ayaka.distributed.runtime.shutdown_distributed_process_group` on every
+    :func:`ayaka.distributed.process_group_lifecycle.shutdown_distributed_process_group` on every
     rank for the final barrier and to destroy a group this process initialized.
     """
     if process_group is None:
-        from ayaka.distributed.runtime import init_distributed_process_group
+        from ayaka.distributed.process_group_lifecycle import init_distributed_process_group
 
         process_group = init_distributed_process_group(plan, group=group)
     return DistributedStepWorker(

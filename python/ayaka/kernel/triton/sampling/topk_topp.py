@@ -124,7 +124,7 @@ def _sampling_from_probs_kernel(
         cols = v_offset + tl.arange(0, BLOCK_SIZE)
         mask = cols < vocab_size
         p = tl.load(probs_ptr + row_offset + cols, mask=mask, other=0.0)
-        total_prob += tl.sum(p, axis=0)
+        total_prob += tl.sum(p, axis=0)  # pyright: ignore[reportOperatorIssue]
 
     # 3. Pass 2: first token crossing the CDF threshold: u * total_prob
     target = u * total_prob
@@ -138,18 +138,18 @@ def _sampling_from_probs_kernel(
 
         # In-block prefix sum
         block_cdf = accum + tl.cumsum(p, axis=0)
-        matched = mask & (block_cdf >= target) & (sampled_idx < 0)
+        matched = mask & (block_cdf >= target) & (sampled_idx < 0)  # pyright: ignore[reportOperatorIssue]
 
-        if tl.sum(matched.to(tl.int32), axis=0) > 0:
+        if tl.sum(matched.to(tl.int32), axis=0) > 0:  # pyright: ignore[reportOperatorIssue]
             # Pick the first matching index
             first_match_offset = tl.min(tl.where(matched, cols, vocab_size), axis=0)
-            if sampled_idx < 0:
+            if sampled_idx < 0:  # pyright: ignore[reportOperatorIssue]
                 sampled_idx = first_match_offset
 
-        accum += tl.sum(p, axis=0)
+        accum += tl.sum(p, axis=0)  # pyright: ignore[reportOperatorIssue]
 
     # Float rounding may leave u unmatched — fall back to the last token
-    if sampled_idx < 0:
+    if sampled_idx < 0:  # pyright: ignore[reportOperatorIssue]
         sampled_idx = vocab_size - 1
 
     tl.store(output_ptr + row_idx, sampled_idx)
@@ -245,7 +245,7 @@ def _min_p_sampling_kernel(
         mask = cols < vocab_size
         p = tl.load(probs_ptr + row_offset + cols, mask=mask, other=0.0)
         filtered_p = tl.where(p >= cutoff, p, 0.0)
-        sum_valid_p += tl.sum(filtered_p, axis=0)
+        sum_valid_p += tl.sum(filtered_p, axis=0)  # pyright: ignore[reportOperatorIssue]
 
     # Pass 3: scan the filtered cumulative CDF for a token
     target = u * sum_valid_p
@@ -259,16 +259,16 @@ def _min_p_sampling_kernel(
         filtered_p = tl.where(p >= cutoff, p, 0.0)
 
         block_cdf = accum + tl.cumsum(filtered_p, axis=0)
-        matched = mask & (block_cdf >= target) & (filtered_p > 0.0) & (sampled_idx < 0)
+        matched = mask & (block_cdf >= target) & (filtered_p > 0.0) & (sampled_idx < 0)  # pyright: ignore[reportOperatorIssue]
 
-        if tl.sum(matched.to(tl.int32), axis=0) > 0:
+        if tl.sum(matched.to(tl.int32), axis=0) > 0:  # pyright: ignore[reportOperatorIssue]
             first_match_offset = tl.min(tl.where(matched, cols, vocab_size), axis=0)
-            if sampled_idx < 0:
+            if sampled_idx < 0:  # pyright: ignore[reportOperatorIssue]
                 sampled_idx = first_match_offset
 
-        accum += tl.sum(filtered_p, axis=0)
+        accum += tl.sum(filtered_p, axis=0)  # pyright: ignore[reportOperatorIssue]
 
-    if sampled_idx < 0:
+    if sampled_idx < 0:  # pyright: ignore[reportOperatorIssue]
         sampled_idx = vocab_size - 1
 
     tl.store(output_ptr + row_idx, sampled_idx)
@@ -358,7 +358,7 @@ def _top_p_sampling_kernel(
             cols = v_offset + tl.arange(0, BLOCK_SIZE)
             mask = cols < vocab_size
             p = tl.load(probs_ptr + row_offset + cols, mask=mask, other=0.0)
-            current_sum += tl.sum(tl.where(p >= mid, p, 0.0), axis=0)
+            current_sum += tl.sum(tl.where(p >= mid, p, 0.0), axis=0)  # pyright: ignore[reportOperatorIssue]
 
         if current_sum >= top_p:
             low = mid
@@ -373,7 +373,7 @@ def _top_p_sampling_kernel(
         cols = v_offset + tl.arange(0, BLOCK_SIZE)
         mask = cols < vocab_size
         p = tl.load(probs_ptr + row_offset + cols, mask=mask, other=0.0)
-        sum_valid += tl.sum(tl.where(p >= threshold, p, 0.0), axis=0)
+        sum_valid += tl.sum(tl.where(p >= threshold, p, 0.0), axis=0)  # pyright: ignore[reportOperatorIssue]
 
     # 3. CDF sampling
     target = u * sum_valid
@@ -387,16 +387,16 @@ def _top_p_sampling_kernel(
         filtered_p = tl.where(p >= threshold, p, 0.0)
 
         block_cdf = accum + tl.cumsum(filtered_p, axis=0)
-        matched = mask & (block_cdf >= target) & (filtered_p > 0.0) & (sampled_idx < 0)
+        matched = mask & (block_cdf >= target) & (filtered_p > 0.0) & (sampled_idx < 0)  # pyright: ignore[reportOperatorIssue]
 
-        if tl.sum(matched.to(tl.int32), axis=0) > 0:
+        if tl.sum(matched.to(tl.int32), axis=0) > 0:  # pyright: ignore[reportOperatorIssue]
             first_match_offset = tl.min(tl.where(matched, cols, vocab_size), axis=0)
-            if sampled_idx < 0:
+            if sampled_idx < 0:  # pyright: ignore[reportOperatorIssue]
                 sampled_idx = first_match_offset
 
-        accum += tl.sum(filtered_p, axis=0)
+        accum += tl.sum(filtered_p, axis=0)  # pyright: ignore[reportOperatorIssue]
 
-    if sampled_idx < 0:
+    if sampled_idx < 0:  # pyright: ignore[reportOperatorIssue]
         sampled_idx = vocab_size - 1
 
     tl.store(output_ptr + row_idx, sampled_idx)
@@ -492,7 +492,7 @@ def _bisect_filtered_sample(
                 x = tl.load(logits_ptr + row_offset + cols, mask=mask, other=float("-inf")).to(
                     tl.float32
                 )
-                cnt += tl.sum((x >= mid).to(tl.int32), axis=0)
+                cnt += tl.sum((x >= mid).to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
             if cnt >= top_k:
                 lo = mid
             else:
@@ -515,7 +515,7 @@ def _bisect_filtered_sample(
             x = tl.load(logits_ptr + row_offset + cols, mask=mask, other=float("-inf")).to(
                 tl.float32
             )
-            s_k += tl.sum(tl.where(x >= t_k, tl.exp(x - x_max), 0.0), axis=0)
+            s_k += tl.sum(tl.where(x >= t_k, tl.exp(x - x_max), 0.0), axis=0)  # pyright: ignore[reportOperatorIssue]
         # Bisect value t in [max(t_k, x_min), x_max] for the largest
         # threshold with sum_{x >= t} e^(x - x_max) >= top_p * S_k.
         lo = tl.where(t_k == float("-inf"), x_min, t_k)
@@ -529,7 +529,7 @@ def _bisect_filtered_sample(
                 x = tl.load(logits_ptr + row_offset + cols, mask=mask, other=float("-inf")).to(
                     tl.float32
                 )
-                partial += tl.sum(tl.where(x >= mid, tl.exp(x - x_max), 0.0), axis=0)
+                partial += tl.sum(tl.where(x >= mid, tl.exp(x - x_max), 0.0), axis=0)  # pyright: ignore[reportOperatorIssue]
             if partial >= top_p * s_k:
                 lo = mid
             else:
@@ -548,7 +548,7 @@ def _bisect_filtered_sample(
         cols = v_offset + tl.arange(0, BLOCK_SIZE)
         mask = cols < vocab_size
         x = tl.load(logits_ptr + row_offset + cols, mask=mask, other=float("-inf")).to(tl.float32)
-        s_keep += tl.sum(tl.where(x >= t_final, tl.exp(x - x_max), 0.0), axis=0)
+        s_keep += tl.sum(tl.where(x >= t_final, tl.exp(x - x_max), 0.0), axis=0)  # pyright: ignore[reportOperatorIssue]
 
     target = u * s_keep
     accum = 0.0
@@ -559,14 +559,14 @@ def _bisect_filtered_sample(
         x = tl.load(logits_ptr + row_offset + cols, mask=mask, other=float("-inf")).to(tl.float32)
         w = tl.where(x >= t_final, tl.exp(x - x_max), 0.0)
         block_cdf = accum + tl.cumsum(w, axis=0)
-        matched = mask & (block_cdf >= target) & (w > 0.0) & (sampled_idx < 0)
-        if tl.sum(matched.to(tl.int32), axis=0) > 0:
+        matched = mask & (block_cdf >= target) & (w > 0.0) & (sampled_idx < 0)  # pyright: ignore[reportOperatorIssue]
+        if tl.sum(matched.to(tl.int32), axis=0) > 0:  # pyright: ignore[reportOperatorIssue]
             first_match_offset = tl.min(tl.where(matched, cols, vocab_size), axis=0)
-            if sampled_idx < 0:
+            if sampled_idx < 0:  # pyright: ignore[reportOperatorIssue]
                 sampled_idx = first_match_offset
-        accum += tl.sum(w, axis=0)
+        accum += tl.sum(w, axis=0)  # pyright: ignore[reportOperatorIssue]
 
-    if sampled_idx < 0:
+    if sampled_idx < 0:  # pyright: ignore[reportOperatorIssue]
         sampled_idx = vocab_size - 1
 
     return sampled_idx

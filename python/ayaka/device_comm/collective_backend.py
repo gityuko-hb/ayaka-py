@@ -35,7 +35,7 @@ from typing import Any, NoReturn, Protocol, runtime_checkable
 
 from ayaka.configs.base import ConfigMixin
 from ayaka.configs.parallel import CollectivePolicy
-from ayaka.distributed.device import (
+from ayaka.device.spec import (
     AsyncHandle,
     CommOpType,
     CommunicationBackend,
@@ -490,7 +490,7 @@ def probe_collective_capability(
             reason=CollectiveReason.CUSTOM_UNAVAILABLE,
         )
 
-    from ayaka.distributed.p2p_probe import probe_verified_topology
+    from ayaka.device_comm.p2p_probe import probe_verified_topology
 
     active_probe = probe if probe is not None else probe_verified_topology
     report = active_probe(

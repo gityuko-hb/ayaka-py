@@ -7,15 +7,9 @@ from collections.abc import Callable
 class CancelledError(RuntimeError):
     """Raised by :meth:`CancellationToken.raise_if_cancelled`."""
 
+
 class CancellationToken:
-    __slots__ = (
-        "_callbacks",
-        "_cancelled",
-        "_children",
-        "_lock",
-        "_reason",
-        "name"
-    )
+    __slots__ = ("_callbacks", "_cancelled", "_children", "_lock", "_reason", "name")
 
     def __init__(self, name: str = "") -> None:
         self.name = name

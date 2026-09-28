@@ -20,8 +20,8 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from ayaka.distributed.node_transport import NodeTransferEngine, NodeTransferTicket
 from ayaka.memory.tiering import TransferState
+from ayaka.serving.node_transport import NodeTransferEngine, NodeTransferTicket
 from ayaka.serving.router import RemoteKVPending
 
 __all__ = ["MigrationController"]

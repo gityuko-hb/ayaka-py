@@ -123,8 +123,7 @@ class OpHandle:
                 raise CapabilityError(
                     f"reference::{self.name}",
                     detail=(
-                        "reference implementations are forced but this op "
-                        "does not declare one"
+                        "reference implementations are forced but this op does not declare one"
                     ),
                     remedy=f"add reference= to the @custom_op on {self.name}",
                 )
@@ -218,9 +217,7 @@ def _reduce_signature(
     original = fn
     original_sig = inspect.signature(fn)
     reduced_params = [
-        param
-        for name, param in original_sig.parameters.items()
-        if name not in computed_args
+        param for name, param in original_sig.parameters.items() if name not in computed_args
     ]
     reduced_sig = original_sig.replace(parameters=reduced_params)
 
@@ -613,8 +610,7 @@ def _compare(
     nan_mismatch = torch.isnan(expected_f) ^ torch.isnan(actual_f)
     if nan_mismatch.any():
         raise AssertionError(
-            f"{label}: NaN in one output but not the other at "
-            f"{int(nan_mismatch.sum())} positions"
+            f"{label}: NaN in one output but not the other at {int(nan_mismatch.sum())} positions"
         )
 
     finite = torch.isfinite(expected_f) & torch.isfinite(actual_f)

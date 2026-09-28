@@ -1,10 +1,10 @@
 """Custom two-rank all-reduce communicator.
 
 This module owns the eager, world=2 SUM implementation behind the
-:class:`~ayaka.distributed.collective_backend.CustomCollective` protocol. It
+:class:`~ayaka.device_comm.collective_backend.CustomCollective` protocol. It
 does not own a process group, does not commit or publish anything, and never
 falls back on its own: every refusal that is safe to retry is raised as
-:class:`~ayaka.distributed.collective_backend.CollectivePreLaunchError` before
+:class:`~ayaka.device_comm.collective_backend.CollectivePreLaunchError` before
 mutation, and every failure after the data plane was entered fails closed by
 quarantining the workspace.
 
@@ -37,7 +37,8 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 
-from ayaka.distributed.collective_backend import (
+from ayaka.device.spec import AsyncHandle, CommOpType, DeviceGroup
+from ayaka.device_comm.collective_backend import (
     CUSTOM_ALIGNMENT_BYTES,
     AgreementChannel,
     CollectiveCapability,
@@ -48,13 +49,12 @@ from ayaka.distributed.collective_backend import (
     CustomCapability,
     probe_collective_capability,
 )
-from ayaka.distributed.device import AsyncHandle, CommOpType, DeviceGroup
 from ayaka.kernel.comm_layout import STATUS_UNSET, WorkspaceLayout
 from ayaka.runtime.ipc_engine import IpcRegionDescriptor, IpcRegionRegistry, IpcRegionView
 from ayaka.types import DType
 
 if TYPE_CHECKING:
-    from ayaka.distributed.collective_graph import CapturedCollective
+    from ayaka.device_comm.collective_graph import CapturedCollective
 
 __all__ = [
     "CUSTOM_ALL_REDUCE_ALGORITHM",
@@ -598,7 +598,7 @@ class CustomAllReduce:
             self._reap_completed()
             if self._pending:
                 raise CollectivePreLaunchError("drain eager collective flights before capture")
-        from ayaka.distributed.collective_graph import CapturedCollective
+        from ayaka.device_comm.collective_graph import CapturedCollective
 
         graph = CapturedCollective.capture(
             self, dtype=dtype, numel=numel, generation_provider=generation_provider
@@ -952,7 +952,7 @@ def build_custom_all_reduce_setup(
     if build:
         try:
             if identity_provider is None:
-                from ayaka.distributed.topology import physical_device_identity
+                from ayaka.device_comm.topology import physical_device_identity
 
                 own_uuid = physical_device_identity(device).uuid
             else:

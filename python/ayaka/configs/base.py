@@ -28,13 +28,13 @@ class ConfigError(ValueError):
         self.context = dict(context or {})
         super().__init__(f"{path}: {message} [{code}]")
 
+
 class FrozenMapping(tuple):
     """An immutable frozen mapping represented as sorted ((key, value), ...) pairs."""
 
+
 def freeze_mapping(
-    value: Mapping[str, Any] | tuple[tuple[str, Any], ...] | None,
-    *,
-    path: str = "extra"
+    value: Mapping[str, Any] | tuple[tuple[str, Any], ...] | None, *, path: str = "extra"
 ) -> FrozenMapping:
     """Return a deterministic immutable representation of a string-keyed map."""
 
@@ -47,6 +47,7 @@ def freeze_mapping(
     if len(keys) != len(set(keys)):
         raise ConfigError(path, "MAP_KEY_DUPLICATE", "mapping contains duplicate keys")
     return FrozenMapping(sorted(items, key=lambda item: item[0]))
+
 
 def _canonical(value: Any) -> Any:
     if isinstance(value, enum.Enum):
@@ -63,14 +64,18 @@ def _canonical(value: Any) -> Any:
         return {str(key): _canonical(item) for key, item in sorted(value.items())}
     if isinstance(value, FrozenMapping):
         return {str(key): _canonical(item) for key, item in value}
-    if bool(value) and isinstance(value, tuple) and all(
-        isinstance(item, tuple) and len(item) == 2 and type(item[0]) is str
-        for item in value
+    if (
+        bool(value)
+        and isinstance(value, tuple)
+        and all(
+            isinstance(item, tuple) and len(item) == 2 and type(item[0]) is str for item in value
+        )
     ):
         return {str(key): _canonical(item) for key, item in value}
     if isinstance(value, (tuple, list, set, frozenset)):
         return [_canonical(item) for item in value]
     return value
+
 
 @dataclass(frozen=True, slots=True)
 class ConfigMixin:

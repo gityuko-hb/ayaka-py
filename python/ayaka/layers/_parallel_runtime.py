@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from ayaka.distributed.device import DeviceGroup, DeviceRef
+from ayaka.device.spec import DeviceGroup, DeviceRef
 from ayaka.distributed.parallel import (
     LocalParallelContext,
     ParallelContext,

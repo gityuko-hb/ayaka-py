@@ -49,8 +49,8 @@ from ayaka.configs.memory import (
 )
 from ayaka.configs.model import ArchitectureConfig
 from ayaka.configs.parallel import CollectivePolicy, ParallelConfig, ResolvedParallelPlan
+from ayaka.device.spec import CommunicationBackend, DeviceGroup, DeviceRef
 from ayaka.distributed import env as distributed_env
-from ayaka.distributed.device import CommunicationBackend, DeviceGroup, DeviceRef
 from ayaka.kvcache.groups import KVCacheGroup
 from ayaka.kvcache.manager import LogicalKVManager
 from ayaka.kvcache.materialize import KVStorageLease, materialize_kv_storage
@@ -65,7 +65,7 @@ from ayaka.utils.import_utils import CapabilityError
 from ayaka.utils.math_utils import div_ceil
 
 if TYPE_CHECKING:
-    from ayaka.distributed.collective_backend import CollectiveSetup
+    from ayaka.device_comm.collective_backend import CollectiveSetup
     from ayaka.distributed.parallel import ParallelContext
     from ayaka.kvcache.grouped_manager import KVCacheGroupManager
     from ayaka.kvcache.storage.ports import KVStorage
@@ -978,7 +978,7 @@ def build_parallel_runtime(
                 "a collective setup cannot be supplied while the policy is torch",
             )
         if tp_group is not None:
-            from ayaka.distributed.collective_backend import setup_collective_backend
+            from ayaka.device_comm.collective_backend import setup_collective_backend
 
             communication = setup_collective_backend(
                 policy=policy,

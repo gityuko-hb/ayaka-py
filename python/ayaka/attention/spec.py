@@ -81,6 +81,7 @@ class AttentionSpec:
         """
         return self.mask is not MaskKind.FULL
 
+
 @dataclass(frozen=True)
 class AttentionGroupSpec:
     """One KV-cache group: the layers that share a pool, and how it is addressed.

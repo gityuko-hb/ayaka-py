@@ -6,7 +6,7 @@ import enum
 from dataclasses import dataclass, field
 
 from ayaka.configs.base import ConfigError, ConfigMixin
-from ayaka.distributed.device import DeviceRef
+from ayaka.device.spec import DeviceRef
 from ayaka.types import DeviceKind
 
 __all__ = [

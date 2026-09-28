@@ -5,7 +5,7 @@ import threading
 from typing import Any
 
 from ayaka.device.backend import DeviceBackend, get_backend
-from ayaka.distributed.device import DeviceCapability, DeviceRef
+from ayaka.device.spec import DeviceCapability, DeviceRef
 from ayaka.types import DeviceKind
 from ayaka.utils.torch_memory import DeviceMemory, device_memory, empty_cache
 from ayaka.utils.torch_utils import synchronize
@@ -17,6 +17,7 @@ class ForkedContextError(RuntimeError):
 
 _CONTEXTS: dict[tuple[int, int], DeviceContext] = {}
 _LOCK = threading.Lock()
+
 
 class DeviceContext:
     __slots__ = ("_backend", "_capability", "_closed", "_index", "_pid", "_ref")

@@ -2,7 +2,7 @@
 
 This module owns no hardware probe. Every fact here is read from an authority
 that already existed: :class:`~ayaka.utils.torch_utils.DeviceProfile` for the
-device itself, :func:`~ayaka.distributed.topology.physical_device_identity` for
+device itself, :func:`~ayaka.device_comm.topology.physical_device_identity` for
 cross-process identity, ``CC_LIMITS``/``_L2_BYTES`` for per-architecture
 constants, :func:`~ayaka.device.platform.arch_reachability` for what this build
 can actually launch, and the already-bound attention backend instances for
@@ -36,7 +36,7 @@ from ayaka.device.platform import (
     framework_architectures,
     framework_ptx,
 )
-from ayaka.distributed.topology import PhysicalDeviceIdentity, physical_device_identity
+from ayaka.device_comm.topology import PhysicalDeviceIdentity, physical_device_identity
 from ayaka.types import DType
 from ayaka.utils.import_utils import CapabilityError, has_module
 from ayaka.utils.validation import require_int, require_text

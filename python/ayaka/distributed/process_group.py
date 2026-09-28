@@ -4,8 +4,8 @@ from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
+from ayaka.device_comm.topology import _is_cuda_device, _optional_torch
 from ayaka.distributed.metadata import DistributedKVMetadata
-from ayaka.distributed.topology import _is_cuda_device, _optional_torch
 from ayaka.exceptions import InvariantViolationError, RuntimeMemoryError, StorageUnavailableError
 
 

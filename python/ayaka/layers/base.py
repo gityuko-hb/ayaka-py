@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
-from ayaka.distributed.device import AsyncHandle, CommOpType, CommunicationBackend, DeviceGroup
+from ayaka.device.spec import AsyncHandle, CommOpType, CommunicationBackend, DeviceGroup
 from ayaka.layers.quantization.base import (
     BaseQuantization,
     QuantizationContext,

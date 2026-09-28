@@ -7,7 +7,7 @@ from itertools import count
 from threading import RLock
 from typing import Any
 
-from ayaka.distributed.topology import PeerTopology, _is_cuda_device, _optional_torch
+from ayaka.device_comm.topology import PeerTopology, _is_cuda_device, _optional_torch
 from ayaka.exceptions import StorageUnavailableError
 from ayaka.handles import KVPageHandle, SequenceHandle
 from ayaka.memory.tiering import (
@@ -27,6 +27,7 @@ def _device_context(torch: Any | None, device: str | None) -> Any:
     if torch is None or device is None or not _is_cuda_device(device):
         return nullcontext()
     return torch.cuda.device(device)
+
 
 class TensorParallelKVStorage:
     """One KV storage per TP rank behind a single logical page geometry."""

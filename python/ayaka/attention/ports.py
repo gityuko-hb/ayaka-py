@@ -78,6 +78,7 @@ class PagedKVCache(Protocol):
         no allocation, no ``.item()``)."""
         ...
 
+
 @runtime_checkable
 class PageTableSource(Protocol):
     """Read-only access to the request page table.
@@ -95,6 +96,7 @@ class PageTableSource(Protocol):
     Strided reads are non-coalesced, but the volume drops by ``stride``, which wins by a
     wide margin at any stride that matters.
     """
+
     @property
     def num_columns(self) -> int:
         """Columns in the live table == max positions a request can address."""
@@ -115,6 +117,7 @@ class PageTableSource(Protocol):
         ``table_idx`` is an int64 device tensor (the scheduler stages it; no host loop).
         """
         ...
+
 
 @runtime_checkable
 class LinearStateCache(Protocol):

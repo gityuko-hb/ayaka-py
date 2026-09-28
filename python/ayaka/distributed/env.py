@@ -24,9 +24,7 @@ def _parse_int_env(name: str, default: int, *, minimum: int | None = None) -> in
     try:
         val = int(raw.strip())
     except ValueError:
-        raise ValueError(
-            f"Environment variable {name}={raw!r} is not a valid integer"
-        ) from None
+        raise ValueError(f"Environment variable {name}={raw!r} is not a valid integer") from None
     if minimum is not None and val < minimum:
         raise ValueError(f"Environment variable {name}={val} must be >= {minimum}")
     return val

@@ -38,7 +38,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from ayaka.distributed.topology import (
+from ayaka.device_comm.topology import (
     PhysicalDeviceIdentity,
     _optional_torch,
     physical_device_identity,

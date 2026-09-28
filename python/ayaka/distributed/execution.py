@@ -313,7 +313,7 @@ class DistributedStepCoordinator:
           an active flight keeps ``RUNNING`` (the flight is not poisoned), and
           an already ``FAILED`` rank keeps its original failure;
         - the process group is never destroyed here; only
-          :func:`ayaka.distributed.runtime.shutdown_distributed_process_group`
+          :func:`ayaka.distributed.process_group_lifecycle.shutdown_distributed_process_group`
           may destroy an owned group after this handshake.
 
         Repeating a completed shutdown is a no-op that returns True.

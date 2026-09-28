@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Final
 
-from ayaka.distributed.device import DeviceRef
+from ayaka.device.spec import DeviceRef
 from ayaka.exceptions import CheckpointCorruptError
 from ayaka.types import DType
 from ayaka.weights.spec import ShardKind, TensorSpec, WeightSource, WeightSpec

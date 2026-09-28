@@ -19,11 +19,11 @@ from __future__ import annotations
 from typing import Any
 
 from ayaka.configs.distributed import CollectiveBackend, ResolvedDistributedPlan
+from ayaka.device_comm.topology import _optional_torch
 from ayaka.distributed.process_group import (
     DistributedStepError,
     TorchDistributedKVProcessGroup,
 )
-from ayaka.distributed.topology import _optional_torch
 from ayaka.exceptions import StorageUnavailableError
 from ayaka.utils.import_utils import CapabilityError
 from ayaka.utils.validation import require_int

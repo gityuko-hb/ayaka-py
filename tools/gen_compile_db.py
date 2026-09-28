@@ -36,7 +36,9 @@ def _include_paths() -> list[Path]:
         import pybind11
         from torch.utils.cpp_extension import include_paths
     except ImportError as exc:
-        raise RuntimeError("install the project with uv sync before generating the database") from exc
+        raise RuntimeError(
+            "install the project with uv sync before generating the database"
+        ) from exc
 
     paths = [Path(path) for path in include_paths()]
     paths.extend((Path(pybind11.get_include()), CSRC_ROOT))
@@ -70,9 +72,7 @@ def build_database() -> list[dict[str, object]]:
             if cuda_root is not None:
                 arguments.extend((f"--cuda-path={cuda_root}", "-I", str(cuda_root / "include")))
         arguments.extend(("-c", str(source)))
-        entries.append(
-            {"directory": str(REPO_ROOT), "file": str(source), "arguments": arguments}
-        )
+        entries.append({"directory": str(REPO_ROOT), "file": str(source), "arguments": arguments})
     return entries
 
 

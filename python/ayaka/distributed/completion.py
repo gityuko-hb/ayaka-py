@@ -7,8 +7,8 @@ from threading import RLock
 from time import monotonic, sleep
 from typing import Any, Protocol, runtime_checkable
 
+from ayaka.device_comm.topology import _optional_torch
 from ayaka.distributed.process_group import DistributedStepError
-from ayaka.distributed.topology import _optional_torch
 from ayaka.exceptions import StorageUnavailableError
 from ayaka.handles import KVReservationHandle, StepMemoryLeaseHandle
 from ayaka.memory.manager import RuntimeMemoryManager
@@ -246,9 +246,7 @@ class TensorParallelStepTicket:
                 detail = "; ".join(
                     f"rank {rank}: {error}" for rank, error in sorted(self._errors.items())
                 )
-                raise DistributedStepError(
-                    f"tensor-parallel step failed after launch: {detail}"
-                )
+                raise DistributedStepError(f"tensor-parallel step failed after launch: {detail}")
 
             self._manager.complete_step(
                 self._lease_handle,
@@ -266,22 +264,14 @@ def _normalize_completion(
 ) -> CompletionFence:
     if isinstance(result, CompletionFence):
         return result
-    if callable(getattr(result, "query", None)) and callable(
-        getattr(result, "synchronize", None)
-    ):
+    if callable(getattr(result, "query", None)) and callable(getattr(result, "synchronize", None)):
         return CudaEventCompletion(result)
     if result is not None:
-        raise TypeError(
-            "rank launcher must return CompletionFence, torch.cuda.Event, or None"
-        )
+        raise TypeError("rank launcher must return CompletionFence, torch.cuda.Event, or None")
     torch = _optional_torch()
     if torch is None or not torch.cuda.is_available():
         return SynchronousCompletion()
-    device = (
-        str(rank_devices[rank])
-        if rank_devices is not None
-        else f"cuda:{rank}"
-    )
+    device = str(rank_devices[rank]) if rank_devices is not None else f"cuda:{rank}"
     return DeviceSynchronizeCompletion(device)
 
 

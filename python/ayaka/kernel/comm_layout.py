@@ -3,7 +3,7 @@
 Kept free of Triton and torch so capability probing and agreement can compute
 the workspace budget on any host, while
 :mod:`ayaka.kernel.triton.comm.signal_epoch` consumes the same offsets for the
-kernel and :mod:`ayaka.distributed.custom_all_reduce` for the views.
+kernel and :mod:`ayaka.device_comm.custom_all_reduce` for the views.
 """
 
 from __future__ import annotations

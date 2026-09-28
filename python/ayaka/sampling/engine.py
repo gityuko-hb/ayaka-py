@@ -41,7 +41,7 @@ from typing import Any, Protocol
 
 import torch
 
-from ayaka.distributed.device import CommOpType
+from ayaka.device.spec import CommOpType
 from ayaka.plan import SamplingPlan
 from ayaka.sampling.logprobs import MODE_ORDINALS, LogprobMode
 from ayaka.sampling.metadata import SamplingMetadata

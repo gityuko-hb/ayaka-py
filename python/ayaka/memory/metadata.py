@@ -81,12 +81,7 @@ class PageMetadata:
     @property
     def ownership_refs(self) -> int:
         """Ownership refs without transient step ownership."""
-        return (
-            self.request_refs
-            + self.cache_refs
-            + self.reservation_refs
-            + self.pin_refs
-        )
+        return self.request_refs + self.cache_refs + self.reservation_refs + self.pin_refs
 
     @property
     def total_refs(self) -> int:

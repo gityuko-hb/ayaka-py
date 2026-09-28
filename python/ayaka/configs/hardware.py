@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass, field, replace
 
 from ayaka.configs.base import ConfigMixin
-from ayaka.distributed.device import DeviceCapability, DeviceRef, LinkKind
+from ayaka.device.spec import DeviceCapability, DeviceRef, LinkKind
 from ayaka.types import DeviceKind
 from ayaka.utils.host_info import host_total_ram_bytes, numa_node_count, pci_numa_node
 from ayaka.utils.nvml_utils import (

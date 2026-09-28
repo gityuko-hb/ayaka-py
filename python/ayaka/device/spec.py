@@ -20,6 +20,7 @@ class DeviceRef:
     def is_cuda(self) -> bool:
         return self.kind is DeviceKind.CUDA
 
+
 @dataclass(frozen=True, slots=True)
 class DeviceCapability:
     """What the planner is allowed to assume about a GPU.
@@ -67,6 +68,7 @@ class DeviceCapability:
         if dtype is DType.FP4_E2M1:
             return cc >= (10, 0)
         return True
+
 
 class LinkKind(enum.StrEnum):
     """Physical hardware interconnect path between two execution or storage devices.
@@ -116,6 +118,7 @@ class LinkKind(enum.StrEnum):
         """Whether the link supports zero-copy peer-to-peer CUDA IPC without host staging."""
         return self in (LinkKind.SELF, LinkKind.NVLINK, LinkKind.NVSWITCH, LinkKind.PCIE)
 
+
 class CommOpType(enum.StrEnum):
     """Reduction operators for distributed collective communication primitives.
 
@@ -155,6 +158,7 @@ class CommOpType(enum.StrEnum):
         """Whether the reduction operator exhibits mathematical linearity over vectors."""
         return self in (CommOpType.SUM, CommOpType.AVG)
 
+
 @dataclass(frozen=True, slots=True)
 class DeviceGroup:
     """A set of devices addressed as one collective domain.
@@ -183,6 +187,7 @@ class DeviceGroup:
         """Single-rank group — every collective is identity.  The P0 path."""
         return self.size <= 1
 
+
 class AsyncHandle(Protocol):
     """Returned by non-blocking collectives.  Deliberately minimal: the executor
     only ever needs to know whether it can proceed, and to force a join."""
@@ -191,12 +196,13 @@ class AsyncHandle(Protocol):
 
     def is_completed(self) -> bool: ...
 
+
 @runtime_checkable
 class CommunicationBackend(Protocol):
     """NCCL / gloo / RDMA / MPI are interchangeable behind this.
 
     Tensors are ``Any`` cannot name a torch type.  Implementations live in
-    ``ayaka.distributed.communication``.
+    :mod:`ayaka.device_comm`.
 
     ``async_op=True`` returns an :class:`AsyncHandle` and the caller is
     responsible for the join.  Every collective takes an explicit ``group`` —
