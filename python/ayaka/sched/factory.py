@@ -42,6 +42,7 @@ def create_scheduler(
     preemption: PreemptionController | None = None,
     decode_first: bool = True,
     allow_mixed_batches: bool = True,
+    max_decode_burst: int | None = None,
     prefill_chunk_size: int | None = None,
     max_bypass: int = 64,
 ) -> EagerScheduler | ContinuousScheduler:
@@ -69,6 +70,7 @@ def create_scheduler(
             preemption=preemption,
             decode_first=decode_first,
             allow_mixed_batches=allow_mixed_batches,
+            max_decode_burst=max_decode_burst,
             prefill_chunk_size=prefill_chunk_size,
             max_bypass=max_bypass,
         )

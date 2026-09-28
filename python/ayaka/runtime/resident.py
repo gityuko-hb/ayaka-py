@@ -170,6 +170,7 @@ class ResidentKVEngine(Engine):
         worker: StepWorker | None = None,
         chunk_pressure: ChunkPressurePolicy | None = None,
         clock: Callable[[], int] | None = None,
+        max_decode_burst: int | None = None,
     ) -> None:
         kind = kind.strip().lower().replace("-", "_")
         if (
@@ -230,6 +231,7 @@ class ResidentKVEngine(Engine):
             admission=self.preparer,
             capacity_hint=self.preparer,
             allow_mixed_batches=bool(getattr(runner, "supports_mixed_batches", False)),
+            max_decode_burst=max_decode_burst,
         )
         super().__init__(
             plan,

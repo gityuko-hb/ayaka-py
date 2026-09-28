@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -30,6 +31,9 @@ from ayaka.worker.base import StepWorker, WorkerOutcome, WorkerStep
 from ayaka.worker.fences import FlightFence, ImmediateFence, RecordingFence
 from ayaka.worker.lifecycle import FlightKey, WorkerLifecycle, WorkerState
 from ayaka.worker.resources import WorkerResources
+
+if TYPE_CHECKING:
+    from ayaka.execution.prefill_decode_multiplexer import PrefillDecodeMultiplexer
 
 __all__ = ["LocalWorker"]
 
@@ -76,6 +80,7 @@ class LocalWorker(StepWorker):
         metrics: RuntimeMetrics | None = None,
         fence_factory: Callable[[], CompletionFence] | None = None,
         resources: WorkerResources | None = None,
+        multiplexer: PrefillDecodeMultiplexer | None = None,
     ) -> None:
         require_int(max_inflight, "max_inflight", minimum=1)
         devices = {
@@ -98,6 +103,7 @@ class LocalWorker(StepWorker):
             raise ValueError("worker resources must own the worker KV binding")
         self.resources = resources
         self.runner = runner
+        self.multiplexer = multiplexer
         self._device = resolved
         self.max_inflight = max_inflight
         self.metrics = metrics or RuntimeMetrics()
@@ -204,25 +210,44 @@ class LocalWorker(StepWorker):
         self._lifecycle.begin_flight(step.ticket_id, tag=str(step.step_id))
         self.metrics.increment("worker_flights_started")
         try:
+            lane = None if self.multiplexer is None else self.multiplexer.admit(step)
+            runner = self.runner if lane is None else lane.runner
+            compute = self.stream if lane is None else lane.stream
             context = (
                 nullcontext() if self._pool is None else self._pool.context(StreamRole.COMPUTE)
             )
-            with context, torch.inference_mode():
-                self._apply_cow(step)
-                note_growth = getattr(self.runner, "on_workspace_growth", None)
+            if lane is not None and lane.stream is not None:
+                context = torch.cuda.stream(lane.stream)
+            from ayaka.runner.graph.pool import execution_enqueue_gate
+
+            with execution_enqueue_gate(), context, torch.inference_mode():
+                prepare_execution = getattr(runner, "prepare_execution", None)
+                execute_batch = getattr(runner, "execute_batch", None)
+                batch = prepare_execution(step) if prepare_execution is not None else None
+                if batch is not None and execute_batch is None:
+                    raise TypeError("execution batch adapter has no execute_batch method")
+                self._apply_cow(step, compute=compute)
+                note_growth = getattr(runner, "on_workspace_growth", None)
                 if note_growth is not None and step.workspace_grew:
                     # The step grew the shared workspace; any captured graph that
                     # bound the old addresses must not replay. The runner falls
                     # back to eager for this step and recaptures before the next
                     # replay.
                     note_growth()
-                samples = self.runner(step.prepared)
+                if batch is None:
+                    samples = runner(step.prepared)
+                else:
+                    assert execute_batch is not None
+                    samples = execute_batch(batch)
                 if samples.token_ids.device != self.device:
                     raise ValueError("runner samples must reside on the KV device")
-                fence = self._register_fence(step.ticket_id, self._device_fence())
+                if self.multiplexer is not None:
+                    self.multiplexer.finish_enqueue(step.ticket_id)
+                device_fence = self._device_fence() if lane is None else self._device_fence(compute)
+                fence = self._register_fence(step.ticket_id, device_fence)
             return WorkerOutcome(samples, fence)
         except BaseException as exc:
-            if _is_ambiguous_device_failure(exc):
+            if _is_ambiguous_device_failure(exc) or self.multiplexer is not None:
                 self._lifecycle.fail(f"ambiguous device failure during execute: {exc}")
                 self.metrics.increment("worker_failures")
             # The flight stays registered: an exception here may hide partially
@@ -238,6 +263,11 @@ class LocalWorker(StepWorker):
             try:
                 # Join any partial transfer before proving quiescence.
                 self._pool.order(after=StreamRole.COMPUTE, before=StreamRole.KV)
+                if self.multiplexer is not None:
+                    # A recovery fence covers partial work on every branch.
+                    for lane in self.multiplexer.lanes.values():
+                        if lane.stream is not None:
+                            self._pool.get(StreamRole.COMPUTE).wait_stream(lane.stream)
             except BaseException as exc:
                 self._lifecycle.fail(f"cannot order transfer drain: {exc}")
                 self.metrics.increment("worker_failures")
@@ -271,6 +301,8 @@ class LocalWorker(StepWorker):
         self.request_closing()
         try:
             self.runner.close()
+            if self.multiplexer is not None:
+                self.multiplexer.close()
             self._release_flights()
             self._close_pool()
             if self.resources is not None:
@@ -309,6 +341,8 @@ class LocalWorker(StepWorker):
             self._note_fence_error(exc)
             raise
         self._flight_fences.pop(key, None)
+        if self.multiplexer is not None:
+            self.multiplexer.retire(key)
         if self._lifecycle.end_flight(key):
             self.metrics.increment("worker_flights_completed")
 
@@ -320,16 +354,18 @@ class LocalWorker(StepWorker):
         self.metrics.increment("worker_fence_errors")
         self._lifecycle.fail(f"completion query failed: {error}")
 
-    def _device_fence(self) -> CompletionFence:
+    def _device_fence(self, stream=None) -> CompletionFence:
         """Factory-aware fence used for submission and drain proofs."""
         if self.fence_factory is not None:
             return self.fence_factory()
-        return self._default_fence()
+        return self._default_fence(stream)
 
-    def _default_fence(self) -> CompletionFence:
+    def _default_fence(self, stream=None) -> CompletionFence:
         if self._pool is None or self._backend is None:
             return ImmediateFence()
-        event = self._pool.events.record_on(self._pool.get(StreamRole.COMPUTE))
+        event = self._pool.events.record_on(
+            self._pool.get(StreamRole.COMPUTE) if stream is None else stream
+        )
         return RecordingFence(
             self._backend,
             event,
@@ -415,18 +451,31 @@ class LocalWorker(StepWorker):
         if sources:
             copy_cache(sources, destinations, False)
 
-    def _apply_cow(self, step: WorkerStep) -> None:
+    def _apply_cow(self, step: WorkerStep, *, compute=None) -> None:
         """Run lease-owned KV copies on the transfer stream at the batch boundary."""
+        if self.multiplexer is not None and not step.prepared.memory_view.copies:
+            return
         if self._pool is None:
             self._copy_pages(step)
             return
-        self._pool.order(after=StreamRole.KV, before=StreamRole.COMPUTE)
+        if self.multiplexer is None:
+            # Preserve backend-agnostic stream ordering for non-CUDA test/platform lanes.
+            self._pool.order(after=StreamRole.KV, before=StreamRole.COMPUTE)
+            try:
+                with self._pool.context(StreamRole.KV):
+                    self._copy_pages(step)
+            finally:
+                self._pool.order(after=StreamRole.COMPUTE, before=StreamRole.KV)
+            return
+        compute = self._pool.get(StreamRole.COMPUTE) if compute is None else compute
+        transfer = self._pool.get(StreamRole.KV)
+        transfer.wait_stream(compute)
         try:
             with self._pool.context(StreamRole.KV):
                 self._copy_pages(step)
         finally:
             # Cover partial-copy failure too, before the compute drain fence.
-            self._pool.order(after=StreamRole.COMPUTE, before=StreamRole.KV)
+            compute.wait_stream(transfer)
 
     def __repr__(self) -> str:
         return (

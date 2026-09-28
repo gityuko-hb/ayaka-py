@@ -1,7 +1,15 @@
 """Server policy, separate from scheduler and model configuration."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ayaka.execution.execution_lane import ExecutionLaneConfig
+    from ayaka.execution.lora_execution_binding import LoRAConfig
+    from ayaka.execution.phase_config import RequestedOverrides
+    from ayaka.execution.speculative_execution_batch import SpeculativeConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +67,35 @@ class ServingConfig:
     tool_parser: Literal["none", "hermes"] = "none"
     structured_outputs: bool = True
     expose_metrics: bool = True
-    decode_graph: bool = False
+    decode_graph: bool | None = None
     graph_buckets: tuple[int, ...] | None = None
+    execution: RequestedOverrides | None = None
+    lora: LoRAConfig | None = None
+    speculative: SpeculativeConfig | None = None
+    execution_lanes: ExecutionLaneConfig | None = None
 
     def __post_init__(self) -> None:
+        from ayaka.execution.execution_lane import ExecutionLaneConfig
+        from ayaka.execution.lora_execution_binding import LoRAConfig
+        from ayaka.execution.phase_config import RequestedOverrides
+        from ayaka.execution.speculative_execution_batch import SpeculativeConfig
+
+        if self.lora is not None and not isinstance(self.lora, LoRAConfig):
+            raise TypeError("lora must be LoRAConfig or None")
+        if self.speculative is not None and not isinstance(self.speculative, SpeculativeConfig):
+            raise TypeError("speculative must be SpeculativeConfig or None")
+        if self.speculative is not None and self.lora is not None:
+            raise ValueError("speculative x LoRA is not certified")
+        if self.execution_lanes is not None:
+            if not isinstance(self.execution_lanes, ExecutionLaneConfig):
+                raise TypeError("execution_lanes must be ExecutionLaneConfig or None")
+            if self.speculative is not None or self.lora is not None:
+                raise ValueError("PDMux x LoRA/speculative is not certified")
+
+        if self.decode_graph is not None and type(self.decode_graph) is not bool:
+            raise TypeError("decode_graph must be boolean or None")
+        if self.execution is not None and not isinstance(self.execution, RequestedOverrides):
+            raise TypeError("execution must be RequestedOverrides or None")
         if not self.model or any(not key for key in self.api_keys):
             raise ValueError("model and configured API keys must be nonempty")
         if self.max_concurrent_requests < 0:

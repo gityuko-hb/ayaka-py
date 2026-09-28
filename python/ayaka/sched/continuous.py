@@ -125,6 +125,7 @@ class ContinuousScheduler(SchedulerCore):
         preemption: PreemptionController | None = None,
         decode_first: bool = True,
         allow_mixed_batches: bool = True,
+        max_decode_burst: int | None = None,
         prefill_chunk_size: int | None = None,
         max_bypass: int | None = None,
         sampling: SamplingCoordinator | None = None,
@@ -153,6 +154,14 @@ class ContinuousScheduler(SchedulerCore):
         self._preemption = preemption
         self._decode_first = bool(decode_first)
         self._allow_mixed_batches = bool(allow_mixed_batches)
+        if max_decode_burst is not None and (
+            type(max_decode_burst) is not int or max_decode_burst < 1 or allow_mixed_batches
+        ):
+            raise ValueError(
+                "max_decode_burst requires a positive count and separate phase batches"
+            )
+        self._max_decode_burst = max_decode_burst
+        self._decode_burst = 0
         chunk_cap = plan.max_prefill_chunk_tokens if plan.enable_chunked_prefill else None
         if prefill_chunk_size is not None:
             if not plan.enable_chunked_prefill:
@@ -192,6 +201,7 @@ class ContinuousScheduler(SchedulerCore):
         for plan in self._candidate_plans():
             ticket = self._prepare_and_adopt(plan)
             if ticket is not None:
+                self._decode_burst = self._decode_burst + 1 if plan.is_pure_decode else 0
                 return ticket
         return None
 
@@ -281,9 +291,12 @@ class ContinuousScheduler(SchedulerCore):
                 yield plan
             return
 
+        decode_first = self._decode_first and (
+            self._max_decode_burst is None or self._decode_burst < self._max_decode_burst
+        )
         builders = (
             (self._build_decode_only, self._build_prefill_only)
-            if self._decode_first
+            if decode_first
             else (self._build_prefill_only, self._build_decode_only)
         )
         for builder in builders:
