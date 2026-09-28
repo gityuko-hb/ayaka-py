@@ -47,13 +47,11 @@ logger = logging.getLogger(__name__)
 
 
 class GraphMemoryPool:
-    """Lazily creates one torch.cuda.graph_pool_handle() per device
-    and hands the same handle back to every caller on that device.
+    """Legacy shared pool for explicitly serialized breakable graph users.
 
-    Deliberately a process-global registry (not per-runner or
-    per-backend state): the whole point is for a decode runner, a
-    prefill runner, and any future graph runner sharing a device to
-    end up in the same pool. A runner-owned pool would defeat that.
+    Serving full-decode graphs use private pools per flight/backend instead.
+    Callers of this legacy registry must serialize every replay and retain
+    outputs until consumed before allowing another caller to reuse scratch.
     """
 
     _pools: dict[torch.device, Any] = {}
@@ -128,9 +126,8 @@ class GraphCaptureFailed(RuntimeError):
             f"bucket or --max-running-requests. (2) an op in forward_fn "
             f"is not capture-safe (host sync, data-dependent control flow, "
             f"or a tensor whose address is expected to change every call — "
-            f"see GraphBufferArena). (3) two runners captured against "
-            f"different memory pools on the same device — see "
-            f"GraphMemoryPool. Underlying error: {cause!r}"
+            f"see GraphBufferArena). (3) another thread enqueued work "
+            f"during capture. Underlying error: {cause!r}"
         )
         self.__cause__ = cause
 
@@ -160,7 +157,9 @@ class FullGraphBackend(GraphBackend):
         recorded NCCL op needs its buffers pre-registered with the
         graph pool, which is out of scope for this module."""
         self._device = device
-        self._pool = GraphMemoryPool.get(device)
+        # One sharing domain per backend/flight. Independent runners may use
+        # different streams and must never alias graph-private scratch.
+        self._pool = torch.cuda.graph_pool_handle()
         self._enable_gc_freeze = enable_gc_freeze
         self._barrier_fn = barrier_fn
         self._warmup_iters = warmup_iters
@@ -280,6 +279,7 @@ ForwardFn = Callable[[], Spans]
 
 @dataclass(slots=True)
 class _CapturedShape:
+    ready: bool = False
     segments: list[torch.cuda.CUDAGraph] = field(default_factory=list)
     is_eager: list[bool] = field(default_factory=list)
     # Only set when the LAST span was captured: the graph's own output
@@ -299,7 +299,7 @@ class BreakableGraphBackend(GraphBackend):
         warmup_iters: int = 2,
     ) -> None:
         self._device = device
-        self._pool = GraphMemoryPool.get(device)
+        self._pool = torch.cuda.graph_pool_handle()
         self._enable_gc_freeze = enable_gc_freeze
         self._barrier_fn = barrier_fn
         self._warmup_iters = warmup_iters
@@ -345,13 +345,17 @@ class BreakableGraphBackend(GraphBackend):
 
         segments: list[torch.cuda.CUDAGraph] = []
         is_eager: list[bool] = []
+        # Retain partial graphs until the owner has joined the failing stream.
+        self._shapes[shape_key] = _CapturedShape(segments=segments, is_eager=is_eager)
         last_out: Any = None
         for i, span in enumerate(spans):
             if isinstance(span, EagerSpan):
-                last_out = span.fn()
+                with torch.cuda.stream(self._capture_stream):
+                    last_out = span.fn()
                 is_eager.append(True)
             else:
                 graph = torch.cuda.CUDAGraph()
+                segments.append(graph)
                 try:
                     with torch.cuda.graph(graph, pool=self._pool, stream=self._capture_stream):
                         last_out = span()
@@ -359,20 +363,24 @@ class BreakableGraphBackend(GraphBackend):
                     raise RuntimeError(
                         f"{shape_key}: capture failed at span {i}/{len(spans)}"
                     ) from e
-                segments.append(graph)
                 is_eager.append(False)
 
         if is_eager[-1]:
-            shape = _CapturedShape(segments=segments, is_eager=is_eager)
+            shape = _CapturedShape(ready=True, segments=segments, is_eager=is_eager)
         else:
             cap = row_count(last_out, shape_key.size)
             shape = _CapturedShape(
-                segments=segments, is_eager=is_eager, captured_output=last_out, output_cap=cap
+                ready=True,
+                segments=segments,
+                is_eager=is_eager,
+                captured_output=last_out,
+                output_cap=cap,
             )
         self._shapes[shape_key] = shape
 
     def can_run(self, shape_key: ShapeKey, *, requested_hidden_mode: str | None = None) -> CanRun:
-        return CanRun.RUNNABLE if shape_key in self._shapes else CanRun.NOT_CAPTURED
+        shape = self._shapes.get(shape_key)
+        return CanRun.RUNNABLE if shape is not None and shape.ready else CanRun.NOT_CAPTURED
 
     @contextmanager
     def replay_session(self):
@@ -382,7 +390,7 @@ class BreakableGraphBackend(GraphBackend):
         self, shape_key: ShapeKey, *, forward_fn: ForwardFn | None = None, **kwargs: Any
     ) -> Any:
         shape = self._shapes.get(shape_key)
-        if shape is None:
+        if shape is None or not shape.ready:
             raise KeyError(f"{shape_key} was never captured; caller must check can_run() first")
         if forward_fn is None:
             raise GraphCapabilityError(
@@ -400,23 +408,24 @@ class BreakableGraphBackend(GraphBackend):
                 f"across calls, this is not a missing-bucket case."
             )
 
-        graph_iter = iter(shape.segments)
-        last_out: Any = None
+        # Validate the entire structure before the first mutating span.
         for i, (span, was_eager) in enumerate(zip(spans, shape.is_eager, strict=False)):
             if isinstance(span, EagerSpan) != was_eager:
                 raise GraphCapabilityError(
                     f"{shape_key}: span {i} changed capture/eager kind since "
                     f"capture — routing bug, not a missing bucket."
                 )
+        graph_iter = iter(shape.segments)
+        last_out: Any = None
+        for span in spans:
             if isinstance(span, EagerSpan):
                 last_out = span.fn()
             else:
                 next(graph_iter).replay()
 
         if shape.is_eager[-1]:
-            cap = row_count(last_out, shape_key.size)
-            return slice_rows(last_out, cap)
-        return slice_rows(shape.captured_output, shape.output_cap)
+            return last_out
+        return shape.captured_output
 
     def cleanup(self) -> None:
         self._shapes.clear()

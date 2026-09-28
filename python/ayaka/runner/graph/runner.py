@@ -247,10 +247,20 @@ class DecodeGraphRunner:
             )
         return result is CanRun.RUNNABLE
 
-    def execute(self, raw_bs: int, *, forward_fn: Callable[[], Any] | None = None) -> Any:
-        if not self.can_run(raw_bs):
+    def execute(
+        self,
+        raw_bs: int,
+        *,
+        forward_fn: Callable[[], Any] | None = None,
+        captured_bucket: int | None = None,
+    ) -> Any:
+        bucket = (
+            pad_to_bucket(raw_bs, self._buckets) if captured_bucket is None else captured_bucket
+        )
+        if raw_bs < 1 or raw_bs > bucket or bucket not in self._buckets:
+            raise ValueError("invalid row count or captured bucket")
+        if not self.can_run(bucket):
             raise RuntimeError("execute() called without a prior successful can_run()")
-        bucket = pad_to_bucket(raw_bs, self._buckets)
         shape_key = ShapeKey(size=bucket)
         with self._backend.replay_session():
             # A per-call forward_fn restages the live step into the captured

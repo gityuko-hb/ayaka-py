@@ -277,13 +277,17 @@ class ModelRunner:
         a CUDA graph overrides this to return the captured logits, so the LM
         head never runs twice and the sampler stays outside the graph.
         """
+        return self._project_forward_result(self._forward_prepared(prepared))
+
+    def _project_forward_result(self, result) -> _ForwardResult:
+        """Shared projection/report adapter for staged and legacy eager execution."""
         (
             hidden_packed,
             sampling_count,
             prompt_descriptors,
             prompt_targets,
             prompt_ks,
-        ) = self._forward_prepared(prepared)
+        ) = result
         total_rows = hidden_packed.size(0)
         if total_rows:
             logits_plan = LogitsPlan(

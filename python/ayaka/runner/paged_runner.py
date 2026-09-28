@@ -47,7 +47,19 @@ from ayaka.types import (
 from ayaka.utils.math_utils import div_ceil
 
 if TYPE_CHECKING:
+    from ayaka.execution.base_runner import PreparedInvocation
+    from ayaka.execution.forward_context import ForwardContext
     from ayaka.serving.constraints import GrammarConstraints
+
+
+@dataclass(frozen=True, slots=True)
+class StagedEagerInputs:
+    """Borrowed metadata and input views, valid for exactly one flight lease."""
+
+    tokens: torch.Tensor
+    positions: torch.Tensor
+    rows: torch.Tensor
+    context: ForwardContext
 
 
 class StoragePagedKVCache:
@@ -236,10 +248,18 @@ class PagedModelRunner(ModelRunner):
         backend: str = "triton",
         force_reference: bool = False,
         buffers: RunnerBuffers | None = None,
+        max_model_len: int | None = None,
     ) -> None:
         super().__init__(coordinator, model, force_reference=force_reference)
         if backend not in ("triton", "reference", "flash_attention", "flashinfer"):
             raise ValueError("unknown paged attention backend")
+        if max_model_len is not None and (
+            not isinstance(max_model_len, int)
+            or isinstance(max_model_len, bool)
+            or max_model_len < 1
+        ):
+            raise ValueError("max_model_len must be a positive integer or None")
+        self._max_model_len = max_model_len
         if set(groups) != set(kv.group_names):
             raise ValueError("attention groups must exactly match logical KV groups")
         if buffers is not None:
@@ -280,6 +300,7 @@ class PagedModelRunner(ModelRunner):
         self.builders: dict[str, BaseAttentionMetadataBuilder] = {}
         self.layers: dict[int, tuple[str, int]] = {}
         self._closed = False
+        self._pending_execution: PreparedInvocation | None = None
         self._valid_token_mask: torch.Tensor | None = None
         self._request_source: Callable[[str], RequestLifecycle] | None = None
         self._request_ir: dict[str, Request] = {}
@@ -428,14 +449,16 @@ class PagedModelRunner(ModelRunner):
             raise RuntimeError("decode graphs are already enabled for this runner")
         if self.buffers is None:
             raise ValueError("decode graphs require the persistent runner buffer pool")
+        if self.buffers.live:
+            raise RuntimeError("drain all flight leases before graph capture")
         reason = self.graph_unavailable_reason()
         if reason is not None:
             raise ValueError(reason)
         spec = self.buffers.spec
         ceiling = min(spec.max_num_seqs, spec.max_num_batched_tokens)
-        buckets = tuple(bucket for bucket in config.buckets if bucket <= ceiling)
-        if not buckets:
-            raise ValueError("no decode graph bucket fits the runner buffer ceilings")
+        buckets = config.buckets
+        if buckets[-1] > ceiling:
+            raise ValueError("decode graph buckets exceed runner buffer ceilings")
         resolved = replace(config, buckets=buckets)
         builder = next(iter(self.builders.values()))
         support = builder.cudagraph_support
@@ -448,10 +471,11 @@ class PagedModelRunner(ModelRunner):
             support=support,
             slots=tuple(range(spec.max_inflight)),
             generation=lambda: self.kv.generation if self.kv is not None else None,
-            kernel_binding=builder.graph_binding_digest,
+            kernel_binding=self._graph_binding_digest,
             barrier_fn=resolved.barrier_fn,
             eager_only_reason=self._graph_eager_only_reason,
             enable_gc_freeze=resolved.enable_gc_freeze,
+            graph_backend=resolved.graph_backend,
         )
         try:
             for metadata_builder in self.builders.values():
@@ -488,6 +512,10 @@ class PagedModelRunner(ModelRunner):
         if self._graph_pool is not None:
             self._graph_pool.note_workspace_growth()
 
+    def _graph_binding_digest(self) -> str:
+        """Canonical backend binding; execution facade adds model/buffer identity."""
+        return next(iter(self.builders.values())).graph_binding_digest()
+
     def _acquire_capture_leases(self) -> None:
         assert self.buffers is not None
         try:
@@ -517,15 +545,17 @@ class PagedModelRunner(ModelRunner):
 
     def _model_forward(self, tokens, positions, metadata) -> Callable[[], Any]:
         """Pure device forward + LM head for the padded bucket, no host branch."""
+        from ayaka.execution.forward_context import ForwardContext, forward_context
 
-        def attention(layer, query, key, value):
-            name, local = self.layers[layer]
-            return self.backends[name].forward(local, query, key, value, metadata[name])
+        context = ForwardContext(self.backends, self.layers, metadata)
 
         def forward():
-            with torch.inference_mode():
-                hidden = self._model.forward_hidden(tokens, positions, attention)
-                return self._model.logits_from_hidden(hidden)
+            with torch.inference_mode(), forward_context(context):
+                hidden = self._model.forward_hidden(tokens, positions, context.attention)
+                logits = self._model.logits_from_hidden(hidden)
+                if logits.shape != (tokens.numel(), self._model.config.vocab_size):
+                    raise ValueError("captured model output must have one vocabulary row per token")
+                return logits
 
         return forward
 
@@ -540,7 +570,17 @@ class PagedModelRunner(ModelRunner):
         for name, metadata_builder in self.builders.items():
             common = self._capture_common(buffers, name, bucket)
             metadata[name] = metadata_builder.build_for_capture(common, bucket)
-        return self._model_forward(tokens, positions, metadata)
+        from ayaka.execution.graph_program import model_program
+
+        assert self._graph_config is not None
+        return model_program(
+            self,
+            tokens,
+            positions,
+            metadata,
+            backend=self._graph_config.graph_backend,
+            compile_seconds=self._graph_config.compile_seconds,
+        )
 
     def _capture_common(self, buffers, name: str, bucket: int) -> CommonAttentionMetadata:
         """Padded placeholder metadata: every dummy lane is zero-length."""
@@ -555,7 +595,9 @@ class PagedModelRunner(ModelRunner):
             computed=[0] * bucket,
             tables=[[config.padding_page] * columns for _ in range(bucket)],
             width=columns,
-            slots=[config.padding_slot] * bucket,
+            # Triton's fused store masks negative slots. No padded lane writes
+            # a shared dummy address, including during warmup/capture.
+            slots=[-1 if self._backend_name == "triton" else config.padding_slot] * bucket,
             positions=[0] * bucket,
         )
         return self._staged_graph_metadata(staged, bucket, max_seq_len=config.max_model_len)
@@ -620,7 +662,11 @@ class PagedModelRunner(ModelRunner):
             computed=list(padded.computed),
             tables=list(padded.tables),
             width=columns,
-            slots=list(padded.slots),
+            slots=(
+                list(padded.slots[: step.num_tokens]) + [-1] * (bucket - step.num_tokens)
+                if self._backend_name == "triton"
+                else list(padded.slots)
+            ),
             positions=positions,
         )
         max_seq_len = max(padded.lengths) if padded.lengths else 0
@@ -690,7 +736,9 @@ class PagedModelRunner(ModelRunner):
                 return self._graph_tail(prepared, lease)
         return super()._forward_tail(prepared)
 
-    def _graph_tail(self, prepared: PreparedStep, lease: RunnerBufferLease) -> _ForwardResult:
+    def _graph_tail(
+        self, prepared: PreparedStep, lease: RunnerBufferLease, *, staged: bool = False
+    ) -> _ForwardResult:
         step = prepared.step
         bucket = step.graph.bucket
         pool = self._graph_pool
@@ -701,7 +749,9 @@ class PagedModelRunner(ModelRunner):
         def stage() -> Callable[[], Any]:
             return self._stage_graph_step(prepared, lease, bucket)
 
-        logits = pool.execute(step, slot=lease.index, rows=rows, stage=stage)
+        logits = pool.execute(
+            step, slot=lease.index, rows=rows, stage=(lambda: None) if staged else stage
+        )
         self._observe_forward(
             step,
             num_tokens=step.num_tokens,
@@ -893,22 +943,36 @@ class PagedModelRunner(ModelRunner):
                 raise ValueError("paged runner requires a runner buffer lease for this step")
             if lease.generation != self.buffers.generation:
                 raise ValueError("runner buffer lease belongs to a replaced pool generation")
+            if not lease.belongs_to(self.buffers):
+                raise ValueError("runner buffer lease belongs to another pool owner")
         elif prepared.buffers is not None:
             raise ValueError("prepared step carries a lease but the runner has no pool binding")
         if step.prompt_logprobs:
             raise ValueError("paged prompt logprobs require chunk-boundary hidden-state carry")
-        validate_paged_inputs(prepared, self._bindings, self._model.config.max_position_embeddings)
+        # The served ceiling (which may reserve less than the checkpoint) is the
+        # authoritative backstop: a range past it must be rejected before any
+        # read/write even if an upstream check was bypassed.
+        validate_paged_inputs(
+            prepared,
+            self._bindings,
+            self._max_model_len or self._model.config.max_position_embeddings,
+        )
 
     def _forward_prepared(self, prepared: PreparedStep):
+        """Legacy eager hook; the execution adapter separates load from execute."""
+        return self._execute_eager_inputs(prepared, self._prepare_eager_inputs(prepared))
+
+    def _prepare_eager_inputs(self, prepared: PreparedStep) -> StagedEagerInputs:
+        """Stage all inputs/attention metadata without running model or sampler."""
+        from ayaka.execution.forward_context import ForwardContext
+
         step = prepared.step
         metadata = {
             name: builder.build(self._common(prepared, name))
             for name, builder in self.builders.items()
         }
 
-        def attention(layer, query, key, value):
-            name, local = self.layers[layer]
-            return self.backends[name].forward(local, query, key, value, metadata[name])
+        context = ForwardContext(self.backends, self.layers, metadata)
 
         lease = prepared.buffers
         if lease is not None:
@@ -916,24 +980,33 @@ class PagedModelRunner(ModelRunner):
         else:
             tokens = torch.tensor(step.token_ids, dtype=torch.long, device=self.device)
             positions = torch.tensor(step.positions, dtype=torch.long, device=self.device)
-        with torch.inference_mode():
+        if lease is not None:
+            rows = lease.buffers.stage_sampling_rows(step.sampling_rows)
+        else:
+            rows = torch.tensor(step.sampling_rows, dtype=torch.long, device=self.device)
+        return StagedEagerInputs(tokens, positions, rows, context)
+
+    def _execute_eager_inputs(self, prepared: PreparedStep, inputs: StagedEagerInputs):
+        """Enqueue model work against a validated, already staged invocation."""
+        from ayaka.execution.forward_context import forward_context
+
+        step = prepared.step
+        tokens, positions, context = inputs.tokens, inputs.positions, inputs.context
+        with torch.inference_mode(), forward_context(context):
             embeddings = self._embeddings(step, tokens)
             self._observe_forward(step, num_tokens=tokens.numel())
             self.forward_calls += 1
             self.forward_tokens += tokens.numel()
             if embeddings is None:
-                hidden = self._model.forward_hidden(tokens, positions, attention)
+                hidden = self._model.forward_hidden(tokens, positions, context.attention)
             else:
                 hidden = self._model.forward_hidden(
-                    tokens, positions, attention, inputs_embeds=embeddings
+                    tokens, positions, context.attention, inputs_embeds=embeddings
                 )
-        if lease is not None:
-            rows = lease.buffers.stage_sampling_rows(step.sampling_rows)
-        else:
-            rows = torch.tensor(step.sampling_rows, dtype=torch.long, device=self.device)
-        return hidden.index_select(0, rows), len(step.sampling_rows), [], [], []
+        return hidden.index_select(0, inputs.rows), len(step.sampling_rows), [], [], []
 
     def close(self) -> None:
+        self._pending_execution = None
         for request_id in tuple(self._request_ir):
             self.forget_request(request_id)
         self._request_source = None
