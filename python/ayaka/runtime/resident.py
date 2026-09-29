@@ -47,6 +47,7 @@ from ayaka.runtime.kv import (
 from ayaka.runtime.output import OutputProcessor
 from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sched.factory import create_scheduler
+from ayaka.speculative.coordinator import SpeculativeCoordinator
 from ayaka.types import DType
 from ayaka.worker.base import StepWorker, WorkerStep
 from ayaka.worker.local import LocalWorker
@@ -171,8 +172,11 @@ class ResidentKVEngine(Engine):
         chunk_pressure: ChunkPressurePolicy | None = None,
         clock: Callable[[], int] | None = None,
         max_decode_burst: int | None = None,
+        speculation: SpeculativeCoordinator | None = None,
     ) -> None:
         kind = kind.strip().lower().replace("-", "_")
+        if speculation is not None and not getattr(runner, "speculative_decoding", False):
+            raise ValueError("speculative planning needs a runner with speculative verification")
         if (
             kind in ("eager", "reference", "debug")
             and plan.scheduling_policy is SchedulingPolicy.LONGEST_PREFIX_MATCH
@@ -232,7 +236,12 @@ class ResidentKVEngine(Engine):
             capacity_hint=self.preparer,
             allow_mixed_batches=bool(getattr(runner, "supports_mixed_batches", False)),
             max_decode_burst=max_decode_burst,
+            speculation=speculation,
         )
+        self.speculation = speculation
+        lora = getattr(runner, "lora", None)
+        if lora is not None:
+            scheduler.max_loras_per_batch = lora.config.max_loras_per_batch
         super().__init__(
             plan,
             requests=requests,
@@ -254,6 +263,9 @@ class ResidentKVEngine(Engine):
             set_source(self.requests.get)
         if set_bans is not None:
             set_bans(self.sampling_masks)
+        set_speculative_bans = getattr(runner, "set_speculative_bans", None)
+        if speculation is not None and set_speculative_bans is not None:
+            set_speculative_bans(self.speculative_masks)
         self.executor.initialize()
 
     @classmethod
@@ -424,4 +436,6 @@ class ResidentKVEngine(Engine):
             self.scheduler.flush_reports()
             if not self.kv.closed:
                 self.kv.reclaim_deferred()
+            if self.speculation is not None:
+                self.speculation.close()
         return result

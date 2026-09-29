@@ -488,6 +488,7 @@ class KVExecutionResources:
         self.submitted = False
         self.committed = False
         self.retired = False
+        self.written: tuple[int, ...] | None = None
 
     def adopt(self, ticket_id: TicketId, prepared: PreparedStep) -> None:
         if self.owner is not None or self.retired or prepared is not self.prepared:
@@ -542,13 +543,31 @@ class KVExecutionResources:
         self.kv.mark_step_in_flight(self.prepared.memory_view.lease)
         self.submitted = True
 
-    def commit(self, ticket_id: TicketId) -> tuple[int, ...]:
+    def commit(
+        self, ticket_id: TicketId, *, written: tuple[int, ...] | None = None
+    ) -> tuple[int, ...]:
+        """Publish KV under completion proof; ``written`` keeps rows per request.
+
+        ``written`` follows packed request order and is required exactly when
+        the step carries speculative draft rows; the KV owner rejects any count
+        outside a reservation's commit range.
+        """
         self._check(ticket_id)
         if not self.submitted or self.committed or self.retired:
             raise ValueError("KV bundle is not awaiting commit")
         self._require_completion(ticket_id, succeeded=True)
         self._require_generation()
-        self.kv.commit_step(self.prepared.memory_view.lease)
+        view = self.prepared.memory_view
+        report = None
+        if written is not None:
+            if type(written) is not tuple or len(written) != len(view.sequences):
+                raise ValueError("written-token report must cover every request in packed order")
+            report = {
+                sequence.reservation: count
+                for sequence, count in zip(view.sequences, written, strict=True)
+            }
+        self.kv.commit_step(view.lease, written_tokens=report)
+        self.written = written
         self.committed = True
         return tuple(
             self.kv.get_sequence(value.sequence).version for value in self.prepared.step.inputs
@@ -579,8 +598,15 @@ class KVExecutionResources:
             self.kv.abort_prepared_step(lease)
         if succeeded and self.requests is not None:
             self.requests.publish(self.prepared, discarded_sequences)
-            for scheduled in self.prepared.step.slices:
-                self.requests.telemetry.record_forward(scheduled.request_id, scheduled.query_count)
+            # Forward telemetry counts rows whose KV committed; rejected draft
+            # rows are speculative waste, reported by the speculative metrics.
+            counts = (
+                self.written
+                if self.written is not None
+                else tuple(s.query_count for s in self.prepared.step.slices)
+            )
+            for scheduled, count in zip(self.prepared.step.slices, counts, strict=True):
+                self.requests.telemetry.record_forward(scheduled.request_id, count)
         if self.requests is not None:
             for sequence in discarded_sequences:
                 self.requests.forget(sequence)

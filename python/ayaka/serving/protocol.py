@@ -276,7 +276,8 @@ def normalize(body: dict, protocol: str) -> GenerationSpec:
 
 
 def _fields(data, allowed):
-    unknown = set(data) - allowed
+    # All public protocols share the explicit name/revision adapter extension.
+    unknown = set(data) - (allowed | {"adapter"})
     if unknown:
         raise UnsupportedFeatureError(f"unsupported field: {sorted(unknown)[0]}")
 

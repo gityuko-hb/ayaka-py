@@ -49,7 +49,7 @@ from ayaka.memory.capacity import (
     mint_generation,
     reconcile_actual_usage,
 )
-from ayaka.memory.host.host_policy import HostMemoryPolicy
+from ayaka.memory.host.host_policy import HostMemoryPolicy, probe_host_memory
 from ayaka.memory.ledger import MemoryLedger, Reservation
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.source import TorchDeviceSource, TorchHostByteSource
@@ -86,6 +86,7 @@ class WorkerResourcePlan:
     staging_bytes: int
     # Logical handles for waiting lifecycle; no KV pages until reservation.
     max_num_requests: int | None = None
+    lora_host_bytes: int = 0
     tiering: TieringConfig | None = None
     max_inflight_bytes: int | None = None
     #: Resolved host pin ceiling for the KV mirror. ``None`` keeps the
@@ -105,6 +106,7 @@ class WorkerResourcePlan:
     def budget(self) -> tuple[int, int, int]:
         """Return policy, KV and total budgets before materializing anything."""
         require_int(self.alignment_bytes, "alignment_bytes", minimum=1)
+        require_int(self.lora_host_bytes, "lora_host_bytes")
         slab = self.storage_spec.aligned_total_bytes(self.alignment_bytes) + LEDGER_OVERHEAD_BYTES
         if self.lane is MemoryLane.CUDA:
             total = self.device_total_bytes
@@ -187,8 +189,15 @@ class WorkerResourcePlan:
             device_index=index,
             host_pageable_bytes=(
                 budget if self.lane is MemoryLane.CPU else self.staging_bytes + mirror_bytes
+            )
+            + self.lora_host_bytes,
+            host_total_bytes=(
+                (probe_host_memory().mem_total_bytes or 0)
+                if self.lora_host_bytes
+                else total
+                if self.lane is MemoryLane.CPU
+                else 0
             ),
-            host_total_bytes=total if self.lane is MemoryLane.CPU else 0,
         )
         with ExitStack() as rollback:
             # Registered first: accounting is released only after backing owners.
@@ -213,6 +222,17 @@ class WorkerResourcePlan:
                             device_index=index,
                         )
                     )
+            if self.lora_host_bytes:
+                ledger.admit(
+                    Reservation(
+                        MemoryOwner.WEIGHT,
+                        "lora.host",
+                        self.lora_host_bytes,
+                        0,
+                        tier=MemoryTier.HOST_PAGEABLE,
+                        charged_bytes=self.lora_host_bytes,
+                    )
+                )
             storage = materialize_kv_storage(
                 self.storage_spec,
                 ledger=ledger,
@@ -362,6 +382,7 @@ class WorkerResourcePlan:
                 budget_bytes=budget,
                 kv_budget_bytes=kv_budget,
                 weights_bytes=self.weights_bytes,
+                host_weights_bytes=self.lora_host_bytes,
                 ledger=ledger,
                 runner_buffer_bytes=self.buffer_spec.device_bytes,
             )

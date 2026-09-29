@@ -122,6 +122,33 @@ class OutputProcessor:
     def masked_ids(self, request_id: str, *, generated_tokens: int) -> frozenset[int]:
         return self._state(request_id).policy.masked_token_ids(generated_tokens)
 
+    def stop_token_ids(self, request_id: str) -> frozenset[int]:
+        """Token ids that end generation once ``min_tokens`` is reached."""
+        policy = self._state(request_id).policy
+        eos = () if policy.ignore_eos else policy.eos_token_ids
+        return frozenset((*policy.stop_token_ids, *eos))
+
+    def has_text_stops(self, request_id: str) -> bool:
+        return bool(self._state(request_id).policy.stop_strings)
+
+    def token_stop_limit(
+        self, request_id: str, tokens: tuple[int, ...], generated_tokens: int
+    ) -> int:
+        """How many of ``tokens`` publish before a token-id stop ends generation.
+
+        Pure: evaluates the stop policy for each prospective token exactly as
+        :meth:`on_published` will, without decoding text or recording events.
+        Text stops need incremental detokenization and are refused; speculative
+        planning never admits a request that has them.
+        """
+        state = self._state(request_id)
+        if state.policy.stop_strings:
+            raise ValueError("text stop strings cannot be evaluated before publication")
+        for index, token in enumerate(tokens, start=1):
+            if state.policy.evaluate(token, generated_tokens=generated_tokens + index) is not None:
+                return index
+        return len(tokens)
+
     def on_published(
         self,
         request_id: str,

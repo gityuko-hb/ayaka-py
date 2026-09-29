@@ -363,7 +363,10 @@ class ServingRuntime:
             self._measure_weights(model) if weights_bytes is None else weights_bytes
         )
         if self.config.lora is not None:
-            self._weights_bytes += self.config.lora.memory_bytes + max_inflight * batch_tokens * 8
+            # One budget covers the stable bank, rank metadata, per-flight
+            # workspaces and grouped routing; the runner enforces the same
+            # ceiling before allocation, so nothing is charged twice.
+            self._weights_bytes += self.config.lora.memory_bytes
         if self.config.speculative is not None:
             self._weights_bytes += (
                 self._measure_weights(draft_model) + self.config.speculative.memory_bytes
@@ -469,6 +472,12 @@ class ServingRuntime:
             max_num_batched_tokens=batch_tokens,
             max_inflight=self._scheduler_config.max_inflight,
             group_columns={"default": div_ceil(max_seq, page_size)},
+            # Verification projects every draft row, bounded by the token budget.
+            max_projection_rows=(
+                max(max_requests, batch_tokens)
+                if self.config.speculative_decoding is not None
+                else None
+            ),
         )
         self._runner_buffer_bytes = self._buffer_spec.device_bytes
         self._runner_staging_bytes = self._buffer_spec.staging_bytes if device.type == "cuda" else 0
@@ -636,6 +645,7 @@ class ServingRuntime:
         spec = self._storage_spec(pages)
         tiering_config, max_inflight_bytes = self._tiering_config(spec)
         return WorkerResourcePlan(
+            lora_host_bytes=(0 if self.config.lora is None else self.config.lora.host_memory_bytes),
             device=self._device,
             storage_spec=self._storage_spec(pages),
             buffer_spec=self._buffer_spec,
@@ -699,6 +709,8 @@ class ServingRuntime:
             lora=self.lora,
         )
         runner.set_valid_token_ids(self._valid_token_ids)
+        if self.config.speculative_decoding is not None:
+            runner.enable_speculative_decoding()
         return runner
 
     def _build_engine(
@@ -719,6 +731,18 @@ class ServingRuntime:
             workspace=MemoryPlan(activation_bytes=self._activation_bytes),
             capabilities=self._capabilities,
         )
+        speculation = None
+        if self.config.speculative_decoding is not None:
+            from ayaka.speculative.coordinator import SpeculativeCoordinator
+
+            # One control plane per engine: proposer state lives exactly as
+            # long as the requests of this tail.
+            speculation = SpeculativeCoordinator(
+                self.config.speculative_decoding,
+                max_model_len=self._max_seq,
+                stop_token_ids=self._output.stop_token_ids,
+                custom_sampling_ops=bool(self._sampling.custom_ops),
+            )
         engine = ResidentKVEngine(
             plan,
             kv,
@@ -738,6 +762,7 @@ class ServingRuntime:
             chunk_pressure=self._chunk_pressure,
             clock=self._clock,
             max_decode_burst=(None if multiplexer is None else multiplexer.config.max_decode_burst),
+            speculation=speculation,
         )
         if self._constraints is not None:
             runner.set_request_source(engine.requests.get, constraints=self._constraints)
@@ -843,16 +868,19 @@ class ServingRuntime:
         worker = None if self.engine is None else self.engine.executor.worker
         mux = getattr(worker, "multiplexer", None)
         spec = None if runner is None else runner.speculative_runner
+        speculation = None if self.engine is None else getattr(self.engine, "speculation", None)
         return {
             "lora": None
             if self.lora is None
             else {
                 "variant": repr(self.lora.variant),
                 "bytes": self.lora.bytes,
-                "loaded": len(self.lora._bindings),
-                "leases": sum(self.lora._leases),
+                "loaded": self.lora.stats()["lora_active_slots"],
+                "leases": self.lora.stats()["lora_active_leases"],
+                **self.lora.stats(),
             },
             "speculative": None if spec is None else spec.report(),
+            "speculative_decoding": None if speculation is None else speculation.report(),
             "lanes": None if mux is None else mux.report(),
         }
 
@@ -1196,6 +1224,8 @@ class ServingRuntime:
                 raise ValueError("rebuild must advance owner_incarnation")
             self._freeze = tail.resources.freeze
         self._tail = tail
+        if self.lora is not None:
+            self.lora.manager.bind_host_ledger(tail.ledger)
         # The runner's attention is bound and the freeze exists, so the graph
         # tier can be judged and the bucket set admitted against real headroom.
         # Order matters: policy must not read a report that still says "unbound",

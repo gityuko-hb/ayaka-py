@@ -7,7 +7,8 @@ can accept, reject, or force the scheduler to reshape a candidate step.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -40,9 +41,12 @@ from ayaka.sched.plan import (
 )
 from ayaka.sched.policy import QueueEntry, order
 from ayaka.sched.preemption import select_preemption_victim
+from ayaka.speculative.coordinator import DecodeCandidate
+from ayaka.speculative.plan import SpecDisableReason, SpeculativeSlicePlan
 
 if TYPE_CHECKING:
     from ayaka.sampling.engine import SamplingCoordinator
+    from ayaka.speculative.coordinator import SpeculativeCoordinator
 
 __all__ = ["ContinuousScheduler", "ContinuousSchedulerStats"]
 
@@ -130,6 +134,7 @@ class ContinuousScheduler(SchedulerCore):
         max_bypass: int | None = None,
         sampling: SamplingCoordinator | None = None,
         request_preparer: RequestPreparer | None = None,
+        speculation: SpeculativeCoordinator | None = None,
     ) -> None:
         super().__init__(
             plan,
@@ -140,6 +145,7 @@ class ContinuousScheduler(SchedulerCore):
             clock=clock,
             sampling=sampling,
             request_preparer=request_preparer,
+            speculation=speculation,
         )
         if prefill_chunk_size is not None and prefill_chunk_size <= 0:
             raise ValueError("prefill_chunk_size must be positive")
@@ -176,6 +182,11 @@ class ContinuousScheduler(SchedulerCore):
         self._max_bypass = max_bypass
 
         self._inflight_slices: dict[TicketId, tuple[_InflightSlice, ...]] = {}
+        #: Adopted plans kept only while speculation needs them for feedback.
+        self._inflight_plans: dict[TicketId, BatchStepPlan] = {}
+        #: Disable reasons and proposer latency of the latest speculative
+        #: planning pass, accounted when (and only if) its step is adopted.
+        self._spec_planning: tuple[Counter[SpecDisableReason], int] | None = None
         self._last_step: BatchStepPlan | None = None
         self._decode_cursor = 0
         self._service_round = 0
@@ -235,6 +246,9 @@ class ContinuousScheduler(SchedulerCore):
     def update_from_output(self, output: CompletionResult) -> None:
         if self._sampling is not None and output.published:
             self._sampling.record_published(output.published)
+        adopted = self._inflight_plans.pop(output.ticket_id, None)
+        if adopted is not None and self._speculation is not None:
+            self._speculation.observe(adopted, output)
         settled_ids = self._clear_inflight(output.ticket_id)
         if settled_ids is not None:
             inflight = self._inflight_slices.pop(output.ticket_id, ())
@@ -310,18 +324,63 @@ class ContinuousScheduler(SchedulerCore):
         inputs = []
         if self._decode_first:
             self._append_decodes(budget, slices, inputs)
+            speculative = self._append_speculation(budget, slices, inputs)
             self._append_prefills(budget, slices, inputs)
         else:
             self._append_prefills(budget, slices, inputs)
             self._append_decodes(budget, slices, inputs)
-        return self._make_plan(slices, inputs) if slices else None
+            speculative = self._append_speculation(budget, slices, inputs)
+        return self._make_plan(slices, inputs, speculative=speculative) if slices else None
 
     def _build_decode_only(self) -> BatchStepPlan | None:
         budget = BatchBudget.from_plan(self._plan)
         slices: list[ScheduledSlice] = []
         inputs = []
         self._append_decodes(budget, slices, inputs)
-        return self._make_plan(slices, inputs) if slices else None
+        speculative = self._append_speculation(budget, slices, inputs)
+        return self._make_plan(slices, inputs, speculative=speculative) if slices else None
+
+    def _append_speculation(
+        self,
+        budget: BatchBudget,
+        slices: list[ScheduledSlice],
+        inputs: list,
+    ) -> dict[str, SpeculativeSlicePlan]:
+        """Extend admitted decode slices with draft rows from the remaining budget.
+
+        Base decode rows were admitted first with unchanged round-robin
+        fairness; speculation only spends what is left and never admits,
+        evicts or reorders a request. Rollback-safe: no request state changes.
+        """
+        self._spec_planning = None
+        coordinator = self._speculation
+        if coordinator is None:
+            return {}
+        candidates = [
+            DecodeCandidate(
+                index, scheduled, value, self._requests.get(scheduled.request_id).request
+            )
+            for index, (scheduled, value) in enumerate(zip(slices, inputs, strict=True))
+            if scheduled.phase is Phase.DECODE
+        ]
+        if not candidates:
+            return {}
+        proposal = coordinator.propose(candidates, step_hint=self._round)
+        disabled = Counter(proposal.disabled)
+        plans: dict[str, SpeculativeSlicePlan] = {}
+        for plan in proposal.plans:
+            fit = budget.largest_fittable(plan.effective_k, new_sequence=False)
+            if fit <= 0:
+                disabled[SpecDisableReason.TOKEN_BUDGET] += 1
+                continue
+            if fit < plan.effective_k:
+                plan = plan.truncated(fit)
+            if not budget.try_consume(plan.effective_k, phase=Phase.DECODE, new_sequence=False):
+                disabled[SpecDisableReason.TOKEN_BUDGET] += 1
+                continue
+            plans[plan.request_id] = plan
+        self._spec_planning = (disabled, proposal.draft_latency_ns)
+        return plans
 
     def _build_prefill_only(self) -> BatchStepPlan | None:
         budget = BatchBudget.from_plan(self._plan)
@@ -352,6 +411,8 @@ class ContinuousScheduler(SchedulerCore):
             if lifecycle.request_id in self._inflight_ids_all:
                 # One unsettled slice per request: the adopted ticket keeps
                 # its ownership until update_from_output settles it.
+                continue
+            if not self._adapter_fits(lifecycle.request, slices):
                 continue
             if not budget.try_consume(1, phase=Phase.DECODE):
                 break
@@ -410,6 +471,9 @@ class ContinuousScheduler(SchedulerCore):
                 break
 
             lifecycle = entry.lifecycle
+            if not self._adapter_fits(lifecycle.request, slices):
+                self._mark_bypass(entry)
+                continue
             if self._request_preparer is not None and not self._request_preparer.prepare_request(
                 lifecycle
             ):
@@ -522,6 +586,20 @@ class ContinuousScheduler(SchedulerCore):
 
         ticket = self._runtime.adopt(prepared)
         self._set_inflight(ticket, (scheduled.request_id for scheduled in current.slices))
+        if self._speculation is not None:
+            disabled, draft_ns = self._spec_planning or (Counter(), 0)
+            planned = plan.speculative if plan.step_id == current.step_id else ()
+            kept = {spec.request_id for spec in current.speculative}
+            live = {scheduled.request_id for scheduled in current.slices}
+            stripped = sum(
+                1 for spec in planned if spec.request_id in live and spec.request_id not in kept
+            )
+            if stripped:
+                disabled = Counter(disabled)
+                disabled[SpecDisableReason.MEMORY_PRESSURE] += stripped
+            self._speculation.record_adopted(current, disabled, draft_latency_ns=draft_ns)
+            self._inflight_plans[ticket.id] = current
+            self._spec_planning = None
         self._service_round += 1
         self._advance_decode_cursor(current.slices)
         self._recover_chunk_cap()
@@ -547,7 +625,13 @@ class ContinuousScheduler(SchedulerCore):
         return ticket
 
     def _shrink_transient(self, plan: BatchStepPlan) -> BatchStepPlan | None:
-        """Reduce pressure while protecting decode latency as long as possible."""
+        """Reduce pressure while protecting decode latency as long as possible.
+
+        Speculative draft rows are the first thing given up: they are an
+        optimization, so they never cost a prefill chunk or a decode request.
+        """
+        if plan.speculative:
+            return self._make_plan(plan.slices, plan.inputs, step_id=plan.step_id)
         slices = plan.slices
         inputs = plan.inputs
         largest = -1
@@ -659,18 +743,28 @@ class ContinuousScheduler(SchedulerCore):
         inputs: Sequence[RequestStepInput],
         *,
         step_id: int | None = None,
+        speculative: Mapping[str, SpeculativeSlicePlan] | None = None,
     ) -> BatchStepPlan:
         if step_id is None:
             step_id = self._next_step_id()
 
+        drafts = speculative or {}
         total = 0
         sampling_rows: list[int] = []
         attribution: list[tuple[str, int]] = []
-        for scheduled in slices:
-            total += scheduled.query_count
-            attribution.append((scheduled.request_id, scheduled.query_count))
+        extensions: list[SpeculativeSlicePlan] = []
+        for index, scheduled in enumerate(slices):
+            rows = scheduled.query_count
+            extension = drafts.get(scheduled.request_id)
+            if extension is not None:
+                extensions.append(extension.with_slice_index(index))
+                rows += extension.effective_k
             if scheduled.sample_last_query:
-                sampling_rows.append(total - 1)
+                # The sampled row is the slice's last committed query; draft
+                # rows follow it in the execution layout.
+                sampling_rows.append(total + scheduled.query_count - 1)
+            total += rows
+            attribution.append((scheduled.request_id, rows))
 
         groups = len(self._plan.execution.attention_groups)
         request_tokens = tuple(attribution)
@@ -688,6 +782,7 @@ class ContinuousScheduler(SchedulerCore):
                 for group in range(groups)
             ),
             created_ns=self._clock(),
+            speculative=tuple(extensions),
         )
 
     def _without_request(self, plan: BatchStepPlan, request_id: str) -> BatchStepPlan | None:
@@ -708,6 +803,7 @@ class ContinuousScheduler(SchedulerCore):
             [scheduled for scheduled, _ in pairs],
             [value for _, value in pairs],
             step_id=plan.step_id,
+            speculative={spec.request_id: spec for spec in plan.speculative},
         )
 
     # ------------------------------------------------------------------

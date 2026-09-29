@@ -84,6 +84,10 @@ class Engine:
             if stat_loggers
             else None
         )
+        if getattr(coordinator, "publication_limit", False) is None:
+            # Speculative emissions stop at the same token-id stops the output
+            # owner would report, before their KV is committed.
+            coordinator.publication_limit = output.token_stop_limit
 
     def submit(self, request: Request, *, defer_to_remote_kv: bool = False) -> RequestLifecycle:
         """Register output state, then admit. Failures leave no output state.
@@ -216,21 +220,31 @@ class Engine:
             did = True
             self._settled += 1
             published_tokens += len(result.published)
+            finished: set[str] = set()
             for sample in result.published:
                 lifecycle = self._requests.find(sample.request_id)
                 if lifecycle is None or lifecycle.is_terminal:
                     continue
                 if lifecycle.sequence_epoch != sample.sequence_epoch:
                     continue
+                if sample.request_id in finished:
+                    # Completion truncates speculative emissions at the first
+                    # token stop, so this is defense in depth only.
+                    continue
                 decision = self._output.on_published(
                     sample.request_id,
                     sample.token_id,
                     sequence_epoch=sample.sequence_epoch,
-                    generated_tokens=len(lifecycle.output_token_ids),
+                    generated_tokens=(
+                        sample.output_index
+                        if sample.output_index is not None
+                        else len(lifecycle.output_token_ids)
+                    ),
                     prompt_tokens=lifecycle.request.prompt_len,
                 )
                 if decision is not None:
                     finishes.append(decision)
+                    finished.add(sample.request_id)
             self._scheduler.update_from_output(result)
 
         for decision in finishes:
@@ -248,9 +262,7 @@ class Engine:
             if ticket is None:
                 break
             self._coordinator.launch(ticket)
-            launched_tokens += sum(
-                scheduled.query_count for scheduled in ticket.prepared.step.slices
-            )
+            launched_tokens += ticket.prepared.step.execution_num_tokens
             did = True
 
         self._allocator.advance_epoch(self._settled)
@@ -324,6 +336,22 @@ class Engine:
                     generated_tokens=len(lifecycle.output_token_ids),
                 )
             )
+        return tuple(masks)
+
+    def speculative_masks(self, step: BatchStepPlan) -> tuple[frozenset[int], ...]:
+        """Pre-sample bans for every draft verification row, in extension-row order.
+
+        Draft row ``i`` (1-based) of a slice decides output token ``g + i + 1``
+        for a request with ``g`` published tokens, so it carries exactly the
+        bans target-only decoding would apply at ``generated_tokens = g + i``.
+        """
+        masks: list[frozenset[int]] = []
+        for plan in step.speculative:
+            generated = len(self._requests.get(plan.request_id).output_token_ids)
+            for offset in range(1, plan.effective_k + 1):
+                masks.append(
+                    self._output.masked_ids(plan.request_id, generated_tokens=generated + offset)
+                )
         return tuple(masks)
 
     def _finish(self, request_id: str, reason: FinishReason, detail: str = "") -> bool:

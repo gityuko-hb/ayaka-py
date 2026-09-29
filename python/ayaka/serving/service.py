@@ -396,13 +396,14 @@ class ServingService:
                     prefix_tokens=decision.prefix_tokens,
                 )
         except Exception as exc:
+            from ayaka.lora.manager import AdapterCapacityError
             from ayaka.sched.interfaces import DeadlineExceededError as SchedulerDeadline
             from ayaka.sched.interfaces import OverloadedError as SchedulerOverloaded
 
             if isinstance(exc, SchedulerDeadline):
                 self.stats.record_rejection("deadline")
                 error = DeadlineExceededError(str(exc))
-            elif isinstance(exc, SchedulerOverloaded):
+            elif isinstance(exc, (SchedulerOverloaded, AdapterCapacityError)):
                 self.stats.record_rejection("scheduler")
                 error = OverloadedError(str(exc))
             elif isinstance(exc, (ValueError, TypeError)):

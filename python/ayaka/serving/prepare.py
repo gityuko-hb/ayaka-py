@@ -43,11 +43,20 @@ class PrepareTimings:
     tokenize_done_ns: int = 0
 
 
+class AdapterSpec(BaseModel):
+    """Public immutable logical adapter identity; never a runtime slot."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: str = Field(min_length=1)
+    revision: str = Field(min_length=1)
+
+
 class GenerationSpec(BaseModel):
     """Every protocol maps into this model before touching the engine."""
 
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
     model: str
+    adapter: AdapterSpec | None = None
     prompt: str | list[int] | None = None
     messages: list[dict] | None = None
     max_tokens: int = Field(default=128, ge=1)
@@ -325,6 +334,8 @@ class RequestProcessor:
             queue_deadline_ns = min(queue_deadline_ns, deadline_ns)
         if deadline_ns is not None and self._clock() >= deadline_ns:
             raise DeadlineExceededError("deadline elapsed during request staging")
+        from ayaka.lora.variant import AdapterIdentity
+
         return Request(
             RequestId("req_" + uuid4().hex),
             tuple(encoded.token_ids),
@@ -351,4 +362,9 @@ class RequestProcessor:
             arrival_ns=self._clock(),
             deadline_ns=deadline_ns,
             queue_deadline_ns=queue_deadline_ns,
+            adapter=(
+                None
+                if spec.adapter is None
+                else AdapterIdentity(spec.adapter.name, spec.adapter.revision)
+            ),
         )
