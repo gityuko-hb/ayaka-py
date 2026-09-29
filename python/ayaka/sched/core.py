@@ -33,6 +33,7 @@ from ayaka.sched.policy import QueueEntry
 if TYPE_CHECKING:
     from ayaka.sampling.engine import SamplingCoordinator
     from ayaka.sched.plan import ScheduledSlice
+    from ayaka.speculative.coordinator import SpeculativeCoordinator
 
 __all__ = ["SchedulerCore", "HOT_WINDOW_SIZE"]
 
@@ -57,6 +58,7 @@ class SchedulerCore(BaseScheduler):
         clock: Callable[[], int] | None = None,
         sampling: SamplingCoordinator | None = None,
         request_preparer: RequestPreparer | None = None,
+        speculation: SpeculativeCoordinator | None = None,
     ) -> None:
         if not isinstance(plan, ResolvedSchedulerPlan):
             raise TypeError("plan must be ResolvedSchedulerPlan")
@@ -71,6 +73,10 @@ class SchedulerCore(BaseScheduler):
                 )
 
         self._request_preparer = request_preparer
+        #: Host speculative control plane; it only proposes draft extensions
+        #: of admitted decode slices and never owns requests or KV.
+        self._speculation = speculation
+        self.max_loras_per_batch: int | None = None
         self._plan = plan
         self._requests = requests
         self._runtime = runtime
@@ -253,6 +259,17 @@ class SchedulerCore(BaseScheduler):
             sequence=sequence,
         )
         return lifecycle
+
+    def _adapter_fits(self, request: Request, slices: Sequence[ScheduledSlice]) -> bool:
+        """Logical distinct-adapter budget; residency stays with the runner owner."""
+        if self.max_loras_per_batch is None or request.adapter is None:
+            return True
+        adapters = {
+            self._requests.get(s.request_id).request.adapter
+            for s in slices
+            if self._requests.get(s.request_id).request.adapter is not None
+        }
+        return request.adapter in adapters or len(adapters) < self.max_loras_per_batch
 
     def _validate_request_features(self, request: Request) -> None:
         params = request.sampling
@@ -630,6 +647,10 @@ class SchedulerCore(BaseScheduler):
         self._prefilling.pop(request_id, None)
         self._running_remove(request_id)
         self._drop_waiting(request_id)
+        if self._speculation is not None:
+            # Terminal ownership ends here; request-private proposer state
+            # (n-gram indexes) must not outlive it.
+            self._speculation.release_request(request_id)
         parent_id = self._parents.parent_of(request_id)
         if parent_id is not None and self._parents.child_finished(request_id) is not None:
             self._parents.unregister(parent_id)

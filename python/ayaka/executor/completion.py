@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ayaka.executor.base import Executor
@@ -18,16 +20,25 @@ from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.sampling.logprobs import LogprobResult, TokenLogprob
 from ayaka.sampling.ops.sampling import SamplingSupportStatus
 from ayaka.sched.plan import PreparedStep, ScheduledSlice
+from ayaka.speculative.metadata import SpeculativeVerification
 from ayaka.utils.validation import require_int
 
 
 @dataclass(frozen=True, slots=True)
 class PublishedSample:
+    """One published token.
+
+    ``output_index`` is the request's generated-token count including this
+    token when one settlement publishes several tokens (speculative decoding);
+    ``None`` means the lifecycle's current count, the single-token case.
+    """
+
     request_id: str
     sequence_epoch: int
     token_id: int
     logprobs: LogprobResult | None = None
     sampling_support: SamplingSupportReport | None = None
+    output_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +252,26 @@ class CompletionResult:
     ignored_requests: tuple[str, ...] = ()
     error: str = ""
     prompt_logprobs: tuple[PromptLogprobChunk, ...] = ()
+    speculative: tuple[SpeculativeVerification, ...] = ()
+    #: Host-observed submit and terminal times of the ticket (monotonic ns);
+    #: an upper bound on device time, used for speculative cost estimates.
+    submitted_ns: int | None = None
+    terminal_ns: int | None = None
+    #: Host time spent materializing acceptance and committing a speculative
+    #: step's partial KV; ``None`` for ordinary steps.
+    settlement_ns: int | None = None
+
+
+#: ``(request_id, candidate_tokens, generated_tokens) -> tokens to publish``.
+#: Pure stop evaluation over token ids; it never decodes text or mutates state.
+PublicationLimit = Callable[[str, tuple[int, ...], int], int]
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeculativeSettlement:
+    written: tuple[int, ...]
+    emitted: dict[int, tuple[int, ...]]
+    accepted: dict[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,10 +291,67 @@ class CompletionCoordinator:
     the ticket; no finally block frees potentially live or ambiguously owned data.
     """
 
-    def __init__(self, executor: Executor, requests: LifecycleManager) -> None:
+    def __init__(
+        self,
+        executor: Executor,
+        requests: LifecycleManager,
+        *,
+        publication_limit: PublicationLimit | None = None,
+    ) -> None:
         self.executor = executor
         self.requests = requests
+        #: Token-id stop oracle applied to speculative emissions before their
+        #: KV commit; ``None`` truncates at the output budget only.
+        self.publication_limit = publication_limit
         self._bindings: dict[TicketId, tuple[tuple[RequestLifecycle, ScheduledSlice], ...]] = {}
+
+    def _speculative_settlement(
+        self,
+        ticket: ExecutionTicket,
+        bindings: tuple[tuple[RequestLifecycle, ScheduledSlice], ...],
+        samples,
+        tokens: tuple[int, ...],
+    ) -> _SpeculativeSettlement:
+        """Decide published tokens and kept KV rows for every slice of a speculative step.
+
+        Emissions are the accepted drafts plus the target token, truncated at
+        the output budget and at the first token-id stop, so committed KV rows
+        equal published tokens. A slice whose request no longer accepts
+        completion commits only its committed query rows and publishes nothing.
+        """
+        step = ticket.prepared.step
+        speculative = samples.speculative
+        if speculative is None:
+            raise RuntimeError("speculative step completed without acceptance results")
+        accepted_counts = tuple(int(value) for value in speculative.accepted.tolist())
+        sample_index: dict[int, int] = {}
+        row = 0
+        for index, (_, scheduled) in enumerate(bindings):
+            if scheduled.sample_last_query:
+                sample_index[index] = row
+                row += 1
+        written = [scheduled.query_count for _, scheduled in bindings]
+        emitted: dict[int, tuple[int, ...]] = {}
+        accepted: dict[int, int] = {}
+        for plan, count in zip(step.speculative, accepted_counts, strict=True):
+            if not 0 <= count <= plan.effective_k:
+                raise ValueError("device acceptance count lies outside the draft length")
+            accepted[plan.slice_index] = count
+            request, scheduled = bindings[plan.slice_index]
+            if not request.accepts_completion(step.step_id, scheduled):
+                continue
+            candidate = (*plan.draft_token_ids[:count], tokens[sample_index[plan.slice_index]])
+            generated = len(request.output_token_ids)
+            keep = min(len(candidate), request.request.stop.max_tokens - generated)
+            if keep >= 1 and self.publication_limit is not None:
+                keep = min(
+                    keep, self.publication_limit(request.request_id, candidate[:keep], generated)
+                )
+            if keep < 1:
+                raise ValueError("speculative settlement has no publishable token")
+            emitted[plan.slice_index] = candidate[:keep]
+            written[plan.slice_index] = keep
+        return _SpeculativeSettlement(tuple(written), emitted, accepted)
 
     def _trace(
         self,
@@ -394,6 +482,8 @@ class CompletionCoordinator:
         published: list[PublishedSample] = []
         ignored: list[str] = []
         prompt_logprobs: list[PromptLogprobChunk] = []
+        speculative: list[SpeculativeVerification] = []
+        settlement_ns: int | None = None
         step_id = ticket.prepared.step.step_id
         try:
             if outcome.status is TerminalStatus.SUCCEEDED:
@@ -414,7 +504,32 @@ class CompletionCoordinator:
                                 or request.sequence_epoch != scheduled.sequence_epoch
                             ):
                                 raise
-                versions = ticket._resources.commit(ticket.id)
+                # Publication boundary: the single host materialization of the
+                # step's device-resident sampling results. Everything upstream
+                # (sampler, coordinator, ticket) keeps tensors; everything
+                # downstream (publish, reporting) reads host values only. A
+                # speculative step needs its accepted counts before the KV
+                # commit, so materialization precedes the commit for every step.
+                samples = outcome.samples
+                if samples is None:
+                    raise RuntimeError(
+                        "succeeded outcome without sampling results; the executor "
+                        "must validate samples before completing a ticket"
+                    )
+                settle_started = time.perf_counter_ns()
+                tokens = tuple(int(t) for t in samples.token_ids.tolist())
+                settlement = (
+                    self._speculative_settlement(ticket, bindings, samples, tokens)
+                    if ticket.prepared.step.speculative
+                    else None
+                )
+                versions = (
+                    ticket._resources.commit(ticket.id)
+                    if settlement is None
+                    else ticket._resources.commit(ticket.id, written=settlement.written)
+                )
+                if settlement is not None:
+                    settlement_ns = time.perf_counter_ns() - settle_started
                 expected = tuple(s.expected_state_version + 1 for _, s in bindings)
                 if type(versions) is not tuple:
                     raise TypeError("committed versions must be an immutable tuple")
@@ -423,17 +538,6 @@ class CompletionCoordinator:
                 if versions != expected:
                     raise ValueError("resource commit returned unexpected KV versions")
                 self._trace("commit", ticket, status=outcome.status.value)
-                # Publication boundary: the single host materialization of the
-                # step's device-resident sampling results. Everything upstream
-                # (sampler, coordinator, ticket) keeps tensors; everything
-                # downstream (publish, reporting) reads host values only.
-                samples = outcome.samples
-                if samples is None:
-                    raise RuntimeError(
-                        "succeeded outcome without sampling results; the executor "
-                        "must validate samples before completing a ticket"
-                    )
-                tokens = tuple(int(t) for t in samples.token_ids.tolist())
                 report_by_row = _materialize_reports(samples)
                 support_by_row = _materialize_support(samples)
                 ids_by_row = _materialize_ids_logprobs(samples)
@@ -446,6 +550,7 @@ class CompletionCoordinator:
                     )
                 }
                 prompt_logprobs.clear()
+                published_counts: dict[int, int] = {}
                 sample_index = 0
                 for slice_index, ((request, scheduled), version) in enumerate(
                     zip(bindings, versions, strict=True)
@@ -459,16 +564,53 @@ class CompletionCoordinator:
                         )
                         continue
                     try:
-                        request.commit_computed_range(
-                            step_id,
-                            scheduled,
-                            committed_state_version=version,
-                            now_ns=now_ns,
+                        emitted = (
+                            None if settlement is None else settlement.emitted.get(slice_index)
                         )
+                        if emitted is not None:
+                            generated = len(request.output_token_ids)
+                            request.commit_speculative_range(
+                                step_id,
+                                scheduled,
+                                emitted,
+                                committed_state_version=version,
+                                now_ns=now_ns,
+                            )
+                            runtime_event(
+                                "publish",
+                                request_id=request.request_id,
+                                sequence_epoch=scheduled.sequence_epoch,
+                                sequence=ticket.prepared.step.inputs[slice_index].sequence,
+                                step_id=step_id,
+                                ticket_id=ticket.id,
+                                status=outcome.status.value,
+                                detail=f"speculative tokens={len(emitted)}",
+                            )
+                            for offset, token in enumerate(emitted, start=1):
+                                published.append(
+                                    PublishedSample(
+                                        request.request_id,
+                                        scheduled.sequence_epoch,
+                                        token,
+                                        output_index=generated + offset,
+                                    )
+                                )
+                            published_counts[slice_index] = len(emitted)
+                        else:
+                            request.commit_computed_range(
+                                step_id,
+                                scheduled,
+                                committed_state_version=version,
+                                now_ns=now_ns,
+                            )
                         # Cancellation may arrive between the predicate and the
                         # P0 method's own guard; treat it as cancellation, not a
                         # resource-accounting fault.
-                        if sample is not None and request.accepts_completion(step_id, scheduled):
+                        if (
+                            emitted is None
+                            and sample is not None
+                            and request.accepts_completion(step_id, scheduled)
+                        ):
                             request.publish_sample(step_id, scheduled, sample)
                             runtime_event(
                                 "publish",
@@ -513,6 +655,23 @@ class CompletionCoordinator:
                             request, scheduled, ticket, cancel=True, fail=False, now_ns=now_ns
                         )
                         ignored.append(request.request_id)
+                if settlement is not None:
+                    for plan in ticket.prepared.step.speculative:
+                        request, scheduled = bindings[plan.slice_index]
+                        count = published_counts.get(plan.slice_index, 0)
+                        speculative.append(
+                            SpeculativeVerification(
+                                request.request_id,
+                                scheduled.sequence_epoch,
+                                plan.mode,
+                                proposed=plan.effective_k,
+                                accepted=settlement.accepted[plan.slice_index],
+                                published=count,
+                                reserved_kv=plan.reserve_tokens,
+                                committed_kv=settlement.written[plan.slice_index],
+                                discarded=count == 0,
+                            )
+                        )
             else:
                 for request, scheduled in bindings:
                     self._discard(
@@ -552,6 +711,10 @@ class CompletionCoordinator:
             tuple(ignored),
             outcome.error,
             tuple(prompt_logprobs),
+            tuple(speculative),
+            submitted_ns=ticket._submitted_ns,
+            terminal_ns=ticket._terminal_ns,
+            settlement_ns=settlement_ns,
         )
 
     def poll(self, *, now_ns: int | None = None) -> tuple[CompletionResult, ...]:

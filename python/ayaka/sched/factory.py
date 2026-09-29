@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ayaka.configs.role import EngineRole
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
@@ -21,6 +21,9 @@ from ayaka.sched.interfaces import (
     StepRuntime,
 )
 from ayaka.sched.role import DecodeScheduler, PrefillScheduler
+
+if TYPE_CHECKING:
+    from ayaka.speculative.coordinator import SpeculativeCoordinator
 
 __all__ = ["create_role_scheduler", "create_scheduler"]
 
@@ -45,8 +48,13 @@ def create_scheduler(
     max_decode_burst: int | None = None,
     prefill_chunk_size: int | None = None,
     max_bypass: int = 64,
+    speculation: SpeculativeCoordinator | None = None,
 ) -> EagerScheduler | ContinuousScheduler:
-    """Construct the selected scheduler without aliasing implementations."""
+    """Construct the selected scheduler without aliasing implementations.
+
+    Speculative decoding is a continuous-batching feature; the eager reference
+    scheduler refuses it instead of silently ignoring it.
+    """
 
     name = kind.strip().lower().replace("-", "_")
     common: dict[str, Any] = {
@@ -56,6 +64,8 @@ def create_scheduler(
         "clock": clock,
     }
     if name in {"eager", "reference", "debug"}:
+        if speculation is not None:
+            raise ValueError("speculative decoding requires the continuous scheduler")
         return EagerScheduler(plan, requests, runtime, allocator, **common)
     if name in {"continuous", "production"}:
         return ContinuousScheduler(
@@ -73,6 +83,7 @@ def create_scheduler(
             max_decode_burst=max_decode_burst,
             prefill_chunk_size=prefill_chunk_size,
             max_bypass=max_bypass,
+            speculation=speculation,
         )
     raise ValueError(f"unknown scheduler implementation: {kind!r}")
 

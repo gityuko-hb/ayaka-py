@@ -34,6 +34,7 @@ from ayaka.plan import (
     SamplingPlan,
     WeightResidencyPlan,
 )
+from ayaka.speculative.plan import SpeculativeSlicePlan
 from ayaka.types import ForwardMode
 from ayaka.utils.validation import require_frozen, require_int, require_text
 
@@ -316,6 +317,13 @@ class BatchStepPlan:
     follows all real rows. sampling_rows must exactly match the last rows of
     slices explicitly requesting a sample; rows cannot be inferred from phase
     or query length. No live request, tensor, allocator or page table is held.
+
+    ``speculative`` extends decode slices with tentative draft rows. Execution
+    rows are each slice's committed query rows followed by its draft rows; row
+    indices (``sampling_rows``, ``extension_rows``) address that execution
+    layout. Without speculation the execution layout is exactly the query
+    layout, so ``num_tokens``/``token_ids``/``positions`` keep their meaning
+    (committed query rows only) while the ``execution_*`` views add drafts.
     """
 
     step_id: int
@@ -335,6 +343,7 @@ class BatchStepPlan:
     graph: GraphPlan = EMPTY_GRAPH_PLAN
     trace_ids: tuple[str, ...] = ()
     created_ns: int = 0
+    speculative: tuple[SpeculativeSlicePlan, ...] = ()
 
     def __post_init__(self) -> None:
         if _VALIDATE:
@@ -370,12 +379,13 @@ class BatchStepPlan:
             raise TypeError("distributed must be DistributedStepIdentity or None")
         if len(self.inputs) != len(self.slices):
             raise ValueError("one input snapshot is required for each slice")
+        drafts = self._validate_speculative()
 
         request_ids: set[str] = set()
         sequences: set[SequenceHandle] = set()
         expected_rows: list[int] = []
         offset = 0
-        for scheduled, value in zip(self.slices, self.inputs, strict=True):
+        for index, (scheduled, value) in enumerate(zip(self.slices, self.inputs, strict=True)):
             if not isinstance(scheduled, ScheduledSlice):
                 raise TypeError("slices must contain ScheduledSlice")
             if not isinstance(value, RequestStepInput):
@@ -387,9 +397,15 @@ class BatchStepPlan:
             scheduled.validate()
             value.validate()
             value.validate_slice(scheduled)
-            offset += scheduled.query_count
             if scheduled.sample_last_query:
-                expected_rows.append(offset - 1)
+                expected_rows.append(offset + scheduled.query_count - 1)
+            offset += scheduled.query_count + drafts.get(index, 0)
+            if index in drafts:
+                remaining = value.max_output_tokens - (
+                    len(value.known_tokens) - value.prompt_tokens
+                )
+                if drafts[index] >= remaining:
+                    raise ValueError("draft rows exceed the remaining output budget")
         if len(sequences) != len(self.inputs):
             raise ValueError("different requests cannot bind the same sequence")
         if self.padded_num_tokens < offset:
@@ -438,6 +454,104 @@ class BatchStepPlan:
                 raise ValueError("graph replay requires explicit pure decode")
             if not self.sampling.graph_capturable:
                 raise ValueError("graph replay cannot contain custom sampling operations")
+            if self.speculative:
+                raise ValueError("speculative verification has no certified graph replay")
+
+    def _validate_speculative(self) -> dict[int, int]:
+        """Validate draft extensions; return ``{slice_index: draft_rows}``."""
+        if type(self.speculative) is not tuple:
+            raise TypeError("speculative must be a tuple")
+        drafts: dict[int, int] = {}
+        previous = -1
+        for plan in self.speculative:
+            if not isinstance(plan, SpeculativeSlicePlan):
+                raise TypeError("speculative must contain SpeculativeSlicePlan")
+            plan.validate()
+            if plan.slice_index <= previous:
+                raise ValueError("speculative plans must be ordered by slice_index")
+            previous = plan.slice_index
+            if plan.slice_index >= len(self.slices):
+                raise IndexError("speculative slice_index outside the step's slices")
+            scheduled = self.slices[plan.slice_index]
+            if plan.request_id != scheduled.request_id:
+                raise ValueError("speculative plan names another request than its slice")
+            if scheduled.phase is not Phase.DECODE or not scheduled.sample_last_query:
+                raise ValueError("only a sampling decode slice may carry draft rows")
+            if plan.reserve_tokens != scheduled.query_count + plan.effective_k:
+                raise ValueError("speculative reservation disagrees with the slice rows")
+            drafts[plan.slice_index] = plan.effective_k
+        return drafts
+
+    def draft_rows(self, slice_index: int) -> int:
+        """Draft rows appended after slice ``slice_index`` (zero without a plan)."""
+        for plan in self.speculative:
+            if plan.slice_index == slice_index:
+                return plan.effective_k
+        return 0
+
+    @property
+    def draft_row_counts(self) -> tuple[int, ...]:
+        """Draft rows per slice in packed order."""
+        counts = [0] * len(self.slices)
+        for plan in self.speculative:
+            counts[plan.slice_index] = plan.effective_k
+        return tuple(counts)
+
+    @property
+    def num_draft_tokens(self) -> int:
+        return sum(plan.effective_k for plan in self.speculative)
+
+    @property
+    def execution_num_tokens(self) -> int:
+        """Rows the forward executes: committed query rows plus every draft row."""
+        return self.num_tokens + self.num_draft_tokens
+
+    @property
+    def execution_query_start_loc(self) -> tuple[int, ...]:
+        offsets = [0]
+        for scheduled, drafts in zip(self.slices, self.draft_row_counts, strict=True):
+            offsets.append(offsets[-1] + scheduled.query_count + drafts)
+        return tuple(offsets)
+
+    @property
+    def execution_token_ids(self) -> tuple[int, ...]:
+        """Packed execution inputs: each slice's known tokens, then its drafts."""
+        if not self.speculative:
+            return self.token_ids
+        drafts = {plan.slice_index: plan.draft_token_ids for plan in self.speculative}
+        tokens: list[int] = []
+        for index, (scheduled, value) in enumerate(zip(self.slices, self.inputs, strict=True)):
+            tokens.extend(value.known_tokens[scheduled.query_start : scheduled.query_end])
+            tokens.extend(drafts.get(index, ()))
+        return tuple(tokens)
+
+    @property
+    def execution_positions(self) -> tuple[int, ...]:
+        if not self.speculative:
+            return self.positions
+        return tuple(
+            position
+            for scheduled, drafts in zip(self.slices, self.draft_row_counts, strict=True)
+            for position in range(scheduled.query_start, scheduled.query_end + drafts)
+        )
+
+    @property
+    def execution_ends(self) -> tuple[int, ...]:
+        """Logical end (exclusive) of every slice's execution rows."""
+        return tuple(
+            scheduled.query_end + drafts
+            for scheduled, drafts in zip(self.slices, self.draft_row_counts, strict=True)
+        )
+
+    @property
+    def extension_rows(self) -> tuple[int, ...]:
+        """Execution rows of every draft token, in speculative-plan order."""
+        starts = self.execution_query_start_loc
+        rows: list[int] = []
+        for plan in self.speculative:
+            first = starts[plan.slice_index] + self.slices[plan.slice_index].query_count
+            rows.extend(range(first, first + plan.effective_k))
+        return tuple(rows)
 
     @property
     def request_order(self) -> tuple[str, ...]:
@@ -473,12 +587,14 @@ class BatchStepPlan:
         Mixed batches deliberately use ``EXTEND``. A pure prefill is ``PREFILL``
         only when every slice starts at logical position zero; prefix hits and
         chunk continuations are ``EXTEND``. Query length is never consulted.
+        Speculative verification keeps DECODE request semantics but executes a
+        ragged causal block per request, so it dispatches as ``EXTEND``.
         """
         semantic = self.semantic_mode
         if semantic is BatchMode.IDLE:
             return ForwardMode.IDLE
         if semantic is BatchMode.DECODE:
-            return ForwardMode.DECODE
+            return ForwardMode.EXTEND if self.speculative else ForwardMode.DECODE
         if semantic is BatchMode.PREFILL and all(s.query_start == 0 for s in self.slices):
             return ForwardMode.PREFILL
         return ForwardMode.EXTEND
@@ -566,12 +682,14 @@ class PreparedStep:
             value.sequence for value in self.step.inputs
         ):
             raise ValueError("KV execution views must follow packed request order")
-        for scheduled, view in zip(self.step.slices, self.memory_view.sequences, strict=True):
+        for scheduled, view, end in zip(
+            self.step.slices, self.memory_view.sequences, self.step.execution_ends, strict=True
+        ):
             if view.reservation.step_id != self.step.step_id:
                 raise ValueError("KV reservation belongs to another step")
             if (
                 view.base_committed_tokens != scheduled.query_start
-                or view.num_reserved_tokens != scheduled.query_count
+                or view.num_reserved_tokens != end - scheduled.query_start
             ):
                 raise ValueError("KV reservation disagrees with scheduled range")
             slot_groups = (
@@ -583,6 +701,6 @@ class PreparedStep:
                 raise ValueError("prepared sequence requires at least one KV group")
             for slots in slot_groups:
                 if tuple(slot.logical_position for slot in slots) != tuple(
-                    range(scheduled.query_start, scheduled.query_end)
+                    range(scheduled.query_start, end)
                 ):
                     raise ValueError("write slots must cover each scheduled logical position")

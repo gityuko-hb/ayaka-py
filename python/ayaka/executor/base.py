@@ -21,6 +21,7 @@ from ayaka.executor.ticket import (
 from ayaka.memory.ledger import MemoryLedger
 from ayaka.obs import RuntimeMetrics, RuntimeSnapshot, runtime_event
 from ayaka.sched.plan import PreparedStep
+from ayaka.speculative.metadata import VerifyLayout
 from ayaka.utils.validation import require_int
 
 _EXECUTOR_IDS = count(1)
@@ -181,6 +182,17 @@ class Executor(abc.ABC):
                 f"sampling output has {samples.token_ids.size(0)} rows, "
                 f"prepared plan declares {expected}"
             )
+        step = ticket.prepared.step
+        speculative = samples.speculative
+        if (speculative is None) != (not step.speculative):
+            raise ValueError("speculative results disagree with the prepared step")
+        if speculative is not None:
+            layout = VerifyLayout.from_step(step)
+            if (
+                speculative.rows != layout.spec_positions
+                or speculative.draft_counts != layout.draft_counts
+            ):
+                raise ValueError("speculative result rows disagree with the prepared plan")
         ticket._samples = samples
 
     def launch(self, ticket: ExecutionTicket) -> None:

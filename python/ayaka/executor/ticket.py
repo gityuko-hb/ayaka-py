@@ -22,6 +22,7 @@ from ayaka.sampling.logprobs import (
 )
 from ayaka.sampling.ops.sampling import SamplingSupportTensors
 from ayaka.sched.plan import PreparedStep
+from ayaka.speculative.metadata import SpeculativeSampleOutputs
 from ayaka.utils.validation import require_frozen, require_int
 
 
@@ -91,11 +92,17 @@ class ExecutionResources(Protocol):
     P1 supplies only a fake implementation. Physical KV/workspace/staging
     accounting and real allocator validation are implemented in P2. Exceptions
     after adoption quarantine the bundle; callbacks are not blindly retried.
+
+    A step with speculative slices is committed with ``written``: the KV rows
+    kept per request in packed order. Completion passes it only for such steps,
+    so implementations that never see speculation keep the one-argument form.
     """
 
     def adopt(self, ticket_id: TicketId, prepared: PreparedStep) -> None: ...
     def mark_submitted(self, ticket_id: TicketId) -> None: ...
-    def commit(self, ticket_id: TicketId) -> tuple[int, ...]: ...
+    def commit(
+        self, ticket_id: TicketId, *, written: tuple[int, ...] | None = None
+    ) -> tuple[int, ...]: ...
     def retire(
         self,
         ticket_id: TicketId,
@@ -133,10 +140,19 @@ class SampleOutputs:
     token_ids_logprobs: TokenIdsLogprobTensors | None = None
     ids_logprob_rows: tuple[int, ...] = ()
     ids_logprob_counts: tuple[int, ...] = ()
+    #: Accepted draft counts for speculative rows. For those rows ``token_ids``
+    #: holds the target token emitted after the accepted drafts.
+    speculative: SpeculativeSampleOutputs | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.token_ids, torch.Tensor):
             raise TypeError("token_ids must be a torch.Tensor")
+        if self.speculative is not None:
+            if not isinstance(self.speculative, SpeculativeSampleOutputs):
+                raise TypeError("speculative must be SpeculativeSampleOutputs")
+            self.speculative.validate_rows(self.token_ids.size(0))
+            if self.speculative.accepted.device != self.token_ids.device:
+                raise ValueError("speculative results must reside with the sampled tokens")
         if self.token_ids.dim() != 1:
             raise ValueError(f"token_ids must be 1-D, got {tuple(self.token_ids.shape)}")
         if self.token_ids.is_floating_point() or self.token_ids.is_complex():
