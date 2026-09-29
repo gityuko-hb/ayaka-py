@@ -106,6 +106,10 @@ class RunnerBufferSpec:
     max_num_batched_tokens: int
     max_inflight: int
     group_columns: tuple[tuple[str, int], ...]
+    #: Hidden rows projected through the LM head per step. One per sequence
+    #: normally; speculative verification also projects every draft row, so it
+    #: raises this up to ``max_num_batched_tokens``.
+    max_projection_rows: int | None = None
 
     @classmethod
     def create(
@@ -115,12 +119,14 @@ class RunnerBufferSpec:
         max_num_batched_tokens: int,
         max_inflight: int,
         group_columns: Mapping[str, int],
+        max_projection_rows: int | None = None,
     ) -> RunnerBufferSpec:
         return cls(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
             max_inflight=max_inflight,
             group_columns=tuple(sorted(group_columns.items())),
+            max_projection_rows=max_projection_rows,
         )
 
     def __post_init__(self) -> None:
@@ -128,6 +134,17 @@ class RunnerBufferSpec:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        rows = self.max_projection_rows
+        if rows is not None and (
+            not isinstance(rows, int)
+            or isinstance(rows, bool)
+            or not self.max_num_seqs <= rows <= max(self.max_num_seqs, self.max_num_batched_tokens)
+        ):
+            # Projected rows never exceed executed rows, which the token
+            # ceiling bounds; fewer than one per sequence would refuse decode.
+            raise ValueError(
+                "max_projection_rows must lie in [max_num_seqs, max(max_num_seqs, tokens)]"
+            )
         if type(self.group_columns) is not tuple or not self.group_columns:
             raise TypeError("group_columns must be a non-empty tuple of (name, columns)")
         if len({name for name, _ in self.group_columns}) != len(self.group_columns):
@@ -145,12 +162,16 @@ class RunnerBufferSpec:
         raise KeyError(f"runner buffers do not cover attention group {name!r}")
 
     @property
+    def projection_rows(self) -> int:
+        return self.max_num_seqs if self.max_projection_rows is None else self.max_projection_rows
+
+    @property
     def per_flight_device_bytes(self) -> int:
         """Bytes one flight's device tensors occupy."""
         tokens = self.max_num_batched_tokens
         seqs = self.max_num_seqs
         total = 2 * 8 * tokens  # token ids and model positions, int64
-        total += 8 * seqs  # sampling rows, int64
+        total += 8 * self.projection_rows  # projected (sampling + draft) rows, int64
         for _, columns in self.group_columns:
             total += 4 * (seqs + 1)  # query_start_loc
             total += 4 * seqs  # seq_lens
@@ -322,7 +343,9 @@ class FlightBuffers:
         self._positions = _Stage1D(
             spec.max_num_batched_tokens, dtype=torch.int64, device=device, pin=pin_staging
         )
-        self._rows = _Stage1D(spec.max_num_seqs, dtype=torch.int64, device=device, pin=pin_staging)
+        self._rows = _Stage1D(
+            spec.projection_rows, dtype=torch.int64, device=device, pin=pin_staging
+        )
         self._groups = {
             name: _GroupBuffers(name, columns, spec, device=device, pin=pin_staging)
             for name, columns in spec.group_columns

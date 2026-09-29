@@ -550,6 +550,9 @@ class QwenForCausalLM(CausalLM[QwenConfig]):
     transformer: _QwenModel
     _decoder_name = "transformer"
 
+    def weight_bindings(self) -> dict[str, WeightBinding]:
+        return qwen_weight_bindings(self.config)
+
     def __init__(
         self,
         config: QwenConfig,

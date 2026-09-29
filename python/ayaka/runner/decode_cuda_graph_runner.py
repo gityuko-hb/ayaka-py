@@ -33,7 +33,9 @@ class DecodeCudaGraphRunner:
         pool = self.owner._graph_pool
         if pool is None:
             return RunnerSupport(FallbackReason.DISABLED)
-        if not step.is_pure_decode:
+        if not step.is_pure_decode or step.speculative:
+            # Captured decode graphs bake one query row per request; a
+            # verification block would alias their shape.
             return RunnerSupport(FallbackReason.WRONG_PHASE)
         if step.prompt_logprobs:
             return RunnerSupport(FallbackReason.OUTPUT_MODE)

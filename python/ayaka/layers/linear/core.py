@@ -75,6 +75,8 @@ class LinearBase(BaseLayer):
         )
         self.return_bias = return_bias
         self.disable_tp = disable_tp
+        # Optional inference sidecar executes before native TP gather/reduce.
+        self.lora_sidecar: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None
         self.parallel_context = context
         self.device = device
         if self.quant_config is None:
@@ -103,9 +105,11 @@ class LinearBase(BaseLayer):
         if x.ndim < 1 or x.shape[-1] != self.input_size_per_partition:
             raise ValueError(f"input must end in {self.input_size_per_partition} features")
         if self.quant_config is not None:
-            return self.apply_quantization(x, bias)
-        assert self.quant_method is not None
-        return self.quant_method.apply(self, x, bias)
+            output = self.apply_quantization(x, bias)
+        else:
+            assert self.quant_method is not None
+            output = self.quant_method.apply(self, x, bias)
+        return output if self.lora_sidecar is None else self.lora_sidecar(x, output)
 
     def process_weights_after_loading(self) -> None:
         if self.quant_config is not None:

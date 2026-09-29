@@ -652,12 +652,15 @@ class PenaltyState:
     # Coords — ONE flush/step, boolean-index on device
     # ------------------------------------------------------------------
     @staticmethod
-    def _as_slots(active_slots: Sequence[int] | int) -> torch.Tensor:
+    def _as_slots(
+        active_slots: Sequence[int] | int, device: torch.device | None = None
+    ) -> torch.Tensor:
         """Normalize ``active_slots`` to a 1-D slot tensor.
 
         Args:
             active_slots: Slot ids in packed order, or int n for identity
                 slots ``[0, n)``.
+            device: Target device for the tensor.
 
         Returns:
             Long tensor of slot ids.
@@ -666,8 +669,8 @@ class PenaltyState:
             ValueError: If any slot id is negative.
         """
         if isinstance(active_slots, int):
-            return torch.arange(active_slots, dtype=torch.long)
-        slots = torch.tensor([int(s) for s in active_slots], dtype=torch.long)
+            return torch.arange(active_slots, dtype=torch.long, device=device)
+        slots = torch.tensor([int(s) for s in active_slots], dtype=torch.long, device=device)
         if bool(torch.any(slots < 0).item()):
             raise ValueError("active_slots must be >= 0")
         return slots
@@ -693,7 +696,7 @@ class PenaltyState:
             Tuple ``(rows, cols, cnts)`` of compact 1-D coords.
         """
         self._flush()
-        slots = self._as_slots(active_slots)
+        slots = self._as_slots(active_slots, device=self._device)
         n = slots.numel()
         if n <= 0:
             empty = torch.empty(0, dtype=torch.long, device=device)
@@ -737,7 +740,7 @@ class PenaltyState:
             tensors.
         """
         self._flush()
-        slots = self._as_slots(active_slots)
+        slots = self._as_slots(active_slots, device=self._device)
         n = slots.numel()
         rows = (
             torch.arange(max(n, 0), device=self._device, dtype=torch.long)

@@ -37,6 +37,13 @@ from ayaka.runner.graph.pool import CaptureProgram, DecodeGraphConfig, DecodeGra
 from ayaka.runner.paged_inputs import PagedGroupBinding, validate_paged_inputs
 from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.sched.plan import BatchMode, Phase, PreparedStep
+from ayaka.speculative.metadata import SpeculativeSampleOutputs, VerifyLayout
+from ayaka.speculative.verifier import (
+    RowSampling,
+    greedy_verify,
+    sampled_verify,
+    stage_host_tensor,
+)
 from ayaka.types import (
     AttentionCudaGraphSupport,
     AttentionType,
@@ -309,6 +316,8 @@ class PagedModelRunner(DenseModelRunner):
         self._graph_pool: DecodeGraphPool | None = None
         self._graph_config: DecodeGraphConfig | None = None
         self._graph_capture_leases: dict[int, RunnerBufferLease] = {}
+        self.speculative_decoding = False
+        self._speculative_bans: Callable[[Any], tuple[frozenset[int], ...]] | None = None
         for name in kv.group_names:
             group = groups[name]
             cache = StoragePagedKVCache(kv.storages[name].storage)
@@ -806,6 +815,84 @@ class PagedModelRunner(DenseModelRunner):
                 )
             row += 1
 
+    def enable_speculative_decoding(self) -> None:
+        """Accept steps whose decode slices carry verified-draft rows."""
+        if self._closed:
+            raise RuntimeError("paged runner is closed")
+        self.speculative_decoding = True
+
+    def set_speculative_bans(self, provider) -> None:
+        """Install per-draft-row pre-sample bans (``Engine.speculative_masks``)."""
+        self._speculative_bans = provider
+
+    def _verify_speculative(
+        self, prepared: PreparedStep, forward: ForwardResult, token_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, SpeculativeSampleOutputs]:
+        """Acceptance of the step's draft rows, entirely on the device.
+
+        Greedy when every speculative slice is greedy (host staging decides, so
+        nothing synchronizes); otherwise sampled verification, which keeps the
+        greedy slices exact through the per-row greedy override. The sampling
+        columns are read before the next flush, so ``offset`` is the offset the
+        base rows drew with.
+        """
+        if not self.speculative_decoding:
+            raise ValueError("speculative verification is not enabled on this runner")
+        step = prepared.step
+        layout = VerifyLayout.from_step(step)
+        verify_rows = len(layout.extension_rows)
+        if forward.verify_count != verify_rows:
+            raise RuntimeError(
+                f"runner projected {forward.verify_count} draft rows, step declares {verify_rows}"
+            )
+        total = forward.logits.size(0)
+        extension = forward.logits.narrow(0, total - verify_rows, verify_rows)
+        bans = (
+            (frozenset(),) * verify_rows
+            if self._speculative_bans is None
+            else self._speculative_bans(step)
+        )
+        md = self._coordinator.md
+        positions = stage_host_tensor(layout.spec_positions, token_ids.device)
+        host_positions = torch.tensor(layout.spec_positions, dtype=torch.long)
+        host_temperature = md.staging("temperature").index_select(0, host_positions)
+        host_top_k = md.staging("top_k").index_select(0, host_positions)
+        base_tokens = token_ids.index_select(0, positions)
+        if bool(((host_temperature == 0.0) | (host_top_k == 1)).all()):
+            final, accepted = greedy_verify(
+                extension,
+                base_tokens,
+                layout,
+                temperatures=md.active("temperature").index_select(0, positions),
+                valid_mask=self._valid_token_mask,
+                bans=bans,
+                ban_applier=self._ban_applier,
+            )
+        else:
+            host_min_p = md.staging("min_p").index_select(0, host_positions)
+            sampling = RowSampling(
+                *(
+                    md.active(name).index_select(0, positions)
+                    for name in ("temperature", "top_k", "top_p", "min_p", "seed", "offset")
+                ),
+                any_min_p=bool((host_min_p > 0.0).any()),
+            )
+            final, accepted = sampled_verify(
+                extension,
+                base_tokens,
+                layout,
+                sampling=sampling,
+                valid_mask=self._valid_token_mask,
+                bans=bans,
+                ban_applier=self._ban_applier,
+                force_reference=self._force_reference,
+            )
+        merged = token_ids.clone()
+        merged.index_copy_(0, positions, final.to(token_ids.dtype))
+        return merged, SpeculativeSampleOutputs(
+            accepted, layout.spec_positions, layout.draft_counts
+        )
+
     def _embeddings(self, step, tokens):
         if not any(
             self._request_ir.get(s.request_id) is not None
@@ -815,7 +902,7 @@ class PagedModelRunner(DenseModelRunner):
             return None
         hidden = self._model.transformer.wte(tokens)
         offset = 0
-        for scheduled in step.slices:
+        for scheduled, drafts in zip(step.slices, step.draft_row_counts, strict=True):
             request = self._request_ir.get(scheduled.request_id)
             for embedding in () if request is None else request.multimodal:
                 begin = max(scheduled.query_start, embedding.start)
@@ -828,15 +915,19 @@ class PagedModelRunner(DenseModelRunner):
                     )
                     start = offset + begin - scheduled.query_start
                     hidden[start : start + end - begin].copy_(values)
-            offset += scheduled.query_count
+            # Draft rows are text positions past the prompt; they carry no
+            # multimodal rows but still occupy execution rows.
+            offset += scheduled.query_count + drafts
         return hidden
 
     def _common(self, prepared: PreparedStep, name: str) -> CommonAttentionMetadata:
         step = prepared.step
         group = self.backends[name].group
         page_size = group.page_size
-        lengths = [s.query_end for s in step.slices]
-        starts = list(step.query_start_loc)
+        # Execution layout: speculative draft rows extend their slice, so the
+        # KV length after this forward is each slice's execution end.
+        lengths = list(step.execution_ends)
+        starts = list(step.execution_query_start_loc)
         tables = []
         slots = []
         width = div_ceil(max(lengths), page_size)
@@ -867,7 +958,7 @@ class PagedModelRunner(DenseModelRunner):
                 tables=tables,
                 width=width,
                 slots=slots,
-                positions=step.positions,
+                positions=step.execution_positions,
             )
             return self._staged_metadata(step, staged, lengths)
 
@@ -884,14 +975,21 @@ class PagedModelRunner(DenseModelRunner):
             computed_lens=device([s.query_start for s in step.slices]),
             block_table=device(tables),
             slot_mapping=device(slots),
-            positions=device(step.positions),
+            positions=device(step.execution_positions),
             query_start_loc_cpu=starts_cpu,
             seq_lens_cpu=lens_cpu,
             num_reqs=len(step.slices),
-            num_tokens=step.num_tokens,
-            max_query_len=max(s.query_count for s in step.slices),
+            num_tokens=step.execution_num_tokens,
+            max_query_len=self._max_query_rows(step),
             max_seq_len=max(lengths),
             mode=step.forward_mode,
+        )
+
+    @staticmethod
+    def _max_query_rows(step) -> int:
+        return max(
+            scheduled.query_count + drafts
+            for scheduled, drafts in zip(step.slices, step.draft_row_counts, strict=True)
         )
 
     @staticmethod
@@ -900,6 +998,7 @@ class PagedModelRunner(DenseModelRunner):
 
         The ragged R06 contract is preserved exactly: real ``num_tokens``, packed
         request order and the live forward mode. Only the backing storage moved.
+        Speculative draft rows are real rows of their slice.
         """
         return CommonAttentionMetadata(
             query_start_loc=staged.query_start_loc,
@@ -911,8 +1010,8 @@ class PagedModelRunner(DenseModelRunner):
             query_start_loc_cpu=staged.query_start_loc_cpu,
             seq_lens_cpu=staged.seq_lens_cpu,
             num_reqs=len(step.slices),
-            num_tokens=step.num_tokens,
-            max_query_len=max(s.query_count for s in step.slices),
+            num_tokens=step.execution_num_tokens,
+            max_query_len=PagedModelRunner._max_query_rows(step),
             max_seq_len=max(lengths),
             mode=step.forward_mode,
         )
@@ -930,6 +1029,8 @@ class PagedModelRunner(DenseModelRunner):
         step = prepared.step
         if step.graph.mode not in (GraphMode.EAGER, GraphMode.REPLAY):
             raise ValueError("paged serving runner supports eager or graph replay execution")
+        if step.speculative and not self.speculative_decoding:
+            raise ValueError("speculative step reached a runner without speculative verification")
         if step.graph.mode is GraphMode.REPLAY:
             if self._graph_pool is None:
                 raise ValueError("graph replay step requires an enabled decode graph pool")
@@ -976,15 +1077,21 @@ class PagedModelRunner(DenseModelRunner):
         context = ForwardContext(self.backends, self.layers, metadata)
 
         lease = prepared.buffers
+        # Execution rows: committed query tokens, then each slice's tentative
+        # drafts at their logical positions. Drafts never enter known_tokens.
+        token_ids, token_positions = step.execution_token_ids, step.execution_positions
         if lease is not None:
-            tokens, positions = lease.buffers.stage_tokens(step.token_ids, step.positions)
+            tokens, positions = lease.buffers.stage_tokens(token_ids, token_positions)
         else:
-            tokens = torch.tensor(step.token_ids, dtype=torch.long, device=self.device)
-            positions = torch.tensor(step.positions, dtype=torch.long, device=self.device)
+            tokens = torch.tensor(token_ids, dtype=torch.long, device=self.device)
+            positions = torch.tensor(token_positions, dtype=torch.long, device=self.device)
+        # Projected rows: sampling rows first, then every draft row, so the
+        # regular sampler still reads a prefix of the logits.
+        projected = step.sampling_rows + step.extension_rows
         if lease is not None:
-            rows = lease.buffers.stage_sampling_rows(step.sampling_rows)
+            rows = lease.buffers.stage_sampling_rows(projected)
         else:
-            rows = torch.tensor(step.sampling_rows, dtype=torch.long, device=self.device)
+            rows = torch.tensor(projected, dtype=torch.long, device=self.device)
         return StagedEagerInputs(tokens, positions, rows, context)
 
     def _execute_eager_inputs(self, prepared: PreparedStep, inputs: StagedEagerInputs):

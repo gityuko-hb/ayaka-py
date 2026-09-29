@@ -21,7 +21,10 @@ Invariants, each with a test:
     CUDA is present.
   * ``apply_batch_update`` is O(|delta|), not O(batch).
   * ``flush()`` copies only dirty columns and mirrors the active-row map.  A
-    stable batch means zero dirty columns and therefore zero H2D.
+    stable batch means zero dirty columns and therefore zero H2D.  Slots
+    written since the last flush are mirrored whole whether or not they are
+    active, because a slot admitted while inactive (chunked prefill) is
+    otherwise never reached by the active-row copy once its column is clean.
   * ``all_greedy`` is computed on **staging** (host) so no device sync is
     needed to learn it -- which is what lets the planner pick a kernel variant
     and a graph bucket before the forward pass runs.
@@ -172,6 +175,7 @@ class SamplingMetadata:
     __slots__ = (
         "_dev",
         "_dirty",
+        "_pending_slots",
         "_rows_dev",
         "_rows_dirty",
         "_rows_list",
@@ -201,6 +205,7 @@ class SamplingMetadata:
             self._stg[name], _ = pinned_empty((max_batch_size,), dtype)
 
         self._dirty: set[str] = set()
+        self._pending_slots: set[int] = set()
         self._rows_stg, _ = pinned_empty((max_batch_size,), torch.long)
         self._rows_dev = torch.empty(max_batch_size, dtype=torch.long, device=self.device)
         self._rows_list: list[int] | None = None
@@ -213,7 +218,11 @@ class SamplingMetadata:
         self.any_bias = False
 
         self._reset_range(0, max_batch_size)
+        # Device columns start as defaults, never as uninitialized memory.
+        for name in ALL_COLUMNS:
+            self._dev[name].copy_(self._stg[name])
         self._dirty.clear()
+        self._pending_slots.clear()
 
     def column(self, name: str) -> torch.Tensor:
         try:
@@ -296,11 +305,13 @@ class SamplingMetadata:
         for name in ALL_COLUMNS:
             self._stg[name][slot] = values[name]
             self._dirty.add(name)
+        self._pending_slots.add(slot)
 
     def _reset_range(self, lo: int, hi: int) -> None:
         for name in ALL_COLUMNS:
             self._stg[name][lo:hi] = _DEFAULTS[name]
             self._dirty.add(name)
+        self._pending_slots.update(range(lo, hi))
 
     def _move_slot(self, src: int, dst: int) -> None:
         if src == dst:
@@ -308,6 +319,7 @@ class SamplingMetadata:
         for name in ALL_COLUMNS:
             self._stg[name][dst] = self._stg[name][src]
             self._dirty.add(name)
+        self._pending_slots.add(dst)
 
     def apply_batch_update(self, upd: BatchUpdate) -> None:
         """Apply a batch mutation delta updating allocated and active slots.
@@ -433,16 +445,31 @@ class SamplingMetadata:
         Returns:
             Number of distinct column buffers copied from host to device.
         """
+        pending = sorted(self._pending_slots)
+        self._pending_slots.clear()
+        non_blocking = self.device.type == "cuda"
+        if pending:
+            # Written slots are mirrored whole, active or not: the dirty-column
+            # copy below reaches only this step's active rows, and a slot
+            # written while inactive would keep stale device values after its
+            # column is marked clean.
+            with get_backend().stream_context(stream):
+                slots = torch.tensor(pending, dtype=torch.long)
+                device_slots = slots.to(self.device, non_blocking=non_blocking)
+                for name in ALL_COLUMNS:
+                    source = self._stg[name].index_select(0, slots)
+                    if self.device.type != "cpu":
+                        source = source.to(self.device, non_blocking=non_blocking)
+                    self._dev[name].index_copy_(0, device_slots, source)
         if self.n_active == 0:
             self._dirty.clear()
             self._rows_dirty = False
-            return 0
+            return len(ALL_COLUMNS) if pending else 0
         rows = self._rows_cpu()
         mirror_rows = rows is not None and self._rows_dirty
         if not self._dirty and not mirror_rows:
-            return 0
+            return len(ALL_COLUMNS) if pending else 0
         n = self.n_active
-        non_blocking = self.device.type == "cuda"
         count = 0
         with get_backend().stream_context(stream):
             if mirror_rows:
@@ -465,7 +492,7 @@ class SamplingMetadata:
                     self._dev[name].index_copy_(0, device_rows, source)
                     count += 1
         self._dirty.clear()
-        return count
+        return len(ALL_COLUMNS) if pending else count
 
     def footprint(self) -> SamplingFootprint:
         """Measure the aggregate memory allocation footprint of all managed tensors."""

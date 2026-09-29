@@ -21,6 +21,7 @@ from torch import nn
 
 from ayaka.configs.model_source import ModelSourceConfig
 from ayaka.distributed.parallel import ParallelContext
+from ayaka.layers._common import LayerBackend
 from ayaka.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 from ayaka.model_loader.manifest import build_manifest_from_source
 from ayaka.model_loader.mapping import ExternMapping
@@ -214,6 +215,7 @@ class CausalLM[ConfigT: ModelConfigMixin](nn.Module):
         device: torch.device | str | None,
         dtype: torch.dtype,
         parallel_context: ParallelContext | None = None,
+        backend: LayerBackend | None = None,
     ) -> None:
         """Register the decoder, the LM head and the tied/grad-free conventions.
 
@@ -222,6 +224,9 @@ class CausalLM[ConfigT: ModelConfigMixin](nn.Module):
         """
         self.config = config
         setattr(self, self._decoder_name, decoder)
+        resolved_backend: LayerBackend = backend or getattr(
+            getattr(decoder, "wte", None), "backend", "triton"
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -230,6 +235,7 @@ class CausalLM[ConfigT: ModelConfigMixin](nn.Module):
             device=device,
             parallel_context=parallel_context,
             prefix="lm_head",
+            backend=resolved_backend,
         )
         if config.tie_word_embeddings:
             self.lm_head.tie_weights(cast(VocabParallelEmbedding, decoder.wte))

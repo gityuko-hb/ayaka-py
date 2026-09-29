@@ -35,8 +35,12 @@ def validate_paged_inputs(
     if isinstance(memory, ExecutionMemoryView) and len(bindings) != 1:
         raise ValueError("homogeneous execution view requires exactly one KV group")
     write_slots: dict[str, set[int]] = {name: set() for name in bindings}
-    for scheduled, view in zip(prepared.step.slices, memory.sequences, strict=True):
-        if scheduled.query_end > max_model_len:
+    for scheduled, view, query_end in zip(
+        prepared.step.slices, memory.sequences, prepared.step.execution_ends, strict=True
+    ):
+        # Speculative draft rows extend the slice; coverage follows every
+        # executed row, committed or tentative.
+        if query_end > max_model_len:
             raise ValueError("scheduled range exceeds model context")
         if not isinstance(view, SequenceExecutionView):
             names = [g.group_name for g in view.groups]
@@ -45,7 +49,7 @@ def validate_paged_inputs(
         for name, binding in bindings.items():
             group, storage = binding.group, binding.storage
             page_size = group.page_size
-            width = div_ceil(scheduled.query_end, page_size)
+            width = div_ceil(query_end, page_size)
             window = group.spec.sliding_window
             read_start = 0 if window is None else max(0, scheduled.query_start + 1 - window)
             if isinstance(view, SequenceExecutionView):
@@ -65,10 +69,10 @@ def validate_paged_inputs(
                     raise ValueError("lease group geometry/storage/dtype disagrees with binding")
                 if (
                     selected.attention_token_start != read_start
-                    or selected.attention_token_stop != scheduled.query_end
+                    or selected.attention_token_stop != query_end
                     or selected.retained_token_start
-                    != (0 if window is None else max(0, scheduled.query_end - window))
-                    or selected.retained_token_stop != scheduled.query_end
+                    != (0 if window is None else max(0, query_end - window))
+                    or selected.retained_token_stop != query_end
                 ):
                     raise ValueError("lease attention coverage disagrees with scheduled range")
                 logical_blocks, table = selected.logical_blocks, selected.block_table

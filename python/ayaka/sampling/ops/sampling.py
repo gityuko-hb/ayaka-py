@@ -389,6 +389,7 @@ def topk_topp_sample(
     *,
     force_reference: bool = False,
     allow_topk_first: bool = False,
+    any_min_p: bool | None = None,
 ) -> torch.Tensor:
     """Sample one token per row through the 5-level dispatch ladder.
 
@@ -426,11 +427,15 @@ def topk_topp_sample(
             torch oracle.
         allow_topk_first: When True, allow level 2 (the caller must still
             gate on :func:`topk_first_hint`).
+        any_min_p: Host-known "some row has ``min_p > 0``". ``None`` reads it
+            from ``min_p``, which synchronizes a CUDA stream; callers holding
+            the host staging values pass it to keep the dispatch sync-free.
 
     Returns:
         ``[B]`` sampled token ids.
     """
-    any_min_p = bool((min_p > 0.0).any())
+    if any_min_p is None:
+        any_min_p = bool((min_p > 0.0).any())
     if logits.is_cuda and not force_reference:
         if _HAS_FLASHINFER and _fi is not None and not any_min_p:
             # FlashInfer: unsorted rejection sampling, many rounds fused into

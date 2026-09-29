@@ -563,6 +563,9 @@ class PhiForCausalLM(CausalLM[PhiConfig]):
     model: _PhiModel
     _decoder_name = "model"
 
+    def weight_bindings(self) -> dict[str, WeightBinding]:
+        return phi_weight_bindings(self.config)
+
     def __init__(
         self,
         config: PhiConfig,

@@ -13,7 +13,8 @@ class ForwardResult:
     """Logits for one step plus the reporting metadata that produced them.
 
     ``logits`` rows follow the packed order: sampling rows first, then
-    prompt-scored rows. A graph runner returns logits whose projection already
+    prompt-scored rows, then ``verify_count`` speculative draft rows in
+    extension-row order. A graph runner returns logits whose projection already
     happened inside the captured graph, so the base class must not re-project.
     """
 
@@ -22,6 +23,7 @@ class ForwardResult:
     prompt_descriptors: tuple[PromptLogprobSliceReport, ...] = ()
     prompt_targets: tuple[int, ...] = ()
     prompt_ks: tuple[int, ...] = ()
+    verify_count: int = 0
 
 
 class OutputLifetime(StrEnum):

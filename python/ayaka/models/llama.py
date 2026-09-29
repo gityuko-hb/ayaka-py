@@ -735,6 +735,10 @@ class LlamaForCausalLM(CausalLM[LlamaConfig]):
             parallel_context=parallel_context,
         )
 
+    def weight_bindings(self) -> dict[str, WeightBinding]:
+        """Expose existing checkpoint semantics to adapter loading."""
+        return llama_weight_bindings(self.config)
+
     @property
     def transformer(self) -> DecoderModule:
         """Alias for runtimes that reach the decoder as ``transformer``."""

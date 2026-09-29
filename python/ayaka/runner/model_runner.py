@@ -13,6 +13,7 @@ import torch
 from ayaka.attention.spec import AttentionGroupSpec
 from ayaka.configs.phase import PhaseConfig
 from ayaka.kvcache.manager import LogicalKVManager
+from ayaka.lora.batch import BatchLoRAMapping
 from ayaka.model_loader.readiness import (
     adopt_model_weights,
     require_ready_weights,
@@ -81,19 +82,38 @@ class ModelRunner(PagedModelRunner):
         self.prefill_runner = None
         self.decode_max_padding_ratio = float("inf")
         self.lora = lora
-        if lora is not None and buffers is not None:
-            if lora.working_bytes(buffers.spec.max_num_batched_tokens) > lora.config.memory_bytes:
-                raise MemoryError("LoRA working set exceeds memory reservation")
         self.speculative_runner = None
         self.plain_greedy = False
         self._adapter_leases = {}
-        self._lora_rows = (
+        self._lora_mappings = (
             []
             if lora is None or buffers is None
             else [
-                torch.zeros(
-                    buffers.spec.max_num_batched_tokens, dtype=torch.long, device=self.device
+                BatchLoRAMapping(
+                    buffers.spec.max_num_batched_tokens,
+                    buffers.spec.max_num_batched_tokens,
+                    lora.config.max_adapters,
+                    self.device,
                 )
+                for _ in range(buffers.spec.max_inflight)
+            ]
+        )
+        if lora is not None and buffers is not None:
+            if (
+                lora.working_bytes(
+                    buffers.spec.max_num_batched_tokens,
+                    buffers.spec.max_inflight,
+                    routing_bytes=sum(mapping.nbytes for mapping in self._lora_mappings),
+                )
+                > lora.config.memory_bytes
+            ):
+                raise MemoryError("LoRA working set exceeds memory reservation")
+        self._lora_rows = [mapping.token_slot_ids for mapping in self._lora_mappings]
+        self._lora_workspaces = (
+            []
+            if lora is None or buffers is None
+            else [
+                lora.workspace(buffers.spec.max_num_batched_tokens)
                 for _ in range(buffers.spec.max_inflight)
             ]
         )
@@ -142,10 +162,24 @@ class ModelRunner(PagedModelRunner):
         if registered and self.lora is not None:
             self.lora.release_request()
 
+    def enable_speculative_decoding(self) -> None:
+        """Enable paged verification of scheduler-planned draft rows.
+
+        The dense reference runner and this path are mutually exclusive, and
+        LoRA x speculation is not certified.
+        """
+        if self.lora is not None or self.speculative_runner is not None or self.plain_greedy:
+            raise ValueError("speculative decoding is incompatible with this runner's features")
+        super().enable_speculative_decoding()
+
     def enable_speculative(self, draft, config) -> None:
         from ayaka.runner.speculative_runner import SpeculativeRunner
 
-        if self.lora is not None or self.speculative_runner is not None:
+        if (
+            self.lora is not None
+            or self.speculative_runner is not None
+            or self.speculative_decoding
+        ):
             raise ValueError("incompatible or already enabled speculative runner")
         if self.buffers is None or self.buffers.live:
             raise RuntimeError("speculative bootstrap requires drained static buffers")
@@ -156,17 +190,23 @@ class ModelRunner(PagedModelRunner):
             return
         if prepared.buffers is None:
             raise ValueError("LoRA requires a ticket-owned flight buffer")
-        values = []
+        slots, counts, generations = [], [], []
         for scheduled in prepared.step.slices:
             if scheduled.request_id not in self._request_ir:
                 raise ValueError("LoRA request was not admitted under an adapter lease")
             lease = self._adapter_leases.get(scheduled.request_id)
             if lease is not None:
                 lease.validate()
-            values.extend([0 if lease is None else lease.binding.slot] * scheduled.query_count)
-        rows = self._lora_rows[prepared.buffers.index]
-        rows.zero_()
-        rows[: len(values)].copy_(torch.tensor(values, dtype=torch.long, device=self.device))
+            slots.append(0 if lease is None else lease.binding.slot)
+            counts.append(scheduled.query_count)
+            generations.append(0 if lease is None else lease.binding.generation)
+        mapping = self._lora_mappings[prepared.buffers.index]
+        mapping.stage(
+            slots, counts, generations, max_loras_per_batch=self.lora.config.max_loras_per_batch
+        )
+        # Planned algorithm route: decode replays BGMV, prefill/mixed SGMV.
+        mapping.phase = "decode" if prepared.step.is_pure_decode else "prefill"
+        self.lora.manager.record_batch(slots)
 
     def model_variant_context(self, tokens):
         if self.lora is None:
@@ -183,7 +223,17 @@ class ModelRunner(PagedModelRunner):
         )
         if index is None:
             raise ValueError("LoRA inputs are outside the flight backing")
-        return self.lora.select(self._lora_rows[index][: tokens.numel()])
+        mapping = self._lora_mappings[index]
+        return self.lora.select(
+            self._lora_rows[index][: tokens.numel()],
+            self._lora_workspaces[index],
+            sequence_slots=mapping.sequence_slot_ids,
+            segment_offsets=mapping.adapter_offsets,
+            token_permutation=mapping.token_permutation,
+            token_inverse=mapping.token_inverse,
+            slot_counts=mapping.slot_counts,
+            phase=mapping.phase,
+        )
 
     def _model_forward(self, tokens, positions, metadata):
         forward = super()._model_forward(tokens, positions, metadata)
@@ -203,12 +253,22 @@ class ModelRunner(PagedModelRunner):
 
         if self.prefill_runner is not None:
             raise RuntimeError("prefill graphs already enabled; drain and rebuild")
+        self._set_lora_capture_phase("prefill")
         self.prefill_runner = PrefillCudaGraphRunner(self, config)
         try:
             self.prefill_runner.capture()
         except BaseException:
             self.bootstrap_stage = BootstrapStage.FAILED
             raise
+
+    def _set_lora_capture_phase(self, phase: str) -> None:
+        """Pin the planned algorithm for every flight before capture.
+
+        Capture stages dummy routing, so the phase cannot come from a live
+        step; the same value is restored by ``_stage_lora`` on every replay.
+        """
+        for mapping in self._lora_mappings:
+            mapping.phase = phase
 
     def on_workspace_growth(self) -> None:
         super().on_workspace_growth()
@@ -220,6 +280,7 @@ class ModelRunner(PagedModelRunner):
             raise RuntimeError("failed bootstrap requires a new execution owner")
         require_ready_weights(self._model)
         self.bootstrap_stage = BootstrapStage.CAPTURE_READY
+        self._set_lora_capture_phase("decode")
         try:
             return super().enable_graph(config, stream=stream)
         except BaseException:
@@ -241,8 +302,19 @@ class ModelRunner(PagedModelRunner):
                 (
                     repr(self.lora.storage_identity),
                     repr(tuple(row.data_ptr() for row in self._lora_rows)),
+                    repr(tuple(w.storage_identity for w in self._lora_workspaces)),
                 )
             )
+            if self.buffers is not None:
+                tokens = self.buffers.spec.max_num_batched_tokens
+                # Both planned algorithm routes are part of the identity: a
+                # decode capture must not survive a prefill-plan change and
+                # vice versa.
+                parts.append(repr(self.lora.plan_identity(tokens, phase="decode")))
+                parts.append(repr(self.lora.plan_identity(tokens, phase="prefill")))
+                parts.append(
+                    repr(tuple(mapping.storage_identity for mapping in self._lora_mappings))
+                )
         if self.buffers is not None:
             parts.append(repr(self.buffers.pointers()))
         for name, backend in self.backends.items():
@@ -309,6 +381,19 @@ class ModelRunner(PagedModelRunner):
         return batch
 
     def execute_batch(self, batch: ExecutionBatch):
+        # Graph replay does not execute the Python sidecar context again. Guard
+        # the outer enqueue and record its completion dependency for slot copies.
+        guard = (
+            self.lora.manager.execution_guard(
+                tuple({binding.identity for binding in batch.adapters if binding is not None})
+            )
+            if self.lora is not None
+            else nullcontext()
+        )
+        with guard:
+            return self._execute_batch_guarded(batch)
+
+    def _execute_batch_guarded(self, batch: ExecutionBatch):
         batch.validate()
         if self.lora is not None:
             if batch.variant != self.lora.variant:

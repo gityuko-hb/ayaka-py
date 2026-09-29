@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import torch
 
+from ayaka.kernel.triton._host import require_cuda, require_device, require_tensor
+
 
 def validate_probs(probs: torch.Tensor, name: str = "probs") -> tuple[int, int]:
     """Validate a ``[B, V]`` CUDA float batch.
@@ -25,10 +27,8 @@ def validate_probs(probs: torch.Tensor, name: str = "probs") -> tuple[int, int]:
         TypeError: If ``probs`` is not a tensor or not floating-point.
         ValueError: If ``probs`` is not CUDA or not 2-D.
     """
-    if not isinstance(probs, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if not probs.is_cuda:
-        raise ValueError(f"{name} must be a CUDA tensor")
+    require_tensor(probs, name)
+    require_cuda(probs, name)
     if not probs.is_floating_point():
         raise TypeError(f"{name} must be a float dtype; got {probs.dtype}")
     if probs.dim() != 2:
@@ -51,12 +51,10 @@ def validate_param_tensor(
         TypeError: If ``tensor`` is not a tensor.
         ValueError: If the shape is not ``[B]`` or the device mismatches.
     """
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
+    require_tensor(tensor, name)
     if tensor.dim() != 1 or tensor.size(0) != batch:
         raise ValueError(f"{name} must have shape [B] matching the batch")
-    if tensor.device != device:
-        raise ValueError(f"{name} and probs must be on the same device")
+    require_device(tensor, name, device, reference_name="probs")
 
 
 def validate_opt_seed_offset(

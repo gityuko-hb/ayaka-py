@@ -68,6 +68,7 @@ from ayaka.sampling.logprobs import (
     compute_token_ids_sampling_logprobs,
 )
 from ayaka.sched.plan import PreparedStep
+from ayaka.speculative.metadata import SpeculativeSampleOutputs
 
 __all__ = ["DenseModelRunner"]
 
@@ -164,6 +165,7 @@ class DenseModelRunner:
         gen_rows: tuple[int, ...] = ()
         prompt_logprobs = None
         support = None
+        speculative: SpeculativeSampleOutputs | None = None
         if total_rows > 0:
             # RAW-mode rows (and all prompt rows) need the pre-mutation
             # snapshot; SAMPLING-mode rows are scored from the post-mutation
@@ -183,6 +185,8 @@ class DenseModelRunner:
             else:
                 token_ids = torch.empty(0, dtype=torch.long, device=logits.device)
 
+            if step.speculative:
+                token_ids, speculative = self._verify_speculative(prepared, forward, token_ids)
             gen_logprobs, gen_rows = self._generation_logprobs(logits, token_ids, report, snapshot)
             ids_logprobs, ids_rows, ids_counts = self._ids_logprobs(
                 logits, token_ids, report, snapshot
@@ -209,10 +213,20 @@ class DenseModelRunner:
             token_ids_logprobs=ids_logprobs,
             ids_logprob_rows=ids_rows,
             ids_logprob_counts=ids_counts,
+            speculative=speculative,
         )
 
     def close(self) -> None:
         return None
+
+    def _verify_speculative(
+        self, prepared: PreparedStep, forward: ForwardResult, token_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, SpeculativeSampleOutputs]:
+        """Accept draft rows; the dense recompute runner has no draft-row layout."""
+        del forward, token_ids
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot verify speculative step {prepared.step.step_id}"
+        )
 
     # ------------------------------------------------------------------
     # internals
@@ -287,6 +301,8 @@ class DenseModelRunner:
             prompt_descriptors=tuple(prompt_descriptors),
             prompt_targets=tuple(prompt_targets),
             prompt_ks=tuple(prompt_ks),
+            # Rows past sampling and prompt scoring are speculative draft rows.
+            verify_count=total_rows - sampling_count - len(prompt_targets),
         )
 
     def _forward_prepared(self, prepared: PreparedStep):

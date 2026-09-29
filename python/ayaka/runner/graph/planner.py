@@ -47,6 +47,7 @@ class GraphFallbackReason(StrEnum):
 
     DISABLED = "disabled"
     NOT_PURE_DECODE = "not_pure_decode"
+    SPECULATIVE = "speculative"
     SAMPLING_UNCAPTURABLE = "sampling_uncapturable"
     PROMPT_LOGPROBS = "prompt_logprobs"
     EAGER_ONLY_REQUEST = "eager_only_request"
@@ -226,6 +227,10 @@ class DecodeGraphPlanner:
             return self._fallback(GraphFallbackReason.DISABLED)
         if not step.is_pure_decode:
             return self._fallback(GraphFallbackReason.NOT_PURE_DECODE)
+        if step.speculative:
+            # Verification blocks have no certified captured shape yet; the
+            # decode captures bake one query row per request.
+            return self._fallback(GraphFallbackReason.SPECULATIVE)
         if not step.sampling.graph_capturable:
             return self._fallback(GraphFallbackReason.SAMPLING_UNCAPTURABLE)
         if step.prompt_logprobs:

@@ -491,6 +491,10 @@ class Qwen3ForCausalLM(Qwen2ForCausalLM):
     before RoPE in every attention layer.
     """
 
+    def weight_bindings(self) -> dict[str, WeightBinding]:
+        assert isinstance(self.config, Qwen3Config)
+        return qwen3_weight_bindings(self.config)
+
     def __init__(
         self,
         config: Qwen3Config,

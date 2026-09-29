@@ -307,6 +307,10 @@ class Qwen2ForCausalLM(LlamaForCausalLM):
     Attention stays a runtime responsibility through the per-forward callback.
     """
 
+    def weight_bindings(self) -> dict[str, WeightBinding]:
+        assert isinstance(self.config, Qwen2Config)
+        return qwen2_weight_bindings(self.config)
+
     def __init__(
         self,
         config: Qwen2Config,
