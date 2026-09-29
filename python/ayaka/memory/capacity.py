@@ -180,6 +180,8 @@ class CapacitySnapshot:
     #: Persistent per-flight runner buffer footprint charged to the
     #: WORKSPACE/DEVICE claim in addition to the growable workspace ceiling.
     runner_buffer_bytes: int = 0
+    #: Independently bounded canonical adapter cache; never a DEVICE charge.
+    host_weights_bytes: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.generation, ResourceGeneration):
@@ -204,6 +206,7 @@ class CapacitySnapshot:
             "kv_budget_bytes",
             "weights_bytes",
             "runner_buffer_bytes",
+            "host_weights_bytes",
         ):
             require_int(getattr(self, name), name)
         if type(self.group_pages) is not tuple or not self.group_pages:
@@ -236,10 +239,11 @@ class CapacitySnapshot:
             if key in seen:
                 raise ValueError(f"duplicate {claim.owner.value}/{claim.tier.name} claim")
             seen.add(key)
-            if claim.budget_bytes > self.budget_bytes:
-                raise ValueError(
-                    f"{claim.owner.value} claim exceeds the {self.budget_bytes}-byte budget"
-                )
+            ceiling = self.budget_bytes
+            if claim.owner is MemoryOwner.WEIGHT and claim.tier is MemoryTier.HOST_PAGEABLE:
+                ceiling += self.host_weights_bytes
+            if claim.budget_bytes > ceiling:
+                raise ValueError(f"{claim.owner.value} claim exceeds the {ceiling}-byte budget")
         expected = {
             MemoryOwner.WEIGHT: claim_tier(MemoryOwner.WEIGHT, lane=self.lane),
             MemoryOwner.KV: claim_tier(MemoryOwner.KV, lane=self.lane),
@@ -346,6 +350,7 @@ def build_capacity_snapshot(
     runner_buffer_bytes: int = 0,
     mirror_bytes: int = 0,
     mirror_pinned: bool = False,
+    host_weights_bytes: int = 0,
 ) -> CapacitySnapshot:
     """Freeze one generation's owner table from the resolved budgets.
 
@@ -362,6 +367,7 @@ def build_capacity_snapshot(
     """
     if staging_tier not in (MemoryTier.HOST_PINNED, MemoryTier.HOST_PAGEABLE):
         raise ValueError("staging_tier must be a host tier")
+    require_int(host_weights_bytes, "host_weights_bytes")
     owners = [
         OwnerClaim(MemoryOwner.WEIGHT, claim_tier(MemoryOwner.WEIGHT, lane=lane), weights_bytes),
         OwnerClaim(MemoryOwner.KV, claim_tier(MemoryOwner.KV, lane=lane), kv_budget_bytes),
@@ -390,6 +396,8 @@ def build_capacity_snapshot(
                 staging_bytes,
             )
         )
+    if host_weights_bytes:
+        owners.append(OwnerClaim(MemoryOwner.WEIGHT, MemoryTier.HOST_PAGEABLE, host_weights_bytes))
     if mirror_bytes:
         owners.append(
             OwnerClaim(
@@ -433,6 +441,7 @@ def build_capacity_snapshot(
         ),
         ledger=ledger.snapshot(),
         runner_buffer_bytes=runner_buffer_bytes,
+        host_weights_bytes=host_weights_bytes,
     )
 
 

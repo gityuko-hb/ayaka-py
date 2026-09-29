@@ -9,7 +9,7 @@ own the truth.  Nothing in this module touches the allocator or the ledger.
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 
 from ayaka.exceptions import InvalidStateTransitionError, TransactionClosedError
@@ -106,6 +106,17 @@ class ReservationRecord:
     """One slot per written token, mapping logical position to flat slot."""
     copies: tuple[KVPageCopy, ...] = ()
     """Source refs stay in the old table until commit; the lease protects last use."""
+    min_commit_tokens: int | None = None
+    """Smallest accepted written-token report; ``None`` requires every token.
+
+    Only a speculative reservation lowers it: its trailing rows are tentative
+    and commit only when verification accepts them.
+    """
+
+    @property
+    def commit_floor(self) -> int:
+        """Fewest written tokens a commit may report for this reservation."""
+        return self.num_new_tokens if self.min_commit_tokens is None else self.min_commit_tokens
 
     @property
     def execution_base_tokens(self) -> int:
@@ -209,11 +220,59 @@ class GroupedReservationRecord:
     num_new_tokens: int
     group_plans: tuple[GroupReservationPlan, ...]
     committed: bool = field(default=False, init=False)
+    min_commit_tokens: int | None = None
+    """Smallest accepted written-token report; ``None`` requires every token."""
+
+    @property
+    def commit_floor(self) -> int:
+        """Fewest written tokens a commit may report for this reservation."""
+        return self.num_new_tokens if self.min_commit_tokens is None else self.min_commit_tokens
 
 
 # Compatibility imports share the exact lifecycle records.
 GroupedTransactionRecord = TransactionRecord
 GroupedLeaseRecord = LeaseRecord
+
+
+def resolve_written_counts(
+    records: Sequence[ReservationRecord | GroupedReservationRecord],
+    written_tokens: Mapping[KVReservationHandle, int] | None,
+) -> dict[KVReservationHandle, int]:
+    """Resolve one commit's written-token report against its reservations.
+
+    ``None`` means every reserved token was written; it is refused when a
+    reservation has tentative rows, because committing those implicitly would
+    make unverified KV sequence-owned. An explicit report must name exactly the
+    step's reservations and keep each count within
+    ``[commit_floor, num_new_tokens]``.
+
+    Raises:
+        InvalidStateTransitionError: On a missing, extra or out-of-range count.
+    """
+    if written_tokens is None:
+        for record in records:
+            if record.commit_floor != record.num_new_tokens:
+                raise InvalidStateTransitionError(
+                    "a speculative reservation needs an explicit written-token report"
+                )
+        return {record.handle: record.num_new_tokens for record in records}
+    if set(written_tokens) != {record.handle for record in records}:
+        raise InvalidStateTransitionError(
+            "written-token report does not match the step reservations"
+        )
+    resolved: dict[KVReservationHandle, int] = {}
+    for record in records:
+        count = written_tokens[record.handle]
+        if type(count) is not int or not record.commit_floor <= count <= record.num_new_tokens:
+            if record.commit_floor == record.num_new_tokens:
+                raise InvalidStateTransitionError(
+                    "a non-speculative reservation requires every reserved token to be written"
+                )
+            raise InvalidStateTransitionError(
+                "written-token report is outside the reservation's commit range"
+            )
+        resolved[record.handle] = count
+    return resolved
 
 
 class TransactionOrchestrator:

@@ -398,12 +398,12 @@ class LogicalKVManager:
                     f"busy={state.busy})"
                 )
         if isinstance(self.backend, KVCacheGroupManager):
-            for scheduled in step.slices:
+            for scheduled, end in zip(step.slices, step.execution_ends, strict=True):
                 for group in self.backend.cache_groups:
                     retained = retained_page_range(
                         group.retention,
                         layer_id=group.layer_ids[0],
-                        sequence_length=scheduled.query_end,
+                        sequence_length=end,
                         page_size=group.storage_spec.page_size,
                     )
                     if len(retained) > group.storage_spec.capacity_pages - 1:
@@ -417,21 +417,36 @@ class LogicalKVManager:
             if {r.group_id for r in step.kv_requirements} != set(range(len(self.group_names))):
                 raise ValueError("KV requirements must cover every group by stable ordinal")
             for requirement in step.kv_requirements:
-                if requirement.append_tokens != step.num_tokens:
+                if requirement.append_tokens != step.execution_num_tokens:
                     raise ValueError("KV append requirement disagrees with packed token count")
                 if requirement.restore_bytes or requirement.growth_bytes:
                     raise ValueError("resident append/COW does not support restore or slab growth")
 
     def reserve(self, step: BatchStepPlan) -> MemoryView:
-        """Atomically reserve all sequences/groups; prepare never commits progress."""
+        """Atomically reserve all sequences/groups; prepare never commits progress.
+
+        Speculative draft rows are reserved with the slice's committed rows but
+        marked tentative: the commit must report how many of them verification
+        accepted, and the rest never become sequence-owned.
+        """
         self.validate_step(step)
         transaction = self.backend.begin_transaction(step.step_id)
         lease = None
         try:
-            for value, scheduled in zip(step.inputs, step.slices, strict=True):
-                result = self.backend.try_reserve(
-                    transaction, value.sequence, scheduled.query_count
-                )
+            for value, scheduled, drafts in zip(
+                step.inputs, step.slices, step.draft_row_counts, strict=True
+            ):
+                if drafts:
+                    result = self.backend.try_reserve(
+                        transaction,
+                        value.sequence,
+                        scheduled.query_count + drafts,
+                        min_commit_tokens=scheduled.query_count,
+                    )
+                else:
+                    result = self.backend.try_reserve(
+                        transaction, value.sequence, scheduled.query_count
+                    )
                 if not result.ok:
                     raise KVCapacityError(
                         f"{value.request_id}: {result.reason}",

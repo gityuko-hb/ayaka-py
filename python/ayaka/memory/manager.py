@@ -81,6 +81,7 @@ from ayaka.memory.transaction import (
     ReservationResult,
     TransactionOrchestrator,
     TransactionRecord,
+    resolve_written_counts,
 )
 from ayaka.memory.views import (
     CacheView,
@@ -1499,6 +1500,8 @@ class RuntimeMemoryManager:
         transaction: MemoryTransactionHandle,
         sequence: SequenceHandle,
         num_new_tokens: int,
+        *,
+        min_commit_tokens: int | None = None,
     ) -> ReservationResult:
         """Tentatively reserve append slots without changing committed KV length.
 
@@ -1507,12 +1510,19 @@ class RuntimeMemoryManager:
         ``prepare_step``/``complete_step``. Failure paths roll back so the plan
         is fully reversible. Cached prefix attachment happens before
         reservation through :meth:`attach_resume`, not here.
+
+        ``min_commit_tokens`` marks the trailing ``num_new_tokens -
+        min_commit_tokens`` rows as tentative (speculative drafts): the commit
+        must then report how many leading rows it keeps, and rows past that
+        report never become sequence-owned.
         """
 
         with self._lock:
             tx = self._get_transaction(transaction)
             LifecycleTransitions.require_open(tx)
             if num_new_tokens <= 0:
+                return ReservationResult.failure(ReservationFailure.INVALID_TOKEN_COUNT)
+            if min_commit_tokens is not None and not 1 <= min_commit_tokens <= num_new_tokens:
                 return ReservationResult.failure(ReservationFailure.INVALID_TOKEN_COUNT)
 
             # Hold the arena lock across the whole plan: resolving the handle
@@ -1607,6 +1617,7 @@ class RuntimeMemoryManager:
                     allocated_pages=allocated,
                     write_slots=write_slots,
                     copies=copies,
+                    min_commit_tokens=min_commit_tokens,
                 )
                 self._reservations[index] = record
                 tx.reservation_handles.append(reservation_handle)
@@ -1769,30 +1780,50 @@ class RuntimeMemoryManager:
 
         The caller must have proof that all writes succeeded. Retirement is
         separate; a committed lease continues to prevent page/sequence reuse.
+
+        ``written_tokens`` may keep only a leading part of a speculative
+        reservation (see :meth:`try_reserve`). Pages lying entirely past the
+        kept rows never join the sequence table: their reservation is abandoned
+        into deferred reclaim, and they are recycled only after retirement drops
+        the step's in-flight references. Rejected rows inside a kept page sit
+        beyond its ``valid_tokens`` and are overwritten by the next append.
         """
 
         with self._lock:
             lease = self._get_lease(lease_handle)
             LifecycleTransitions.require_lease(lease, LeaseState.IN_FLIGHT)
             records = [self._get_reservation(handle) for handle in lease.reservation_handles]
-            self._validate_written_counts(records, written_tokens)
+            written = resolve_written_counts(records, written_tokens)
             self._validate_lease_sequences(lease, records)
 
-            new_pages = tuple(page for record in records for page in record.allocated_pages)
             touched_pages = self._lease_touched_pages(lease)
             for page in touched_pages:
                 meta = self.allocator.get_meta(page)
                 if meta.inflight_refs <= 0:
                     raise InvariantViolationError("lease page has no in-flight ownership")
 
-            # RESERVED -> LIVE with one request ref per new page.
+            kept_tables = [self._kept_table(record, written[record.handle]) for record in records]
+            kept_pages = {entry.page for table in kept_tables for entry in table}
+            new_pages = tuple(
+                page for record in records for page in record.allocated_pages if page in kept_pages
+            )
+            rejected = tuple(
+                page
+                for record in records
+                for page in record.allocated_pages
+                if page not in kept_pages
+            )
+            # Rejected pages were written by a quiescent launch but never become
+            # durable: drop the reservation now, reclaim after retirement.
+            self.allocator.abandon_reserved(rejected, safe_epoch=self.current_epoch)
+            # RESERVED -> LIVE with one request ref per kept new page.
             self.allocator.commit_reserved(new_pages)
-            for record in records:
-                for entry in record.planned_page_table:
+            for record, table in zip(records, kept_tables, strict=True):
+                for entry in table:
                     self.allocator.set_valid_tokens(entry.page, entry.valid_tokens)
                 with self.sequences.mutate(record.sequence) as state:
-                    state.page_table.entries = list(record.planned_page_table)
-                    state.committed_tokens = record.execution_base_tokens + record.num_new_tokens
+                    state.page_table.entries = list(table)
+                    state.committed_tokens = record.execution_base_tokens + written[record.handle]
                     state.version += 1
 
                 for copy in record.copies:
@@ -2303,28 +2334,28 @@ class RuntimeMemoryManager:
                         "sequence changed while its execution lease was active"
                     )
 
-    @staticmethod
-    def _validate_written_counts(
-        records: Sequence[ReservationRecord],
-        written_tokens: Mapping[KVReservationHandle, int] | None,
-    ) -> None:
-        """Validate an optional written-token report against the reservations.
+    def _kept_table(self, record: ReservationRecord, written: int) -> tuple[PageTableEntry, ...]:
+        """Planned table truncated to the first ``written`` appended rows.
 
-        Phase A1 requires every reserved token to be written, so partial writes
-        are rejected structurally.
+        Every dropped entry must be a page this reservation allocated: existing
+        committed pages always cover positions below the base, and ``written``
+        is at least one, so the (possibly copied) tail page is always kept.
         """
-        if written_tokens is None:
-            return
-        expected_handles = {record.handle for record in records}
-        if set(written_tokens) != expected_handles:
-            raise InvalidStateTransitionError(
-                "written-token report does not match the step reservations"
+        final = record.execution_base_tokens + written
+        keep = div_ceil(final, self.page_size)
+        planned = record.planned_page_table
+        if keep > len(planned):
+            raise InvariantViolationError("written rows exceed the planned page table")
+        allocated = set(record.allocated_pages)
+        if any(entry.page not in allocated for entry in planned[keep:]):
+            raise InvariantViolationError("a rejected speculative page was not newly reserved")
+        kept = list(planned[:keep])
+        if kept:
+            tail = kept[-1]
+            kept[-1] = PageTableEntry(
+                page=tail.page, valid_tokens=final - (keep - 1) * self.page_size
             )
-        for record in records:
-            if written_tokens[record.handle] != record.num_new_tokens:
-                raise InvalidStateTransitionError(
-                    "Phase A1 requires every reserved token to be written"
-                )
+        return tuple(kept)
 
     def _lease_touched_pages(self, lease: LeaseRecord) -> tuple[KVPageHandle, ...]:
         """All unique pages a lease's steps may touch, deduplicated.

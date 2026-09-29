@@ -84,6 +84,7 @@ from ayaka.memory.transaction import (
     LifecycleTransitions,
     ReservationResult,
     TransactionOrchestrator,
+    resolve_written_counts,
 )
 from ayaka.memory.views import (
     GroupedExecutionMemoryView,
@@ -695,6 +696,7 @@ class KVCacheGroupManager:
         num_new_tokens: int,
         *,
         prefix_match: object | None = None,
+        min_commit_tokens: int | None = None,
     ) -> ReservationResult:
         """Atomically reserve append pages in every cache group.
 
@@ -708,6 +710,9 @@ class KVCacheGroupManager:
             sequence: Sequence to extend.
             num_new_tokens: Positive token count to plan for.
             prefix_match: Rejected for grouped managers (no A6 prefix path).
+            min_commit_tokens: Leading rows that must commit; trailing rows are
+                tentative speculative drafts kept only when a commit reports
+                them written. ``None`` requires every row.
 
         Returns:
             Success (with an opaque reservation handle) or a structured
@@ -722,6 +727,8 @@ class KVCacheGroupManager:
             if not isinstance(num_new_tokens, int) or isinstance(num_new_tokens, bool):
                 raise TypeError("num_new_tokens must be an integer")
             if num_new_tokens <= 0:
+                return ReservationResult.failure(ReservationFailure.INVALID_TOKEN_COUNT)
+            if min_commit_tokens is not None and not 1 <= min_commit_tokens <= num_new_tokens:
                 return ReservationResult.failure(ReservationFailure.INVALID_TOKEN_COUNT)
             try:
                 state = self._get_sequence_state(sequence)
@@ -822,6 +829,7 @@ class KVCacheGroupManager:
                 base_committed_tokens=state.committed_tokens,
                 num_new_tokens=num_new_tokens,
                 group_plans=group_plans,
+                min_commit_tokens=min_commit_tokens,
             )
             tx.reservation_handles.append(reservation_handle)
             state.pending_transaction_index = transaction.index
@@ -1018,12 +1026,18 @@ class KVCacheGroupManager:
 
         The caller must have proof that all writes succeeded. Retirement is
         separate; a committed lease continues to prevent page/sequence reuse.
+
+        A speculative reservation may keep only a leading part of its rows
+        (``written_tokens``). In every group, pages lying wholly past the kept
+        rows are abandoned into deferred reclaim instead of joining the table,
+        and retention is evaluated at the committed length, not the reserved
+        one, so each group keeps exactly the window its own policy requires.
         """
         with self._lock:
             lease = self._get_lease(lease_handle)
             LifecycleTransitions.require_lease(lease, LeaseState.IN_FLIGHT)
             records = [self._get_reservation(handle) for handle in lease.reservation_handles]
-            self._validate_written_counts(records, written_tokens)
+            written = resolve_written_counts(records, written_tokens)
             self._validate_lease_sequences(lease, records)
 
             for runtime in self._group_runtimes:
@@ -1031,22 +1045,34 @@ class KVCacheGroupManager:
                     if runtime.allocator.get_meta(page).inflight_refs <= 0:
                         raise InvariantViolationError("lease page has no in-flight ownership")
 
-            # Commit new pages per group (RESERVED -> LIVE).
-            for runtime in self._group_runtimes:
-                new_pages = tuple(
-                    page
-                    for record in records
-                    for plan in record.group_plans
-                    if plan.group_name == runtime.descriptor.name
-                    for page in plan.allocated_pages
+            kept = {
+                (record.handle, plan.group_name): self._kept_group_entries(
+                    plan, record.base_committed_tokens + written[record.handle]
                 )
-                runtime.allocator.commit_reserved(new_pages)
+                for record in records
+                for plan in record.group_plans
+            }
+            # Commit kept new pages per group (RESERVED -> LIVE); abandon the
+            # rejected ones, which a quiescent launch wrote but nothing owns.
+            for runtime in self._group_runtimes:
+                name = runtime.descriptor.name
+                new_pages: list[KVPageHandle] = []
+                rejected: list[KVPageHandle] = []
+                for record in records:
+                    for plan in record.group_plans:
+                        if plan.group_name != name:
+                            continue
+                        kept_pages = {entry.page for entry in kept[(record.handle, name)]}
+                        for page in plan.allocated_pages:
+                            (new_pages if page in kept_pages else rejected).append(page)
+                runtime.allocator.abandon_reserved(tuple(rejected), safe_epoch=self.current_epoch)
+                runtime.allocator.commit_reserved(tuple(new_pages))
             for record in records:
-                final_tokens = record.base_committed_tokens + record.num_new_tokens
+                final_tokens = record.base_committed_tokens + written[record.handle]
                 state = self._get_sequence_state(record.sequence)
                 for plan in record.group_plans:
                     runtime = self._runtime_by_name[plan.group_name]
-                    for entry in plan.planned_page_table:
+                    for entry in kept[(record.handle, plan.group_name)]:
                         runtime.allocator.set_valid_tokens(entry.page, entry.valid_tokens)
                 state.committed_tokens = final_tokens
                 state.version += 1
@@ -1054,7 +1080,7 @@ class KVCacheGroupManager:
             # Retention pruning per group: blocks outside the live window drop
             # their request refs and enter deferred free at the current epoch.
             for record in records:
-                final_tokens = record.base_committed_tokens + record.num_new_tokens
+                final_tokens = record.base_committed_tokens + written[record.handle]
                 state = self._get_sequence_state(record.sequence)
                 for plan in record.group_plans:
                     runtime = self._runtime_by_name[plan.group_name]
@@ -1067,7 +1093,7 @@ class KVCacheGroupManager:
                         )
                     )
                     retained_entries = []
-                    for entry in plan.planned_page_table:
+                    for entry in kept[(record.handle, plan.group_name)]:
                         if entry.logical_block in retained_blocks:
                             retained_entries.append(entry)
                         else:
@@ -2244,21 +2270,34 @@ class KVCacheGroupManager:
                     "sequence changed while its grouped lease was active"
                 )
 
-    @staticmethod
-    def _validate_written_counts(
-        records: Sequence[_ReservationRecord],
-        written_tokens: Mapping[KVReservationHandle, int] | None,
-    ) -> None:
-        """Validate an optional written-token report (A1: all tokens written)."""
-        if written_tokens is None:
-            return
-        expected = {record.handle for record in records}
-        if set(written_tokens) != expected:
-            raise InvalidStateTransitionError(
-                "written-token report does not match grouped reservations"
+    def _kept_group_entries(
+        self, plan: _GroupReservationPlan, final_tokens: int
+    ) -> tuple[GroupPageTableEntry, ...]:
+        """One group's planned entries covering rows below ``final_tokens``.
+
+        Valid-token counts are recomputed at the committed length. A dropped
+        entry must be a page this reservation allocated; existing pages always
+        lie below the committed base.
+        """
+        page_size = self._runtime_by_name[plan.group_name].descriptor.storage_spec.page_size
+        allocated = set(plan.allocated_pages)
+        kept: list[GroupPageTableEntry] = []
+        for entry in plan.planned_page_table:
+            start = entry.logical_block * page_size
+            if start >= final_tokens:
+                if entry.page not in allocated:
+                    raise InvariantViolationError(
+                        "a rejected speculative page was not newly reserved"
+                    )
+                continue
+            kept.append(
+                GroupPageTableEntry(
+                    logical_block=entry.logical_block,
+                    page=entry.page,
+                    valid_tokens=min(page_size, final_tokens - start),
+                )
             )
-        if any(written_tokens[record.handle] != record.num_new_tokens for record in records):
-            raise InvalidStateTransitionError("every grouped reservation token must be written")
+        return tuple(kept)
 
     def _lease_touched_pages(
         self,

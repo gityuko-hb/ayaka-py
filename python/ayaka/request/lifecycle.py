@@ -320,6 +320,51 @@ class RequestLifecycle:
         self._known_tokens += (token_id,)
         self._clear_slice()
 
+    def commit_speculative_range(
+        self,
+        step_id: int,
+        scheduled: ScheduledSlice,
+        token_ids: tuple[int, ...],
+        *,
+        committed_state_version: int,
+        now_ns: int | None = None,
+    ) -> None:
+        """Settle a verified speculative decode slice after its partial KV commit.
+
+        ``token_ids`` are the accepted drafts followed by the target token,
+        already truncated at a stop or the output budget. The KV owner committed
+        exactly ``len(token_ids)`` rows starting at the slice: the base row plus
+        one row per accepted draft. Progress advances one row and one token at a
+        time, so the machine never computes past its known tokens and each
+        token is published at the known boundary, exactly as ``len(token_ids)``
+        ordinary decode steps would. Nothing is mutated if validation fails.
+        """
+        self.validate_forward_commit(
+            step_id,
+            scheduled,
+            committed_state_version=committed_state_version,
+        )
+        if scheduled.phase is not Phase.DECODE or not scheduled.sample_last_query:
+            raise ValueError("only a sampling decode slice can settle speculative tokens")
+        if type(token_ids) is not tuple or not token_ids:
+            raise ValueError("a speculative settlement publishes at least one token")
+        for token in token_ids:
+            require_int(token, "sample token id")
+        if len(self._output_token_ids) + len(token_ids) > self.request.stop.max_tokens:
+            raise ValueError("output token budget is exhausted")
+        if self.state is RequestState.ADMITTED:
+            self.machine.transition(RequestState.DECODING, now_ns=now_ns)
+        position = scheduled.query_start
+        for token in token_ids:
+            self.machine.commit_computed_range(position, 1)
+            self.machine.on_token_generated(1)
+            self.machine.mark_published(now_ns=now_ns)
+            self._output_token_ids.append(token)
+            self._known_tokens += (token,)
+            position += 1
+        self._state_version = committed_state_version
+        self._clear_slice()
+
     def discard_slice(self, step_id: int, scheduled: ScheduledSlice) -> None:
         """Forget an unsubmitted or fully drained slice and invalidate its epoch.
 
