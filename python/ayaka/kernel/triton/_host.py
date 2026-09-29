@@ -79,13 +79,28 @@ def require_shape(x: torch.Tensor, name: str, shape: tuple[int, ...]) -> None:
         raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(x.shape)}")
 
 
-def require_device(x: torch.Tensor, name: str, device: torch.device) -> None:
+def require_device(
+    x: torch.Tensor,
+    name: str,
+    device: torch.device,
+    *,
+    reference_name: str | None = None,
+) -> None:
     """Require ``x`` to live on ``device``.
+
+    Args:
+        x: Candidate tensor.
+        name: Argument name used in the error message.
+        device: Expected device.
+        reference_name: Optional name of the tensor or argument that owns
+            ``device``. When provided, the error describes a device mismatch.
 
     Raises:
         ValueError: if the device differs.
     """
     if x.device != device:
+        if reference_name is not None:
+            raise ValueError(f"{name} and {reference_name} must be on the same device")
         raise ValueError(f"{name} must be on {device}, got {x.device}")
 
 
@@ -95,7 +110,7 @@ def require_same_device(
     reference: torch.Tensor,
     reference_name: str,
 ) -> None:
-    """Require ``x`` and ``reference`` to share one CUDA device.
+    """Require ``x`` and ``reference`` to share one device.
 
     Raises:
         ValueError: if the devices differ.
