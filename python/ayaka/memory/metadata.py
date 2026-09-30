@@ -43,7 +43,7 @@ class PageMetadata:
     inflight_refs: int = 0
     """Launched execution steps that may still read or write this page."""
     pin_refs: int = 0
-    """Reference count for explicit pins (e.g. static system prompts, active LoRA caches)."""
+    """Reference count for explicit pins (e.g. static system prompts)."""
 
     valid_tokens: int = 0
     """Number of valid KV tokens in this page; bounded by the page size."""

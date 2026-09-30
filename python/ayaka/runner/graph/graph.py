@@ -23,7 +23,7 @@ class ShapeKey:
 
     size: per-phase capture size (decode: bs, prefill: num_tokens).
     stream_idx: pdmux-style stream group; None for single-stream runners.
-    variant_label: e.g. "lora" / "nolora" when a runner records a
+    variant_label: e.g. a speculative role/width when a runner records a
         separate graph per variant to avoid an in-graph branch.
     quant_mode: kernel-variant selector (e.g. "w4a16_marlin", "fp8",
         "mxfp4") for when the chosen GEMM/attention kernel changes

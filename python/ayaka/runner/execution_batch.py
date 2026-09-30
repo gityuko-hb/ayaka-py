@@ -5,14 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ayaka.lora.variant import ExecutionVariant
 from ayaka.memory.capacity import ResourceGeneration
 from ayaka.sched.plan import PreparedStep
 from ayaka.types import ForwardMode
 
 if TYPE_CHECKING:
     from ayaka.executor.ticket import TicketId
-    from ayaka.lora.binding import AdapterBinding
     from ayaka.worker.base import WorkerStep
 
 
@@ -30,8 +28,6 @@ class ExecutionBatch:
     prepared: PreparedStep
     generation: ResourceGeneration | None
     ticket_id: TicketId | None = None
-    variant: ExecutionVariant | None = None
-    adapters: tuple[AdapterBinding | None, ...] = ()
 
     def __post_init__(self) -> None:
         self.validate()
@@ -50,11 +46,6 @@ class ExecutionBatch:
     def validate(self) -> None:
         """Validate identity/capacity again before staging or launching."""
         self.prepared.validate()
-        if self.variant is None:
-            if self.adapters:
-                raise ValueError("adapter rows require a structural variant")
-        elif len(self.adapters) != self.request_count:
-            raise ValueError("adapter bindings must follow packed request order")
         if self.generation is not None and not isinstance(self.generation, ResourceGeneration):
             raise TypeError("batch generation must be a ResourceGeneration")
         lease = self.prepared.buffers

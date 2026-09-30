@@ -219,7 +219,6 @@ class ServingRuntime:
         half-captured graph path.
         """
         self.config = config or ServingConfig()
-        self.lora = None
         self._draft_model = draft_model
         if self.config.speculative is not None:
             if draft_model is None or draft_tokenizer_path is None:
@@ -362,11 +361,6 @@ class ServingRuntime:
         self._weights_bytes = (
             self._measure_weights(model) if weights_bytes is None else weights_bytes
         )
-        if self.config.lora is not None:
-            # One budget covers the stable bank, rank metadata, per-flight
-            # workspaces and grouped routing; the runner enforces the same
-            # ceiling before allocation, so nothing is charged twice.
-            self._weights_bytes += self.config.lora.memory_bytes
         if self.config.speculative is not None:
             self._weights_bytes += (
                 self._measure_weights(draft_model) + self.config.speculative.memory_bytes
@@ -531,8 +525,6 @@ class ServingRuntime:
             finally:
                 if self.tokenizer is not None:
                     self.tokenizer.close()
-                if self.lora is not None:
-                    self.lora.close()
             raise
 
     # ------------------------------------------------------------------
@@ -645,7 +637,6 @@ class ServingRuntime:
         spec = self._storage_spec(pages)
         tiering_config, max_inflight_bytes = self._tiering_config(spec)
         return WorkerResourcePlan(
-            lora_host_bytes=(0 if self.config.lora is None else self.config.lora.host_memory_bytes),
             device=self._device,
             storage_spec=self._storage_spec(pages),
             buffer_spec=self._buffer_spec,
@@ -693,10 +684,6 @@ class ServingRuntime:
 
     def _build_runner(self, kv: LogicalKVManager, buffers: RunnerBuffers) -> ModelRunner:
         """Bind a fresh paged runner to the slab, this model and its buffers."""
-        if self.config.lora is not None and self.lora is None:
-            from ayaka.lora.binding import LoRAExecutionBinding
-
-            self.lora = LoRAExecutionBinding(self._model, self.config.lora)
         runner = ModelRunner(
             self._sampling,
             self._model,
@@ -706,7 +693,6 @@ class ServingRuntime:
             force_reference=self._device.type == "cpu",
             buffers=buffers,
             max_model_len=self._max_seq,
-            lora=self.lora,
         )
         runner.set_valid_token_ids(self._valid_token_ids)
         if self.config.speculative_decoding is not None:
@@ -780,17 +766,11 @@ class ServingRuntime:
         """
         if self.kv is None:
             raise RuntimeError("prefix identity requested before the KV slab is bound")
-        adapter = getattr(_request, "adapter", None)
-        if adapter is not None and self.lora is None:
-            raise ValueError("LoRA prefix identity requires a loaded adapter")
         return build_prefix_context(
             model_id=self.config.model,
             model_revision=f"{self._model_revision}:{self._weights_revision}",
             config=self._model_config,
             storage_spec=self.kv.storages["default"].storage.spec,
-            adapter_id=(
-                None if adapter is None or self.lora is None else self.lora.prefix_identity(adapter)
-            ),
         )
 
     def _build_tail(self, pages: int) -> _KVTail:
@@ -870,15 +850,6 @@ class ServingRuntime:
         spec = None if runner is None else runner.speculative_runner
         speculation = None if self.engine is None else getattr(self.engine, "speculation", None)
         return {
-            "lora": None
-            if self.lora is None
-            else {
-                "variant": repr(self.lora.variant),
-                "bytes": self.lora.bytes,
-                "loaded": self.lora.stats()["lora_active_slots"],
-                "leases": self.lora.stats()["lora_active_leases"],
-                **self.lora.stats(),
-            },
             "speculative": None if spec is None else spec.report(),
             "speculative_decoding": None if speculation is None else speculation.report(),
             "lanes": None if mux is None else mux.report(),
@@ -1224,8 +1195,6 @@ class ServingRuntime:
                 raise ValueError("rebuild must advance owner_incarnation")
             self._freeze = tail.resources.freeze
         self._tail = tail
-        if self.lora is not None:
-            self.lora.manager.bind_host_ledger(tail.ledger)
         # The runner's attention is bound and the freeze exists, so the graph
         # tier can be judged and the bucket set admitted against real headroom.
         # Order matters: policy must not read a report that still says "unbound",
@@ -1471,8 +1440,6 @@ class ServingRuntime:
         if self.service is not None and not self.service.close(timeout):
             return False
         self._teardown_tail()
-        if self.lora is not None:
-            self.lora.close()
         if self.tokenizer is not None:
             self.tokenizer.close()
         self._closed = True

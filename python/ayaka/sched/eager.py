@@ -206,8 +206,6 @@ class EagerScheduler(SchedulerCore):
         for entry in ranked:
             if len(slices) >= self._seq_cap():
                 break
-            if not self._adapter_fits(entry.lifecycle.request, slices):
-                continue
             if self._request_preparer is not None and not self._request_preparer.prepare_request(
                 entry.lifecycle
             ):
@@ -242,8 +240,6 @@ class EagerScheduler(SchedulerCore):
         total = 0
         for lifecycle in tuple(self._running.values()):
             if lifecycle.is_terminal or lifecycle.token.is_cancelled:
-                continue
-            if not self._adapter_fits(lifecycle.request, slices):
                 continue
             if lifecycle.request_id in self._inflight_ids_all:
                 continue

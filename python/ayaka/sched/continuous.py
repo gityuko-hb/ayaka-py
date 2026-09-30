@@ -412,8 +412,6 @@ class ContinuousScheduler(SchedulerCore):
                 # One unsettled slice per request: the adopted ticket keeps
                 # its ownership until update_from_output settles it.
                 continue
-            if not self._adapter_fits(lifecycle.request, slices):
-                continue
             if not budget.try_consume(1, phase=Phase.DECODE):
                 break
             snapshot = lifecycle.snapshot()
@@ -471,9 +469,6 @@ class ContinuousScheduler(SchedulerCore):
                 break
 
             lifecycle = entry.lifecycle
-            if not self._adapter_fits(lifecycle.request, slices):
-                self._mark_bypass(entry)
-                continue
             if self._request_preparer is not None and not self._request_preparer.prepare_request(
                 lifecycle
             ):

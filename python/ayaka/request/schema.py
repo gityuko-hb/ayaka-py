@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import NewType
 
-from ayaka.lora.variant import AdapterIdentity
 from ayaka.request.input import ConstraintSpec, MultimodalEmbedding
 from ayaka.sampling.params import SamplingParams
 from ayaka.utils.validation import require_frozen, require_int, require_text
@@ -75,13 +74,10 @@ class Request:
     # Set at the API edge, carried unchanged to
     # every span the request produces.
     trace_id: str | None = None
-    adapter: AdapterIdentity | None = None
 
     def __post_init__(self) -> None:
         require_frozen(self, "request")
         require_text(self.request_id, "request_id")
-        if self.adapter is not None and not isinstance(self.adapter, AdapterIdentity):
-            raise TypeError("adapter must be an AdapterIdentity")
         for token in self.prompt_token_ids:
             require_int(token, "prompt token id")
         previous_end = 0

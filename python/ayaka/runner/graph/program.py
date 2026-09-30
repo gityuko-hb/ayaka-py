@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,8 +70,7 @@ def model_program(
     hidden: list[torch.Tensor] = []
 
     def body() -> torch.Tensor:
-        variant = getattr(owner, "model_variant_context", lambda tokens: nullcontext())
-        with torch.inference_mode(), forward_context(context), variant(tokens):
+        with torch.inference_mode(), forward_context(context):
             output = owner._model.forward_hidden(tokens, positions, context.attention)
             if backend == "torch_compile_piecewise" and hidden:
                 hidden[0].copy_(output)

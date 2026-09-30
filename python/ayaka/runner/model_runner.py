@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from contextlib import nullcontext
-from dataclasses import replace
 from enum import StrEnum
 
 import torch
@@ -13,7 +11,6 @@ import torch
 from ayaka.attention.spec import AttentionGroupSpec
 from ayaka.configs.phase import PhaseConfig
 from ayaka.kvcache.manager import LogicalKVManager
-from ayaka.lora.batch import BatchLoRAMapping
 from ayaka.model_loader.readiness import (
     adopt_model_weights,
     require_ready_weights,
@@ -61,7 +58,6 @@ class ModelRunner(PagedModelRunner):
         force_reference: bool = False,
         buffers: RunnerBuffers | None = None,
         max_model_len: int | None = None,
-        lora=None,
     ) -> None:
         self.bootstrap_stage = BootstrapStage.MODEL_LOADED
         adopt_model_weights(model)
@@ -81,194 +77,56 @@ class ModelRunner(PagedModelRunner):
         self.decode_runner = DecodeCudaGraphRunner(self)
         self.prefill_runner = None
         self.decode_max_padding_ratio = float("inf")
-        self.lora = lora
         self.speculative_runner = None
         self.plain_greedy = False
-        self._adapter_leases = {}
-        self._lora_mappings = (
-            []
-            if lora is None or buffers is None
-            else [
-                BatchLoRAMapping(
-                    buffers.spec.max_num_batched_tokens,
-                    buffers.spec.max_num_batched_tokens,
-                    lora.config.max_adapters,
-                    self.device,
-                )
-                for _ in range(buffers.spec.max_inflight)
-            ]
-        )
-        if lora is not None and buffers is not None:
-            if (
-                lora.working_bytes(
-                    buffers.spec.max_num_batched_tokens,
-                    buffers.spec.max_inflight,
-                    routing_bytes=sum(mapping.nbytes for mapping in self._lora_mappings),
-                )
-                > lora.config.memory_bytes
-            ):
-                raise MemoryError("LoRA working set exceeds memory reservation")
-        self._lora_rows = [mapping.token_slot_ids for mapping in self._lora_mappings]
-        self._lora_workspaces = (
-            []
-            if lora is None or buffers is None
-            else [
-                lora.workspace(buffers.spec.max_num_batched_tokens)
-                for _ in range(buffers.spec.max_inflight)
-            ]
-        )
 
     def prepare_request(self, request) -> None:
         if self.speculative_runner is not None or self.plain_greedy:
             from ayaka.runner.speculative_runner import require_plain_greedy
 
             require_plain_greedy(request)
-            if request.adapter is not None:
-                raise ValueError("speculative x LoRA is not certified")
             if (
                 self.speculative_runner is not None
                 and request.max_total_len
                 > self.speculative_runner.draft.model.config.max_position_embeddings
             ):
                 raise ValueError("request exceeds the draft model context")
-        lease = None
-        if request.adapter is not None:
-            if self.lora is None:
-                raise ValueError("LoRA is disabled")
-            lease = self.lora.acquire(request.adapter)
-        retained = False
-        try:
-            if self.lora is not None:
-                self.lora.retain_request()
-                retained = True
-            super().prepare_request(request)
-        except BaseException:
-            if lease is not None:
-                lease.close()
-            if retained and self.lora is not None:
-                self.lora.release_request()
-            raise
-        if lease is not None:
-            self._adapter_leases[str(request.request_id)] = lease
+        super().prepare_request(request)
 
     def forget_request(self, request_id: str) -> None:
-        registered = request_id in self._request_ir
         super().forget_request(request_id)
-        lease = self._adapter_leases.pop(request_id, None)
-        if lease is not None:
-            lease.close()
         if self.speculative_runner is not None:
             self.speculative_runner.forget(request_id)
-        if registered and self.lora is not None:
-            self.lora.release_request()
 
     def enable_speculative_decoding(self) -> None:
         """Enable paged verification of scheduler-planned draft rows.
 
-        The dense reference runner and this path are mutually exclusive, and
-        LoRA x speculation is not certified.
+        The dense reference runner and this path are mutually exclusive.
         """
-        if self.lora is not None or self.speculative_runner is not None or self.plain_greedy:
+        if self.speculative_runner is not None or self.plain_greedy:
             raise ValueError("speculative decoding is incompatible with this runner's features")
         super().enable_speculative_decoding()
 
     def enable_speculative(self, draft, config) -> None:
         from ayaka.runner.speculative_runner import SpeculativeRunner
 
-        if (
-            self.lora is not None
-            or self.speculative_runner is not None
-            or self.speculative_decoding
-        ):
+        if self.speculative_runner is not None or self.speculative_decoding:
             raise ValueError("incompatible or already enabled speculative runner")
         if self.buffers is None or self.buffers.live:
             raise RuntimeError("speculative bootstrap requires drained static buffers")
         self.speculative_runner = SpeculativeRunner(self, draft, config)
-
-    def _stage_lora(self, prepared: PreparedStep) -> None:
-        if self.lora is None:
-            return
-        if prepared.buffers is None:
-            raise ValueError("LoRA requires a ticket-owned flight buffer")
-        slots, counts, generations = [], [], []
-        for scheduled in prepared.step.slices:
-            if scheduled.request_id not in self._request_ir:
-                raise ValueError("LoRA request was not admitted under an adapter lease")
-            lease = self._adapter_leases.get(scheduled.request_id)
-            if lease is not None:
-                lease.validate()
-            slots.append(0 if lease is None else lease.binding.slot)
-            counts.append(scheduled.query_count)
-            generations.append(0 if lease is None else lease.binding.generation)
-        mapping = self._lora_mappings[prepared.buffers.index]
-        mapping.stage(
-            slots, counts, generations, max_loras_per_batch=self.lora.config.max_loras_per_batch
-        )
-        # Planned algorithm route: decode replays BGMV, prefill/mixed SGMV.
-        mapping.phase = "decode" if prepared.step.is_pure_decode else "prefill"
-        self.lora.manager.record_batch(slots)
-
-    def model_variant_context(self, tokens):
-        if self.lora is None:
-            return nullcontext()
-        if self.buffers is None:
-            raise ValueError("LoRA requires static buffers")
-        index = next(
-            (
-                i
-                for i, pointers in enumerate(self.buffers.pointers())
-                if pointers[0] == tokens.data_ptr()
-            ),
-            None,
-        )
-        if index is None:
-            raise ValueError("LoRA inputs are outside the flight backing")
-        mapping = self._lora_mappings[index]
-        return self.lora.select(
-            self._lora_rows[index][: tokens.numel()],
-            self._lora_workspaces[index],
-            sequence_slots=mapping.sequence_slot_ids,
-            segment_offsets=mapping.adapter_offsets,
-            token_permutation=mapping.token_permutation,
-            token_inverse=mapping.token_inverse,
-            slot_counts=mapping.slot_counts,
-            phase=mapping.phase,
-        )
-
-    def _model_forward(self, tokens, positions, metadata):
-        forward = super()._model_forward(tokens, positions, metadata)
-
-        def run():
-            with self.model_variant_context(tokens):
-                return forward()
-
-        return run
-
-    def _execute_eager_inputs(self, prepared, inputs):
-        with self.model_variant_context(inputs.tokens):
-            return super()._execute_eager_inputs(prepared, inputs)
 
     def enable_prefill_graph(self, config: PhaseConfig) -> None:
         from ayaka.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
 
         if self.prefill_runner is not None:
             raise RuntimeError("prefill graphs already enabled; drain and rebuild")
-        self._set_lora_capture_phase("prefill")
         self.prefill_runner = PrefillCudaGraphRunner(self, config)
         try:
             self.prefill_runner.capture()
         except BaseException:
             self.bootstrap_stage = BootstrapStage.FAILED
             raise
-
-    def _set_lora_capture_phase(self, phase: str) -> None:
-        """Pin the planned algorithm for every flight before capture.
-
-        Capture stages dummy routing, so the phase cannot come from a live
-        step; the same value is restored by ``_stage_lora`` on every replay.
-        """
-        for mapping in self._lora_mappings:
-            mapping.phase = phase
 
     def on_workspace_growth(self) -> None:
         super().on_workspace_growth()
@@ -280,7 +138,6 @@ class ModelRunner(PagedModelRunner):
             raise RuntimeError("failed bootstrap requires a new execution owner")
         require_ready_weights(self._model)
         self.bootstrap_stage = BootstrapStage.CAPTURE_READY
-        self._set_lora_capture_phase("decode")
         try:
             return super().enable_graph(config, stream=stream)
         except BaseException:
@@ -297,24 +154,6 @@ class ModelRunner(PagedModelRunner):
             weight_binding(self._model),
             super()._graph_binding_digest(),
         ]
-        if self.lora is not None:
-            parts.extend(
-                (
-                    repr(self.lora.storage_identity),
-                    repr(tuple(row.data_ptr() for row in self._lora_rows)),
-                    repr(tuple(w.storage_identity for w in self._lora_workspaces)),
-                )
-            )
-            if self.buffers is not None:
-                tokens = self.buffers.spec.max_num_batched_tokens
-                # Both planned algorithm routes are part of the identity: a
-                # decode capture must not survive a prefill-plan change and
-                # vice versa.
-                parts.append(repr(self.lora.plan_identity(tokens, phase="decode")))
-                parts.append(repr(self.lora.plan_identity(tokens, phase="prefill")))
-                parts.append(
-                    repr(tuple(mapping.storage_identity for mapping in self._lora_mappings))
-                )
         if self.buffers is not None:
             parts.append(repr(self.buffers.pointers()))
         for name, backend in self.backends.items():
@@ -336,7 +175,6 @@ class ModelRunner(PagedModelRunner):
     def _forward_tail(self, prepared: PreparedStep) -> ForwardResult:
         if self.kv is None:
             raise RuntimeError("execution runner is closed")
-        self._stage_lora(prepared)
         if self.speculative_runner is not None and prepared.step.is_pure_decode:
             return self.speculative_runner.execute(prepared)
         batch = ExecutionBatch.from_prepared(prepared, generation=self.kv.generation)
@@ -366,44 +204,12 @@ class ModelRunner(PagedModelRunner):
         """Worker adapter validates before COW or any other mutating enqueue."""
         batch = ExecutionBatch.from_worker(step)
         self._validate_prepared(batch.prepared)
-        if self.lora is not None:
-            adapters = []
-            for scheduled in batch.prepared.step.slices:
-                if scheduled.request_id not in self._request_ir:
-                    raise ValueError("LoRA request was not admitted")
-                lease = self._adapter_leases.get(scheduled.request_id)
-                if lease is not None:
-                    lease.validate()
-                adapters.append(None if lease is None else lease.binding)
-            batch = replace(batch, variant=self.lora.variant, adapters=tuple(adapters))
         if self.speculative_runner is not None:
             self.speculative_runner.validate_binding()
         return batch
 
     def execute_batch(self, batch: ExecutionBatch):
-        # Graph replay does not execute the Python sidecar context again. Guard
-        # the outer enqueue and record its completion dependency for slot copies.
-        guard = (
-            self.lora.manager.execution_guard(
-                tuple({binding.identity for binding in batch.adapters if binding is not None})
-            )
-            if self.lora is not None
-            else nullcontext()
-        )
-        with guard:
-            return self._execute_batch_guarded(batch)
-
-    def _execute_batch_guarded(self, batch: ExecutionBatch):
         batch.validate()
-        if self.lora is not None:
-            if batch.variant != self.lora.variant:
-                raise ValueError("execution variant changed before enqueue")
-            for scheduled, binding in zip(batch.prepared.step.slices, batch.adapters, strict=True):
-                lease = self._adapter_leases.get(scheduled.request_id)
-                if (None if lease is None else lease.binding) != binding:
-                    raise ValueError("adapter request binding changed before enqueue")
-                if binding is not None:
-                    self.lora.validate(binding)
         if self.plain_greedy:
             from ayaka.executor.ticket import SampleOutputs
 

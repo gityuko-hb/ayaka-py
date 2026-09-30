@@ -239,9 +239,6 @@ class ResidentKVEngine(Engine):
             speculation=speculation,
         )
         self.speculation = speculation
-        lora = getattr(runner, "lora", None)
-        if lora is not None:
-            scheduler.max_loras_per_batch = lora.config.max_loras_per_batch
         super().__init__(
             plan,
             requests=requests,

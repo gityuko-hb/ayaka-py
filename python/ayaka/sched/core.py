@@ -76,7 +76,6 @@ class SchedulerCore(BaseScheduler):
         #: Host speculative control plane; it only proposes draft extensions
         #: of admitted decode slices and never owns requests or KV.
         self._speculation = speculation
-        self.max_loras_per_batch: int | None = None
         self._plan = plan
         self._requests = requests
         self._runtime = runtime
@@ -259,17 +258,6 @@ class SchedulerCore(BaseScheduler):
             sequence=sequence,
         )
         return lifecycle
-
-    def _adapter_fits(self, request: Request, slices: Sequence[ScheduledSlice]) -> bool:
-        """Logical distinct-adapter budget; residency stays with the runner owner."""
-        if self.max_loras_per_batch is None or request.adapter is None:
-            return True
-        adapters = {
-            self._requests.get(s.request_id).request.adapter
-            for s in slices
-            if self._requests.get(s.request_id).request.adapter is not None
-        }
-        return request.adapter in adapters or len(adapters) < self.max_loras_per_batch
 
     def _validate_request_features(self, request: Request) -> None:
         params = request.sampling
