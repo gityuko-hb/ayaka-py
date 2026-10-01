@@ -174,7 +174,16 @@ async def _body(request):
     try:
         body = await request.json()
     except (ValueError, UnicodeError) as exc:
-        raise InvalidRequestError("body must be valid JSON") from exc
+        try:
+            raw = (await request.body()).decode("utf-8").strip()
+            if raw.startswith("'") and raw.endswith("'"):
+                import json
+
+                body = json.loads(raw[1:-1].strip())
+            else:
+                raise InvalidRequestError("body must be valid JSON") from exc
+        except Exception:
+            raise InvalidRequestError("body must be valid JSON") from exc
     if not isinstance(body, dict):
         raise InvalidRequestError("body must be a JSON object")
     return body

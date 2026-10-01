@@ -269,6 +269,17 @@ class HfTokenizer:
                 except Exception:
                     pass
 
+        if not getattr(tok, "chat_template", None):
+            vocab = tok.get_vocab() if hasattr(tok, "get_vocab") else {}
+            if "<|im_start|>" in vocab and "<|im_end|>" in vocab:
+                tok.chat_template = (
+                    "{% for message in messages %}"
+                    "{{'<|im_start|>' + message['role'] + '\n' + "
+                    "message['content'] + '<|im_end|>\n'}}"
+                    "{% endfor %}"
+                    "{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}"
+                )
+
         # 2. Extract multi-EOS and sampling defaults from generation_config.json if present
         from ayaka.model_loader.source import (
             load_generation_config,

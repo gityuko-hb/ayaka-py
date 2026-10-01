@@ -2,7 +2,9 @@
 
 ## Project Structure & Module Organization
 
-Ayaka is a Python LLM inference engine. Source lives in `python/ayaka/`: `configs/` defines configuration and execution phase policy, `model_loader/` and `weights/` handle checkpoints and weight readiness, `memory/` and `kvcache/` manage storage, while `sched/`, `executor/`, `worker/`, and `runner/` define execution components (phase adapters, graph programs, PDMux lanes). `device/` owns hardware qualification and profiles, `sampling/` owns samplers and speculative acceptance, and `attention/` owns the attention backend contract and scoped forward context. GPU operations live in `kernel/triton/` (the LoRA shrink/expand kernels remain there, but no runtime path calls them); shared helpers belong in `utils/`. Tests live in `tests/`, and contribution templates live in `.github/`. The former `execution/` package has been dissolved into these owners; import dependencies flow `runtime/worker → runner → configs/device/model_loader/attention`.
+Ayaka is a Python LLM inference engine. Source lives in `python/ayaka/`: `configs/` defines configuration and execution phase policy, `model_loader/` and `weights/` handle checkpoints and weight readiness, `memory/` and `kvcache/` manage storage, while `sched/`, `executor/`, `worker/`, and `runner/` define execution components (phase adapters, graph programs, PDMux lanes). `speculative/` owns scheduler-aware transactional speculative decoding and is deliberately its own plane because it cuts across `sched/`, `kvcache/`, `runner/`, and `sampling/`. `device/` owns hardware qualification and profiles, `device_comm/` owns collective policy dispatch and the verified-P2P probe, `sampling/` owns samplers, and `attention/` owns the attention backend contract and scoped forward context. GPU operations live in `kernel/triton/`; shared helpers belong in `utils/`. Tests live in `tests/`, and contribution templates live in `.github/`. The former `execution/` package has been dissolved into these owners; import dependencies flow `runtime/worker → runner → configs/device/model_loader/attention`.
+
+Two kernel subtrees in `kernel/triton/` have no runtime consumer and should not be assumed wired: `moe/` (a complete CUDA→Triton port) and `lora/` (BGMV/SGMV shrink/expand, orphaned after the `lora/` package was removed). Conversely, `kernel/triton/comm/` and `p2p_signal.py` are live — they are imported by `device_comm/`.
 
 ## Build, Test, and Development Commands
 
@@ -15,7 +17,7 @@ Use Python 3.13 and uv from the repository root. Prefix shell commands with `rtk
 - `rtk proxy uv run --no-sync ruff format --check .`: check formatting; omit `--check` to format.
 - `rtk proxy uv run --no-sync pyright .`: check types.
 
-Run sync before the `--no-sync` commands. The declared `ayaka` CLI target is not implemented; use library modules and tests for local development.
+Run sync before the `--no-sync` commands. The `ayaka` CLI is implemented: `python -m ayaka serve` (see `python/ayaka/commands/cli.py`). Use library modules and tests for local development.
 
 ## Coding Style & Naming Conventions
 

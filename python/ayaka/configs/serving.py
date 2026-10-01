@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from ayaka.configs.phase import RequestedOverrides
     from ayaka.configs.speculative import SpeculativeConfig
-    from ayaka.lora.config import LoRAConfig
     from ayaka.speculative.config import SpeculativeDecodingConfig
     from ayaka.worker.execution_lane import ExecutionLaneConfig
 
@@ -71,7 +70,6 @@ class ServingConfig:
     decode_graph: bool | None = None
     graph_buckets: tuple[int, ...] | None = None
     execution: RequestedOverrides | None = None
-    lora: LoRAConfig | None = None
     #: Dense draft-model reference path (golden oracle, one token per step).
     speculative: SpeculativeConfig | None = None
     execution_lanes: ExecutionLaneConfig | None = None
@@ -81,12 +79,9 @@ class ServingConfig:
     def __post_init__(self) -> None:
         from ayaka.configs.phase import RequestedOverrides
         from ayaka.configs.speculative import SpeculativeConfig
-        from ayaka.lora.config import LoRAConfig
         from ayaka.speculative.config import SpeculativeDecodingConfig
         from ayaka.worker.execution_lane import ExecutionLaneConfig
 
-        if self.lora is not None and not isinstance(self.lora, LoRAConfig):
-            raise TypeError("lora must be LoRAConfig or None")
         if self.speculative is not None and not isinstance(self.speculative, SpeculativeConfig):
             raise TypeError("speculative must be SpeculativeConfig or None")
         if self.speculative_decoding is not None and not isinstance(
@@ -95,19 +90,11 @@ class ServingConfig:
             raise TypeError("speculative_decoding must be SpeculativeDecodingConfig or None")
         if self.speculative is not None and self.speculative_decoding is not None:
             raise ValueError("the reference and production speculative paths are exclusive")
-        if (self.speculative is not None or self.speculative_decoding is not None) and (
-            self.lora is not None
-        ):
-            raise ValueError("speculative x LoRA is not certified")
         if self.execution_lanes is not None:
             if not isinstance(self.execution_lanes, ExecutionLaneConfig):
                 raise TypeError("execution_lanes must be ExecutionLaneConfig or None")
-            if (
-                self.speculative is not None
-                or self.speculative_decoding is not None
-                or self.lora is not None
-            ):
-                raise ValueError("PDMux x LoRA/speculative is not certified")
+            if self.speculative is not None or self.speculative_decoding is not None:
+                raise ValueError("PDMux x speculative is not certified")
 
         if self.decode_graph is not None and type(self.decode_graph) is not bool:
             raise TypeError("decode_graph must be boolean or None")

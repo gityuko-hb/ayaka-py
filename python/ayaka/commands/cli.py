@@ -80,7 +80,15 @@ def main(argv=None) -> None:
     from ayaka.models.qwen3 import Qwen3Config, Qwen3ForCausalLM, load_qwen3_weights
     from ayaka.runtime.serving import ServingRuntime
 
-    values = json.loads((args.model_path / "config.json").read_text(encoding="utf-8"))
+    model_path = Path(os.path.expandvars(str(args.model_path))).expanduser().resolve()
+    tokenizer_path = (
+        Path(os.path.expandvars(str(args.tokenizer))).expanduser().resolve()
+        if args.tokenizer is not None
+        else model_path
+    )
+    if not (model_path / "config.json").is_file():
+        parser.error(f"model_path does not contain config.json: {model_path}")
+    values = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
     model_type = values.get("model_type")
     dtype = getattr(
         torch, args.dtype or ("float16" if args.device.startswith("cuda") else "float32")
@@ -90,32 +98,32 @@ def main(argv=None) -> None:
         model = QwenForCausalLM(
             QwenConfig.from_dict(values), device=args.device, dtype=dtype, backend=backend
         )
-        load_qwen_weights(model, args.model_path)
+        load_qwen_weights(model, model_path)
     elif model_type == "qwen3":
         model = Qwen3ForCausalLM(
             Qwen3Config.from_dict(values), device=args.device, dtype=dtype, backend=backend
         )
-        load_qwen3_weights(model, args.model_path)
+        load_qwen3_weights(model, model_path)
     elif model_type == "qwen2":
         model = Qwen2ForCausalLM(
             Qwen2Config.from_dict(values), device=args.device, dtype=dtype, backend=backend
         )
-        load_qwen2_weights(model, args.model_path)
+        load_qwen2_weights(model, model_path)
     elif model_type == "gpt2":
         model = GPT2ForCausalLM(
             GPT2Config.from_dict(values), device=args.device, dtype=dtype, backend=backend
         )
-        load_gpt2_weights(model, args.model_path)
+        load_gpt2_weights(model, model_path)
     elif model_type == "phi":
         model = PhiForCausalLM(
             PhiConfig.from_dict(values), device=args.device, dtype=dtype, backend=backend
         )
-        load_phi_weights(model, args.model_path)
+        load_phi_weights(model, model_path)
     elif model_type == "llama":
         model = LlamaForCausalLM(
             LlamaConfig.from_dict(values), device=args.device, dtype=dtype, backend=backend
         )
-        load_llama_weights(model, args.model_path)
+        load_llama_weights(model, model_path)
     else:
         parser.error(
             "this native runner currently supports model_type in "
@@ -133,7 +141,7 @@ def main(argv=None) -> None:
             parser.error("--graph-buckets must contain positive integers")
     runtime = ServingRuntime(
         model,
-        args.tokenizer or args.model_path,
+        tokenizer_path,
         config=ServingConfig(
             model=args.served_model_name,
             api_keys=tuple(k.strip() for k in keys.split(",") if k.strip()),
