@@ -247,11 +247,46 @@ class HfTokenizer:
             use_fast=config.mode != "slow",
         )
 
+        from ayaka.model_loader.source import optional_hf_file
+
+        # 0. Sync missing added tokens from tokenizer.json if present
+        # Handles checkpoints (e.g. Qwen3) where tokenizer_config.json's added_tokens_decoder
+        # is out of sync with tokenizer.json (e.g. omitting <think> or <tool_response>).
+        tok_json_path = optional_hf_file(
+            config.tokenizer,
+            "tokenizer.json",
+            revision=config.revision,
+            cache_dir=config.download_dir,
+        )
+        if tok_json_path and os.path.isfile(tok_json_path):
+            try:
+                with open(tok_json_path, encoding="utf-8") as f:
+                    tok_json_data = json.load(f)
+                added = tok_json_data.get("added_tokens", [])
+                if added:
+                    from transformers import AddedToken
+
+                    existing_vocab_values = set(tok.get_vocab().values())
+                    missing = [
+                        AddedToken(
+                            t["content"],
+                            rstrip=t.get("rstrip", False),
+                            lstrip=t.get("lstrip", False),
+                            single_word=t.get("single_word", False),
+                            normalized=t.get("normalized", False),
+                            special=t.get("special", False),
+                        )
+                        for t in sorted(added, key=lambda x: x.get("id", 0))
+                        if t.get("id") not in existing_vocab_values
+                    ]
+                    if missing:
+                        tok.add_tokens(missing)
+            except Exception:
+                pass
+
         # 1. Fallback for models (e.g. Mistral) storing chat_template
         # in a separate chat_template.json
         if not getattr(tok, "chat_template", None):
-            from ayaka.model_loader.source import optional_hf_file
-
             template_path = optional_hf_file(
                 config.tokenizer,
                 "chat_template.json",
@@ -347,6 +382,8 @@ class HfTokenizer:
 
         self._vocab: dict[str, int] = dict(tok.get_vocab())
         self._added: dict[str, int] = dict(tok.get_added_vocab())
+        if self._added:
+            self._vocab.update(self._added)
 
         # Use the tokenizer's own vocab_size attribute (logical size from the
         # model config) rather than len(get_vocab()), which includes added
@@ -750,7 +787,10 @@ class HfTokenizer:
 
     def get_vocab(self) -> dict[str, int]:
         """Return the full token-string → token-ID mapping (including added tokens)."""
-        return dict(self._vocab)
+        vocab = dict(self._vocab)
+        if self._added:
+            vocab.update(self._added)
+        return vocab
 
     def get_added_vocab(self) -> dict[str, int]:
         """Return only the tokens added after the base vocabulary was built."""
