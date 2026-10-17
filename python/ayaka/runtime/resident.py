@@ -396,6 +396,10 @@ class ResidentKVEngine(Engine):
     def submit(self, request: Request, *, defer_to_remote_kv: bool = False) -> RequestLifecycle:
         if self._closing:
             raise RuntimeError("resident engine is closing")
+        if (request.reasoning_budget is not None or request.suppressed_token_ids) and not getattr(
+            self.executor.runner, "supports_generation_controls", False
+        ):
+            raise ValueError("this runner does not implement request generation controls")
         prepare = getattr(self.executor.runner, "prepare_request", None)
         if prepare is not None:
             prepare(request)

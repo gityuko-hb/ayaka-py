@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import NewType
 
+from ayaka.generation.controls import ReasoningBudget
 from ayaka.request.input import ConstraintSpec, MultimodalEmbedding
 from ayaka.sampling.params import SamplingParams
 from ayaka.utils.validation import require_frozen, require_int, require_text
@@ -75,11 +76,21 @@ class Request:
     # every span the request produces.
     trace_id: str | None = None
 
+    # Optional generation controls, enforced at every paged-runner selection.
+    reasoning_budget: ReasoningBudget | None = None
+    suppressed_token_ids: tuple[int, ...] = ()
+
     def __post_init__(self) -> None:
         require_frozen(self, "request")
         require_text(self.request_id, "request_id")
         for token in self.prompt_token_ids:
             require_int(token, "prompt token id")
+        for token in self.suppressed_token_ids:
+            require_int(token, "suppressed token id")
+        if self.reasoning_budget is not None and not isinstance(
+            self.reasoning_budget, ReasoningBudget
+        ):
+            raise TypeError("reasoning_budget must be ReasoningBudget")
         previous_end = 0
         for embedding in self.multimodal:
             if (

@@ -30,7 +30,7 @@ from ayaka.sched.plan import PreparedStep, RequestStepInput
 from ayaka.types import MaskKind
 
 
-def require_plain_greedy(request: Request) -> None:
+def require_plain_greedy(request: Request, *, allow_generation_controls: bool = False) -> None:
     """Reject unsupported sampling before admission, not after a mutating forward."""
     p = request.sampling
     if (
@@ -45,6 +45,10 @@ def require_plain_greedy(request: Request) -> None:
         or p.return_sampling_support
         or request.constraint is not None
         or request.multimodal
+        or (
+            not allow_generation_controls
+            and (request.reasoning_budget is not None or request.suppressed_token_ids)
+        )
     ):
         raise ValueError("EP3 speculative/PDMux serving requires plain greedy text requests")
 

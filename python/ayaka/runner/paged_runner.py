@@ -246,6 +246,8 @@ class PagedModelRunner(DenseModelRunner):
     ResidentKVExecutor, which orders COW and owns the stream and completion fence.
     """
 
+    supports_generation_controls = True
+
     def __init__(
         self,
         coordinator: SamplingCoordinator,
@@ -313,6 +315,9 @@ class PagedModelRunner(DenseModelRunner):
         self._request_source: Callable[[str], RequestLifecycle] | None = None
         self._request_ir: dict[str, Request] = {}
         self.constraints: GrammarConstraints | None = None
+        from ayaka.generation.adapter import GenerationControls
+
+        self._generation_controls = GenerationControls(model.config.vocab_size)
         self._graph_pool: DecodeGraphPool | None = None
         self._graph_config: DecodeGraphConfig | None = None
         self._graph_capture_leases: dict[int, RunnerBufferLease] = {}
@@ -393,14 +398,23 @@ class PagedModelRunner(DenseModelRunner):
             for embedding in request.multimodal:
                 if any(len(row) != self._model.config.hidden_size for row in embedding.rows):
                     raise ValueError("embedding width disagrees with model")
+        if request.reasoning_budget is not None and self._request_source is None:
+            raise ValueError("reasoning budget requires a bound publication source")
+        self._generation_controls.register(request)
         if request.constraint is not None:
             if self.constraints is None or self._request_source is None:
+                self._generation_controls.forget(str(request.request_id))
                 raise ValueError("structured decoding requires a bound grammar compiler")
-            self.constraints.register(str(request.request_id), request.constraint)
+            try:
+                self.constraints.register(str(request.request_id), request.constraint)
+            except Exception:
+                self._generation_controls.forget(str(request.request_id))
+                raise
         self._request_ir[str(request.request_id)] = request
 
     def forget_request(self, request_id: str) -> None:
         self._request_ir.pop(request_id, None)
+        self._generation_controls.forget(request_id)
         if self.constraints is not None:
             self.constraints.forget(request_id)
 
@@ -813,6 +827,13 @@ class PagedModelRunner(DenseModelRunner):
                 self.constraints.apply(
                     scheduled.request_id, lifecycle.output_token_ids, logits[row]
                 )
+            if self._generation_controls.contains(scheduled.request_id):
+                published = (
+                    ()
+                    if self._request_source is None
+                    else self._request_source(scheduled.request_id).output_token_ids
+                )
+                self._generation_controls.apply(scheduled.request_id, published, logits[row])
             row += 1
 
     def enable_speculative_decoding(self) -> None:

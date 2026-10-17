@@ -84,7 +84,7 @@ class ModelRunner(PagedModelRunner):
         if self.speculative_runner is not None or self.plain_greedy:
             from ayaka.runner.speculative_runner import require_plain_greedy
 
-            require_plain_greedy(request)
+            require_plain_greedy(request, allow_generation_controls=self.speculative_runner is None)
             if (
                 self.speculative_runner is not None
                 and request.max_total_len
