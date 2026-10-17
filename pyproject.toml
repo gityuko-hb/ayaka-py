@@ -55,6 +55,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+grammar = ["llguidance>=1.9.1,<2"]
 cuda = [
     "torch>=2.12",
     "triton>=3.8,<3.9; sys_platform == 'linux'",
@@ -160,3 +161,4 @@ test = ["psutil>=7.2.2"]
     "csrc/**/*.hpp",
 ]
 "ayaka.serving" = ["*.proto", "*.md"]
+
