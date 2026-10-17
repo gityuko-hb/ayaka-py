@@ -49,7 +49,14 @@ def request_disable_reason(
         or params.return_sampling_support
     ):
         return SpecDisableReason.LOGPROBS
-    if request.constraint is not None:
+    # Stateful generation controls also need a mask for every tentative row.
+    # The current verifier consumes only the base row's mask; keep these on
+    # ordinary decoding until the extension-row mask path is implemented.
+    if (
+        request.constraint is not None
+        or request.reasoning_budget is not None
+        or request.suppressed_token_ids
+    ):
         return SpecDisableReason.GRAMMAR
     if request.stop.stop_strings:
         return SpecDisableReason.STOP_STRINGS

@@ -72,6 +72,7 @@ năng cấp phát; completion xác nhận kết quả trước khi trả tài ng
 | [memory/](python/ayaka/memory/), [kvcache/](python/ayaka/kvcache/), [prefix/](python/ayaka/prefix/) | Allocation, KV storage/tiering/retention và prefix reuse. |
 | [attention/](python/ayaka/attention/), [sampling/](python/ayaka/sampling/) | Backend contract, forward context, sampler, penalties và constraints. |
 | [speculative/](python/ayaka/speculative/) | Proposer, policy, verifier, acceptance và speculative transaction. |
+| [generation/](python/ayaka/generation/README.md) | Bản chuyển Rust: staged generation, reasoning budget, suppression, draft state và adapter cho paged runner. |
 | [device/](python/ayaka/device/), [device_comm/](python/ayaka/device_comm/), [distributed/](python/ayaka/distributed/) | Capability phần cứng, collective policy và phối hợp nhiều rank/replica. |
 | [kernel/triton/](python/ayaka/kernel/triton/), [kernel/csrc/](python/ayaka/kernel/csrc/) | GPU kernels, PyTorch reference kernels và native IPC extension. |
 | [tokenizers/](python/ayaka/tokenizers/), [utils/](python/ayaka/utils/) | Tokenization/detokenization, stop checking và helper dùng chung. |
@@ -156,6 +157,9 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   [SamplingParams](python/ayaka/sampling/params.py) và
   [SpeculativeDecodingConfig](python/ayaka/speculative/config.py) là các điểm vào cấu hình
   serving, sampling và n-gram speculation.
+- [Generation](python/ayaka/generation/README.md) cung cấp API điều khiển độc lập với device.
+  `Request.reasoning_budget` và `suppressed_token_ids` đã được nối vào paged runner;
+  state machine MTP/DFlash cần numerical backend trước khi bật trong serving.
 
 ## Phát triển và kiểm tra
 

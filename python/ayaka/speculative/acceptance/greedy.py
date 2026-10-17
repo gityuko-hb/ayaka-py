@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 
 import torch
+
+from ayaka.generation.acceptance import accept_prefix
 
 __all__ = ["Acceptance", "accept_greedy", "greedy_accept"]
 
@@ -17,7 +20,9 @@ class Acceptance:
     accepted: int
 
 
-def accept_greedy(candidates: tuple[int, ...], target_tokens: tuple[int, ...]) -> Acceptance:
+def accept_greedy(
+    candidates: tuple[int, ...], target_tokens: tuple[int, ...], *, stops: Collection[int] = ()
+) -> Acceptance:
     """Accept the longest equal prefix, then emit target correction or bonus.
 
     This is the golden oracle for :func:`greedy_accept`; it never touches a
@@ -25,11 +30,7 @@ def accept_greedy(candidates: tuple[int, ...], target_tokens: tuple[int, ...]) -
     """
     if len(target_tokens) != len(candidates) + 1:
         raise ValueError("verification needs candidate rows plus a bonus row")
-    accepted = 0
-    for draft, target in zip(candidates, target_tokens, strict=False):
-        if draft != target:
-            break
-        accepted += 1
+    accepted = accept_prefix(candidates, target_tokens, stops)
     return Acceptance((*candidates[:accepted], target_tokens[accepted]), accepted)
 
 

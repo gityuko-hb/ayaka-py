@@ -45,6 +45,10 @@ class PrefillDecodeMultiplexer:
         self.flights: dict[object, _Flight] = {}
         self.closed = False
         prefill._request_ir = decode._request_ir
+        # The closing prefill selection and later decode selections must
+        # share one request-local generation control owner.
+        if getattr(decode, "supports_generation_controls", False):
+            prefill._generation_controls = decode._generation_controls
         for lane in self.lanes.values():
             lane.runner.plain_greedy = True
             # Reuse the scheduler's existing separate-phase admission path.
