@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -14,7 +14,7 @@ from ayaka.plan import SamplingPlan
 from ayaka.sampling.executor import apply_custom_ops
 from ayaka.sampling.mask.arena import MaskHandle
 from ayaka.sampling.mask.pipeline import MaskEntry
-from ayaka.sampling.mask.producer import MaskProducer
+from ayaka.sampling.mask.producer import MaskProducer, MaskRows
 from ayaka.sampling.metadata import SamplingMetadata
 from ayaka.sampling.ops import penalties as _pen
 from ayaka.sampling.ops.penalties import PenaltyState, apply_bias_, apply_penalties_
@@ -94,6 +94,28 @@ class SamplerOutput:
 
     token_ids: torch.Tensor
     stats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+
+class _AllowAllMaskProducer:
+    """Identity rows for unconstrained requests in a mixed constrained batch."""
+
+    caps = Cap.SPEC_VERIFIABLE | Cap.ARGMAX_INVARIANT | Cap.COMMUTATIVE
+
+    def density_hint(self) -> int | None:
+        return None
+
+    def committed_len(self) -> int:
+        return 0
+
+    def commit(self, tokens: Sequence[int]) -> None:
+        pass
+
+    def emit(self, draft: Sequence[int], out: MaskRows) -> int:
+        if out.n_rows != len(draft) + 1:
+            raise ValueError("identity mask window does not match draft")
+        for i in range(out.n_rows):
+            out.allow_all(i)
+        return len(draft)
 
 
 class SamplingPlanner:
@@ -183,13 +205,17 @@ class SamplingPlanner:
         mask_row = 0
         scratch_row = 0  # Secondary entries allocated after the primary block.
         argmax_invariant = True
-        for slot in sorted(self._producers):
-            if slot >= md.n_active:
-                continue
+        active_slots = md.active_rows
+        if active_slots is None:
+            active_slots = tuple(range(md.n_active))
+        has_constraints = any(slot in self._producers for slot in active_slots)
+        for packed_row, slot in enumerate(active_slots):
+            if not has_constraints:
+                break
             draft = drafts.get(slot, ())
             if draft and len(draft) > 0:
                 # Reject speculative draft tokens if any attached producer lacks SPEC_VERIFIABLE.
-                for producer in self._producers[slot]:
+                for producer in self._producers.get(slot, ()):
                     caps = getattr(producer, "caps", Cap.NONE)
                     if not caps & Cap.SPEC_VERIFIABLE:
                         raise CapabilityError(
@@ -203,16 +229,16 @@ class SamplingPlanner:
                                 "hỗ trợ speculative verification"
                             ),
                         )
-            producers = self._producers[slot]
+            producers = self._producers.get(slot) or [_AllowAllMaskProducer()]
             commit_tokens = commits.get(slot, ())
             for order, producer in enumerate(producers):
                 span = len(draft) + 1
                 if order == 0:
                     entry = MaskEntry(
                         producer=producer,
-                        logits_row=slot,
+                        logits_row=packed_row,
                         mask_row=mask_row,
-                        stream_idx=slot,
+                        stream_idx=packed_row,
                         propose_step=len(draft),
                         draft=draft,
                         commit_tokens=commit_tokens,
@@ -221,9 +247,9 @@ class SamplingPlanner:
                 else:
                     entry = MaskEntry(
                         producer=producer,
-                        logits_row=slot,
-                        mask_row=(mask_row + scratch_row),
-                        stream_idx=slot,
+                        logits_row=packed_row,
+                        mask_row=scratch_row,
+                        stream_idx=packed_row,
                         propose_step=len(draft),
                         draft=draft,
                         commit_tokens=commit_tokens,
@@ -234,6 +260,12 @@ class SamplingPlanner:
                 if not getattr(producer, "caps", Cap.NONE) & Cap.ARGMAX_INVARIANT:
                     argmax_invariant = False
 
+        # Scratch windows start after the complete primary block, including
+        # primary entries belonging to later slots.
+        entries = [
+            replace(entry, mask_row=mask_row + entry.mask_row) if entry.scratch else entry
+            for entry in entries
+        ]
         schedule = MaskSchedule(entries=tuple(entries))
         plan = SamplingPlan(
             num_rows=md.n_active,

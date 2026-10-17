@@ -37,13 +37,16 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
+import numpy as np
 import torch
 
 from ayaka.device.spec import CommOpType
 from ayaka.plan import SamplingPlan
 from ayaka.sampling.logprobs import MODE_ORDINALS, LogprobMode
+from ayaka.sampling.mask.arena import MaskHandle
+from ayaka.sampling.mask.producer import MaskRows
 from ayaka.sampling.metadata import SamplingMetadata
 from ayaka.sampling.ops.penalties import BiasState, PenaltyState
 from ayaka.sampling.ops.sampling import (
@@ -53,9 +56,13 @@ from ayaka.sampling.ops.sampling import (
     greedy_support_output,
 )
 from ayaka.sampling.params import SamplingParams
-from ayaka.sampling.plan import SamplingPlanner, create_sampler
+from ayaka.sampling.plan import MaskSchedule, SamplingPlanner, create_sampler
 from ayaka.sampling.trace import trace_sampler
 from ayaka.utils.import_utils import CapabilityError
+
+if TYPE_CHECKING:
+    from ayaka.grammar import Grammar, Vocabulary
+    from ayaka.grammar.adapter import GBNFMaskProducer
 
 __all__ = ["SamplingCoordinator"]
 
@@ -103,6 +110,8 @@ class SamplingCoordinator:
         "_comm",
         "_custom_ops",
         "_free_slots",
+        "_grammar_producers",
+        "_mask_schedule",
         "_ids_logprobs",
         "_next_slot",
         "_request_to_slot",
@@ -173,6 +182,8 @@ class SamplingCoordinator:
         self._ids_logprobs: dict[str, tuple[int, ...]] = {}
         self._free_slots: list[int] = []
         self._next_slot = 0
+        self._grammar_producers: dict[int, GBNFMaskProducer] = {}
+        self._mask_schedule: tuple[SamplingPlan, MaskSchedule] | None = None
 
     # ------------------------------------------------------------------
     # Slot registry (called by the scheduler)
@@ -197,6 +208,7 @@ class SamplingCoordinator:
                 f"request {request_id!r} already owns sampling slot "
                 f"{self._request_to_slot[request_id]}"
             )
+        self._mask_schedule = None
         slot = self._allocate()
         self._request_to_slot[request_id] = slot
         self.md.write_slot(slot, params, request_index=request_index)
@@ -218,13 +230,45 @@ class SamplingCoordinator:
         slot = self._request_to_slot.pop(request_id, None)
         if slot is None:
             return None
+        self._mask_schedule = None
         self.penalty_state.reset(slot)
         self.bias_state.reset(slot)
         self._ids_logprobs.pop(request_id, None)
         self.planner.detach(slot)
+        self._grammar_producers.pop(slot, None)
         self.md.reset_slot(slot)
         self._free_slots.append(slot)
         return slot
+
+    def attach_grammar(
+        self,
+        request_id: str,
+        vocabulary: Vocabulary,
+        grammar: Grammar | str,
+        *,
+        prefix: Sequence[int] = (),
+    ) -> GBNFMaskProducer:
+        """Bind GBNF to an admitted request before its next plan is built.
+
+        Supply exact tokenizer bytes and the model's full logits width through
+        Vocabulary. Each request owns independent parser state. Install on every
+        TP rank; published tokens advance the grammar only after completion.
+        This engine path handles ordinary decoding. Speculative owners can use
+        GBNFMaskProducer directly with MaskPipeline's draft/rollback protocol.
+        """
+        from ayaka.grammar import compile
+        from ayaka.grammar.adapter import GBNFMaskProducer
+
+        slot = self._slot_for(request_id)
+        if slot in self._grammar_producers:
+            raise ValueError(f"request {request_id!r} already has a grammar")
+        if isinstance(grammar, str):
+            grammar = compile(grammar).grammar
+        producer = GBNFMaskProducer(vocabulary.bind(grammar, prefix))
+        self.planner.attach(slot, producer)
+        self._grammar_producers[slot] = producer
+        self._mask_schedule = None
+        return producer
 
     def slot_of(self, request_id: str) -> int | None:
         return self._request_to_slot.get(request_id)
@@ -266,7 +310,8 @@ class SamplingCoordinator:
         rows = [self._slot_for(slice_.request_id) for slice_ in slices if slice_.sample_last_query]
         self.md.set_active_rows(rows)
         try:
-            plan, _schedule = self.planner.build(self.md, custom_ops=self._custom_ops)
+            plan, schedule = self.planner.build(self.md, custom_ops=self._custom_ops)
+            self._mask_schedule = (plan, schedule)
             if plan.num_rows != len(rows):
                 raise RuntimeError(
                     f"sampling plan has {plan.num_rows} rows but {len(rows)} slices sample"
@@ -326,11 +371,55 @@ class SamplingCoordinator:
                 "the runner must gather logits into packed sampling order"
             )
         trace_sampler("coordinator_flush_done", rows=plan.num_rows)
-        output = self.sampler(logits, self.md, plan, None, force_reference=force_reference)
+        mask = self._materialize_masks(logits, plan)
+        output = self.sampler(logits, self.md, plan, mask, force_reference=force_reference)
+        if mask is not None:
+            self._sync_token_ids(output.token_ids, grammar_active=True)
         self.md.step_rng()
         trace_sampler("coordinator_rng_stepped")
         support = self._capture_support(logits, output.token_ids, plan)
         return output.token_ids, support
+
+    def _materialize_masks(self, logits: torch.Tensor, plan: SamplingPlan) -> MaskHandle | None:
+        """Materialize the frozen ordinary-decode schedule on the caller's stream.
+
+        CPU grammar work and a synchronous device copy stay outside model CUDA
+        graphs. This correctness path allocates per step; no async arena lifetime
+        or graph-capture performance guarantee is made.
+        """
+        if self._grammar_producers and (
+            self._mask_schedule is None or self._mask_schedule[0] is not plan
+        ):
+            raise ValueError("grammar sampling requires a fresh plan_for() result")
+        if not plan.any_mask:
+            return None
+        if self._mask_schedule is None or self._mask_schedule[0] is not plan:
+            raise ValueError("masked sampling requires the latest plan_for() result")
+        schedule = self._mask_schedule[1]
+        schedule.require_match(plan)
+        width = logits.size(1)
+        words = (width + 31) // 32
+        merged: dict[int, np.ndarray] = {}
+        for entry in schedule.entries:
+            if entry.propose_step or entry.draft or entry.commit_tokens:
+                raise ValueError("coordinator mask path requires ordinary decoding")
+            buffer = np.zeros((1, words), dtype=np.uint32)
+            entry.producer.emit((), MaskRows(buffer, width))
+            if entry.logits_row in merged:
+                merged[entry.logits_row] &= buffer[0]
+            else:
+                merged[entry.logits_row] = buffer[0].copy()
+        if not merged or any(not row.any() for row in merged.values()):
+            raise ValueError("constraint intersection has no usable continuation")
+        indices = sorted(merged)
+        masks = np.stack([merged[i] for i in indices]).view(np.int32)
+        return MaskHandle(
+            masks=torch.from_numpy(masks).to(logits.device),
+            row_indices=torch.tensor(indices, dtype=torch.int32, device=logits.device),
+            n_rows=len(indices),
+            vocab_size=width,
+            caps=schedule.caps,
+        )
 
     def _capture_support(
         self,
@@ -435,6 +524,8 @@ class SamplingCoordinator:
                     f"published token for {item.request_id!r} but the request no longer "
                     "owns a sampling slot; record before terminal settlement"
                 )
+            if slot in self._grammar_producers:
+                self._grammar_producers[slot].commit((int(item.token_id),))
             self.penalty_state.record(slot, (int(item.token_id),))
 
     def logprob_k_for(self, request_id: str) -> int | None:
