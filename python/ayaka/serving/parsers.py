@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator, ValidationError
@@ -22,7 +23,8 @@ class OutputParser:
 
     Tool arguments are emitted after the closing delimiter, so escaped strings,
     arbitrary chunk boundaries and malformed JSON can never create revised deltas.
-    A length-limited unfinished tool is an explicit error.
+    At an output-length cutoff, completed calls survive and an unfinished
+    trailing call is discarded. Other malformed completions are errors.
     """
 
     def __init__(
@@ -132,7 +134,7 @@ class OutputParser:
         self._enforce_bound()
         return events
 
-    def finish(self):
+    def finish(self, *, truncated: bool = False):
         """Flush the parser exactly once; later calls return no events.
 
         A first call that raises :class:`ParserError` still consumes the
@@ -149,14 +151,35 @@ class OutputParser:
                 if not isinstance(calls, list) or not calls:
                     raise ValueError("missing tool calls")
             except (ValueError, KeyError, TypeError) as exc:
-                raise ParserError("incomplete or invalid constrained tool output") from exc
+                if not truncated:
+                    raise ParserError("incomplete or invalid constrained tool output") from exc
+                # The constrained envelope may end inside its final call. Recover
+                # only complete JSON array elements; never guess partial arguments.
+                prefix = re.match(r'^\s*\{\s*"tool_calls"\s*:\s*\[', self.buffer)
+                calls = []
+                if prefix is not None:
+                    remaining = self.buffer[prefix.end() :].lstrip()
+                    decoder = json.JSONDecoder()
+                    while remaining:
+                        try:
+                            call, end = decoder.raw_decode(remaining)
+                        except ValueError:
+                            break
+                        calls.append(call)
+                        remaining = remaining[end:].lstrip()
+                        if not remaining.startswith(","):
+                            break
+                        remaining = remaining[1:].lstrip()
             events = []
             for call in calls:
                 events.extend(self._call(call))
             self.buffer = ""
             return events
         if self.mode == "tool":
-            raise ParserError("incomplete tool call at end of generation")
+            if not truncated:
+                raise ParserError("incomplete tool call at end of generation")
+            self.buffer = ""
+            return []
         tail, self.buffer = self.buffer, ""
         if not tail:
             return []

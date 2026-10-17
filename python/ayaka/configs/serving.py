@@ -50,7 +50,7 @@ class ServingConfig:
     api_keys: tuple[str, ...] = ()
     max_concurrent_requests: int = 0
     max_admitted_requests: int = 0
-    max_request_bytes: int = 4 << 20
+    max_request_bytes: int = 32 << 20
     max_request_chunks: int = 4096
     max_stream_events: int = 128
     max_stream_bytes: int = 1 << 20

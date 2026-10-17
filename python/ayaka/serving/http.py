@@ -25,6 +25,8 @@ from ayaka.serving.protocol import (
     openai_stream,
     responses_stream,
 )
+from ayaka.serving.protocols.engine import AyakaModels
+from ayaka.serving.protocols.router import create_router
 
 
 def error_response(exc: ServingError, path: str):
@@ -32,7 +34,7 @@ def error_response(exc: ServingError, path: str):
     if exc.detail:
         error["detail"] = exc.detail
     payload = {"error": error}
-    if path.startswith("/v1/messages"):
+    if path.startswith(("/v1/messages", "/anthropic/v1/messages")):
         error_type = {
             400: "invalid_request_error",
             401: "authentication_error",
@@ -57,7 +59,7 @@ class AccessMiddleware:
             self.stats.record_rejection(reason)
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
         path = scope["path"]
         headers = dict(scope["headers"])
@@ -66,7 +68,7 @@ class AccessMiddleware:
             authorization = headers.get(b"authorization", b"").decode("latin-1")
             supplied = authorization[7:] if authorization.lower().startswith("bearer ") else ""
             # Anthropic SDK normally uses x-api-key.
-            if not supplied and path.startswith("/v1/messages"):
+            if not supplied and path.startswith(("/v1/messages", "/anthropic/v1/messages")):
                 supplied = headers.get(b"x-api-key", b"").decode("latin-1")
             valid = False
             for key in self.config.api_keys:
@@ -75,10 +77,17 @@ class AccessMiddleware:
                 from ayaka.serving.errors import AuthenticationError
 
                 self._reject("auth")
+                if scope["type"] == "websocket":
+                    await send(
+                        {"type": "websocket.close", "code": 1008, "reason": "invalid API key"}
+                    )
+                    return
                 response = error_response(AuthenticationError("invalid API key"), path)
                 return await response(scope, receive, send)
             tenant = hashlib.sha256(supplied.encode()).hexdigest()
         scope.setdefault("state", {})["tenant"] = tenant
+        if scope["type"] == "websocket":
+            return await self.app(scope, receive, send)
         messages, size = [], 0
         if scope["method"] == "POST":
             while True:
@@ -363,29 +372,16 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
         finally:
             pipeline.release(handle)
 
-    @app.post("/v1/chat/completions")
-    async def chat(request: Request):
-        return await generate(request, "chat")
-
     @app.post("/v1/completions")
     async def completions(request: Request):
         return await generate(request, "completion")
 
-    @app.post("/v1/messages")
-    async def messages(request: Request):
-        return await generate(request, "anthropic")
-
-    @app.post("/v1/responses")
-    async def responses(request: Request):
-        return await generate(request, "responses")
-
-    @app.post("/v1/messages/count_tokens")
-    async def count_tokens(request: Request):
-        body = await _body(request)
-        # Count the exact rendered prompt, without scheduling model execution.
-        body["max_tokens"] = 1
-        spec = _normalize(body, "anthropic")
-        prepared = await asyncio.to_thread(processor.prepare, spec, request.state.tenant)
-        return {"input_tokens": prepared.prompt_len}
+    app.include_router(
+        create_router(
+            AyakaModels(pipeline, processor),
+            max_request_bytes=processor.config.max_request_bytes,
+            max_request_chunks=processor.config.max_request_chunks,
+        )
+    )
 
     return app
