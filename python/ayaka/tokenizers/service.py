@@ -206,6 +206,38 @@ class TokenizerService:
             raise RuntimeError("blocking encode must not run from a completion callback")
         return self.submit(value, options, cancellation=cancellation).result()
 
+    def render_prompt(self, value: TextInput | ChatInput | TemplateInput) -> str:
+        """Render with the same adapter lock and bounded host admission as encoding."""
+        weight = self._weight(value)
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("tokenizer service is closed")
+            if (
+                self._pending >= self.config.encode_max_pending
+                or self._pending_bytes + weight > self.config.encode_max_pending_bytes
+            ):
+                raise TokenizerOverloaded("tokenizer input capacity exhausted")
+            self._pending += 1
+            self._pending_bytes += weight
+        try:
+            with self._adapter_lock:
+                if self.tokenizer is None or not self.loaded.capabilities.text_encode:
+                    raise ValueError("loaded tokenizer cannot render text")
+                if (
+                    isinstance(value, (ChatInput, TemplateInput))
+                    and not self.loaded.capabilities.chat
+                ):
+                    raise ValueError("loaded tokenizer does not support chat templates")
+                text, _ = self._render(value)
+                if len(text.encode()) > self.config.encode_max_pending_bytes:
+                    raise TokenizerOverloaded("rendered prompt exceeds input budget")
+                return text
+        finally:
+            with self._cv:
+                self._pending -= 1
+                self._pending_bytes -= weight
+                self._cv.notify_all()
+
     async def encode_async(
         self,
         value: EncodeInput,
@@ -297,7 +329,9 @@ class TokenizerService:
         assert self.tokenizer is not None
         if isinstance(value, TemplateInput):
             return self.tokenizer.apply_chat_template(
-                json.loads(value.messages_json), tools=json.loads(value.tools_json)
+                json.loads(value.messages_json),
+                tools=json.loads(value.tools_json),
+                add_generation_prompt=value.add_generation_prompt,
             ), False
         return self.tokenizer.apply_chat_template(
             [{"role": m.role, "content": m.content} for m in value.messages],

@@ -50,7 +50,7 @@ class GenerationSpec(BaseModel):
     model: str
     prompt: str | list[int] | None = None
     messages: list[dict] | None = None
-    max_tokens: int = Field(default=128, ge=1)
+    max_tokens: int | None = Field(default=128, ge=1)
     min_tokens: int = Field(default=0, ge=0)
     temperature: float = Field(default=1.0, ge=0)
     top_p: float = Field(default=1.0, gt=0, le=1)
@@ -64,6 +64,7 @@ class GenerationSpec(BaseModel):
     stop: str | list[str] | None = None
     stop_token_ids: list[int] = Field(default_factory=list)
     ignore_eos: bool = False
+    cache_prompt: bool = True
     stream: bool = False
     include_usage: bool = False
     response_format: dict | None = None
@@ -74,7 +75,7 @@ class GenerationSpec(BaseModel):
     def check_values(self):
         if (self.prompt is None) == (self.messages is None):
             raise ValueError("exactly one of prompt or messages is required")
-        if self.min_tokens > self.max_tokens:
+        if self.max_tokens is not None and self.min_tokens > self.max_tokens:
             raise ValueError("min_tokens exceeds max_tokens")
         if self.top_k == 0 or self.top_k < -1:
             raise ValueError("top_k must be -1 or positive")
@@ -249,6 +250,30 @@ class RequestProcessor:
         self.tokenizer, self.config = tokenizer, config
         self._clock = clock or time.monotonic_ns
 
+    def render_source(self, spec: GenerationSpec):
+        """The exact host input used by generation, token counts and template inspection."""
+        constraint = constraint_for(spec)
+        if spec.messages is None:
+            return (
+                TextInput(spec.prompt)
+                if isinstance(spec.prompt, str)
+                else TokenIdsInput(tuple(spec.prompt or ()))
+            )
+        messages = chat_messages(spec.messages)
+        if constraint is not None and constraint.kind == "tool_calls":
+            messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": 'Return only JSON: {"tool_calls":[{"name":"function_name",'
+                    '"arguments":{}}]}. Choose from the supplied functions.',
+                },
+            )
+        return TemplateInput(
+            json.dumps(messages, ensure_ascii=False),
+            json.dumps(spec.tools if spec.tool_choice != "none" else []),
+        )
+
     def prepare(
         self,
         spec: GenerationSpec,
@@ -271,34 +296,14 @@ class RequestProcessor:
             raise UnsupportedFeatureError("structured decoding is disabled")
         if spec.tools and spec.tool_choice == "auto" and self.config.tool_parser == "none":
             raise UnsupportedFeatureError("automatic tools require a configured tool parser")
-        if spec.messages is not None:
-            messages = chat_messages(spec.messages)
-            if constraint is not None and constraint.kind == "tool_calls":
-                messages.insert(
-                    0,
-                    {
-                        "role": "system",
-                        "content": 'Return only JSON: {"tool_calls":[{"name":"function_name",'
-                        '"arguments":{}}]}. Choose from the supplied functions.',
-                    },
-                )
-            source = TemplateInput(
-                json.dumps(messages, ensure_ascii=False),
-                json.dumps(spec.tools if spec.tool_choice != "none" else []),
-            )
-        else:
-            source = (
-                TextInput(spec.prompt)
-                if isinstance(spec.prompt, str)
-                else TokenIdsInput(tuple(spec.prompt or ()))
-            )
+        source = self.render_source(spec)
         namespace = hashlib.sha256(tenant.encode()).hexdigest()
         if timings is not None:
             timings.validation_done_ns = self._clock()
         try:
             encoded = self.tokenizer.encode(
                 source,
-                EncodeOptions(max_output_tokens=spec.max_tokens, cache_namespace=namespace),
+                EncodeOptions(max_output_tokens=spec.max_tokens or 1, cache_namespace=namespace),
                 cancellation=cancellation,
             )
         except TokenizerOverloaded as exc:
@@ -309,6 +314,11 @@ class RequestProcessor:
             raise InvalidRequestError(str(exc)) from exc
         if timings is not None:
             timings.tokenize_done_ns = self._clock()
+        max_tokens = spec.max_tokens
+        if max_tokens is None:
+            max_tokens = self.tokenizer.max_model_len - len(encoded.token_ids)
+        if max_tokens < 1 or spec.min_tokens > max_tokens:
+            raise ContextLengthExceededError("prompt leaves insufficient generation capacity")
         if any(t >= self.tokenizer.model_vocab_size for t in spec.stop_token_ids):
             raise InvalidRequestError("stop token ID exceeds model vocabulary")
         stops = (spec.stop,) if isinstance(spec.stop, str) else tuple(spec.stop or ())
@@ -339,13 +349,15 @@ class RequestProcessor:
                 seed=spec.seed,
             ),
             stop=StopCriteria(
-                max_tokens=spec.max_tokens,
+                max_tokens=max_tokens,
                 min_tokens=spec.min_tokens,
                 stop_strings=stops,
                 stop_token_ids=tuple(spec.stop_token_ids),
                 ignore_eos=spec.ignore_eos,
             ),
-            cache=CacheHints(cache_salt=namespace),
+            cache=CacheHints(
+                cache_salt=namespace, prefix_cache=spec.cache_prompt, store_kv=spec.cache_prompt
+            ),
             tenant_id=tenant,
             constraint=constraint,
             arrival_ns=self._clock(),

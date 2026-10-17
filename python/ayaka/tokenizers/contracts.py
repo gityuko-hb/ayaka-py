@@ -79,8 +79,10 @@ class TemplateInput:
 
     messages_json: str
     tools_json: str = "[]"
+    add_generation_prompt: bool = True
 
     def __post_init__(self) -> None:
+        require_bool(self.add_generation_prompt, "add_generation_prompt")
         if type(self.messages_json) is not str or type(self.tools_json) is not str:
             raise TypeError("template inputs must be JSON strings")
         messages, tools = json.loads(self.messages_json), json.loads(self.tools_json)
@@ -105,7 +107,8 @@ class EncodeOptions:
     cache_namespace: str = ""
 
     def __post_init__(self) -> None:
-        require_int(self.max_output_tokens, "max_output_tokens", minimum=1)
+        # Host-only token counts reserve no output; generation always reserves >= 1.
+        require_int(self.max_output_tokens, "max_output_tokens", minimum=0)
         if self.max_input_tokens is not None:
             require_int(self.max_input_tokens, "max_input_tokens", minimum=1)
         require_bool(self.truncate, "truncate")

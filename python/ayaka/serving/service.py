@@ -465,7 +465,7 @@ class ServingService:
                 "queue_timeout",
             ):
                 try:
-                    for parsed in handle.parser.finish():
+                    for parsed in handle.parser.finish(truncated=status == "length"):
                         if not handle.put(parsed):
                             raise OverloadedError("output consumer is too slow")
                 except Exception as exc:
@@ -486,12 +486,12 @@ class ServingService:
                 finish = (
                     "cancelled"
                     if status in ("abort", "cancelled")
-                    else "tool_call"
-                    if handle.parser.had_tools
                     else "timeout"
                     if status in ("timeout", "queue_timeout")
                     else "length"
                     if status == "length"
+                    else "tool_call"
+                    if handle.parser.had_tools
                     else "stop"
                 )
                 terminal = GenerationFinished(finish, usage)
