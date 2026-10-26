@@ -62,11 +62,20 @@ from ayaka.serving.flush import FlushResult
 from ayaka.serving.http import create_app
 from ayaka.serving.prepare import RequestProcessor
 from ayaka.serving.service import ServingService
+from ayaka.serving.weights import WeightUpdateResult
 from ayaka.tokenizers.service import TokenizerService
 from ayaka.types import AttentionType, DType, MemoryTier
 from ayaka.utils.math_utils import div_ceil
 from ayaka.utils.torch_memory import empty_cache
 from ayaka.utils.validation import require_int
+from ayaka.weights.update import (
+    CheckpointWeightSource,
+    WeightSource,
+    WeightTransactionOutcome,
+    WeightUpdateStatus,
+    apply_weight_transaction,
+    reload_refusal,
+)
 from ayaka.worker.local import LocalWorker
 from ayaka.worker.resources import WorkerResourcePlan, WorkerResources
 
@@ -344,6 +353,8 @@ class ServingRuntime:
         self._tokenizer_path = Path(tokenizer_path)
         self._model_revision = model_revision
         self._weights_revision = weights_revision
+        #: Committed weight updates since boot (see ``update_weights``).
+        self._weights_generation = 0
         self._resize_safety_bytes = resize_safety_bytes
         self._resize_headroom_source = resize_headroom_bytes
         self._chunk_pressure = chunk_pressure
@@ -1382,6 +1393,81 @@ class ServingRuntime:
             released = kv.clear_prefix_cache()
         kv.reclaim_deferred()
         return released
+
+    def update_weights(
+        self,
+        source: WeightSource,
+        *,
+        revision: str,
+        timeout: float = 30.0,
+        abort_running: bool = False,
+        backup: bool = True,
+        probe=None,
+    ) -> WeightUpdateResult:
+        """Replace the serving weights through the owner thread (research R6).
+
+        See :meth:`ServingService.update_weights` for the drain, deadline and
+        request policy and ``ayaka.weights.update`` for the transaction.
+        """
+        self._require_live()
+        if self.service is None:
+            raise RuntimeError("runtime has no serving service")
+        return self.service.update_weights(
+            source,
+            revision=revision,
+            timeout=timeout,
+            abort_running=abort_running,
+            backup=backup,
+            probe=probe,
+        )
+
+    def checkpoint_source(self, path: str | Path) -> CheckpointWeightSource:
+        """A checkpoint source using this model family's validating loader."""
+        from ayaka.models.qwen2 import Qwen2ForCausalLM, load_qwen2_weights
+
+        if not isinstance(self._model, Qwen2ForCausalLM):
+            raise ValueError(
+                f"no in-place checkpoint loader for {type(self._model).__name__}; "
+                "pass a WeightSource"
+            )
+        resolved = Path(path).expanduser().resolve()
+        return CheckpointWeightSource(resolved, load_qwen2_weights, identity=str(resolved))
+
+    def weights_identity(self) -> tuple[str, int]:
+        """The serving weights revision and generation (owner thread)."""
+        return self._weights_revision, self._weights_generation
+
+    def weight_update_refusal(self, revision: str) -> str | None:
+        """Why an in-place update cannot run on this runtime, before anything moves."""
+        if revision == self._weights_revision:
+            return "revision must change: it is part of the prefix-cache identity"
+        if self._decode_graph or (
+            self.phase_config is not None and self.phase_config.prefill.backend != "eager"
+        ):
+            return "captured graphs bind weight tensor versions; recapture is not implemented"
+        if self.config.execution_lanes is not None:
+            return "PDMux lanes hold their own runners; update them as one generation first"
+        if self.config.speculative is not None or self._draft_model is not None:
+            return "the draft model would need the same transaction; draft updates are not wired"
+        return reload_refusal(self._model)
+
+    def apply_weight_update(
+        self, source: WeightSource, *, revision: str, backup: bool, probe=None
+    ) -> WeightTransactionOutcome:
+        """Run the transaction while every owner is quiescent (owner thread only).
+
+        On commit the new revision enters the prefix identity and the old
+        generation's prefix cache is dropped, so no KV computed with the old
+        weights can be reused.
+        """
+        outcome = apply_weight_transaction(
+            {"target": self._model}, {"target": source}, backup=backup, probe=probe
+        )
+        if outcome.status is WeightUpdateStatus.COMMITTED:
+            self._weights_revision = revision
+            self._weights_generation += 1
+            self.flush_prefix_cache()
+        return outcome
 
     def resize(self, pages: int, *, timeout: float = 30.0) -> CacheStatus:
         """Request a capacity change through the engine owner thread.

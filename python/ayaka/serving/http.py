@@ -336,6 +336,43 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
             status_code = {"flushed": 200, "busy": 409, "timeout": 409}.get(result.status, 500)
             return JSONResponse(result.as_dict(), status_code=status_code)
 
+        @app.post("/v1/weights/update")
+        async def weights_update(request: Request):
+            """In-place checkpoint reload as one transaction (all-new/all-old/failed).
+
+            200 committed, 409 refused/timeout (nothing touched), 422 rolled back
+            (bad checkpoint, old weights verified), 500 failed (engine stopped).
+            """
+            body = await _body(request)
+            allowed = {"checkpoint", "revision", "timeout", "abort_running", "backup"}
+            unknown = set(body) - allowed
+            if unknown:
+                raise InvalidRequestError(f"unsupported field: {sorted(unknown)[0]}")
+            checkpoint, revision = body.get("checkpoint"), body.get("revision")
+            if not isinstance(checkpoint, str) or not checkpoint:
+                raise InvalidRequestError("checkpoint must be a path", param="checkpoint")
+            if not isinstance(revision, str) or not revision:
+                raise InvalidRequestError("revision must be a nonempty string", param="revision")
+            try:
+                source = admin.checkpoint_source(checkpoint)
+                result = await asyncio.to_thread(
+                    admin.update_weights,
+                    source,
+                    revision=revision,
+                    timeout=body.get("timeout", 30.0),
+                    abort_running=body.get("abort_running", False),
+                    backup=body.get("backup", True),
+                )
+            except (TypeError, ValueError) as exc:
+                raise InvalidRequestError(str(exc)) from exc
+            status_code = {
+                "committed": 200,
+                "refused": 409,
+                "timeout": 409,
+                "rolled_back": 422,
+            }.get(result.status, 500)
+            return JSONResponse(result.as_dict(), status_code=status_code)
+
     async def generate(request: Request, protocol: str):
         body = await _body(request)
         spec = _normalize(body, protocol)

@@ -182,6 +182,13 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   số prompt token đang xếp hàng ingress. `/stats.token_conservation` đối soát
   `published = forwarded + withheld[reason]` và bằng usage khi quiescent. Một burst speculative
   publish cùng lúc chỉ tạo một mẫu ITL, không tạo mẫu ITL giả cho từng token.
+- Cập nhật weight online (`ServingRuntime.update_weights`, route admin `POST /v1/weights/update`)
+  là một transaction **all-new / all-old / failed**: giữ admission, chờ mọi owner quiescent (hoặc
+  `abort_running=True`), backup và digest weights, nạp checkpoint in-place, rồi hoặc commit
+  (revision mới vào prefix identity, xóa prefix cache của generation cũ) hoặc khôi phục và xác minh
+  digest cũ (`rolled_back`). Không có restore được xác minh thì `failed` và engine dừng. Request
+  admit trước khi bắt đầu chạy hết trên weights cũ; request đến sau chạy trên weights mới. Từ
+  chối rõ ràng khi có CUDA graph đã capture, PDMux lanes, draft model hoặc layer lượng tử hóa.
 
 ## Phát triển và kiểm tra
 

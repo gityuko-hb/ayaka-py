@@ -172,6 +172,12 @@ class ServingStats:
             ["status"],
             registry=self.registry,
         )
+        self.weight_updates = Counter(
+            "ayaka_weight_updates",
+            "Weight update transactions by outcome",
+            ["status"],
+            registry=self.registry,
+        )
         # Token conservation at the stream boundary (research CT-O03): every
         # published token is either forwarded to its stream or withheld.
         self.stream_tokens_published = Counter(

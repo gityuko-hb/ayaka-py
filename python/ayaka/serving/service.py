@@ -10,7 +10,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 
 from ayaka.configs.serving import ServingConfig
 from ayaka.executor.base import TicketAge
@@ -53,6 +53,8 @@ from ayaka.serving.migration import MigrationController
 from ayaka.serving.parsers import OutputParser
 from ayaka.serving.prepare import GenerationSpec, PrepareTimings
 from ayaka.serving.stats import ServingStats, UsageRecord
+from ayaka.serving.weights import WeightOperation, WeightUpdateResult, WeightUpdateStatus
+from ayaka.weights.update import WeightSource
 
 _LOG = logging.getLogger(__name__)
 
@@ -97,6 +99,10 @@ class _WorkerFailed(RuntimeError):
 
 class _FlushFailed(RuntimeError):
     """A prefix-cache clear raised mid-way; state may be partial, admission stops."""
+
+
+class _WeightUpdateFailed(RuntimeError):
+    """A weight update failed without a verified restore; admission stops."""
 
 
 #: How long a flush caller waits past its own timeout for the owner's answer.
@@ -262,6 +268,9 @@ class ServingService:
         #: The one parked cache flush (engine thread only); see ``flush_cache``.
         self._flush: FlushOperation | None = None
         self._flush_ids = itertools.count(1)
+        #: The one parked weight update (engine thread only); see ``update_weights``.
+        self._weights: WeightOperation | None = None
+        self._weight_ids = itertools.count(1)
         #: Prompt tokens of queued, not yet admitted commands (under ``_lock``).
         self._queued_tokens = 0
         #: The ticket that tripped the completion watchdog, while it stays stuck.
@@ -393,6 +402,166 @@ class ServingService:
             raise EngineUnavailableError("cache flush returned no result")
         return result
 
+    def update_weights(
+        self,
+        source: WeightSource,
+        *,
+        revision: str,
+        timeout: float = 30.0,
+        abort_running: bool = False,
+        backup: bool = True,
+        probe=None,
+    ) -> WeightUpdateResult:
+        """Replace the serving weights as one transaction (see ``ayaka.serving.weights``).
+
+        Admission is held from the moment the owner picks the command up. With
+        ``abort_running`` live requests are aborted; otherwise they finish on
+        the old weights within ``timeout`` (finite seconds) or the update times
+        out untouched. ``revision`` must differ from the serving one: it becomes
+        part of the prefix-cache identity. ``backup=False`` saves the host copy
+        but turns any failure after mutation into a fail-stop.
+
+        Raises:
+            TypeError, ValueError: For an invalid timeout, revision or flags.
+            EngineUnavailableError: When the engine is closing, has no weight
+                controller, or did not answer in time.
+        """
+        seconds = validate_flush_timeout(timeout)
+        if not isinstance(revision, str) or not revision.strip():
+            raise ValueError("revision must be a nonempty string")
+        if type(abort_running) is not bool or type(backup) is not bool:
+            raise TypeError("abort_running and backup must be booleans")
+        if not isinstance(source, WeightSource):
+            raise TypeError("source must implement WeightSource")
+        if not self.ready:
+            raise EngineUnavailableError("engine is unavailable")
+        future: Future = Future()
+        payload = (source, revision, seconds, abort_running, backup, probe)
+        with self._lock:
+            try:
+                self._controls.put_nowait(("weights", payload, future))
+            except queue.Full as exc:
+                self.stats.record_rejection("control")
+                raise EngineUnavailableError("engine control queue is full") from exc
+        self._signal.set()
+        try:
+            result = future.result(seconds + _FLUSH_REPLY_GRACE_SECONDS)
+        except TimeoutError as exc:
+            future.cancel()
+            raise EngineUnavailableError("weight update did not answer in time") from exc
+        if not isinstance(result, WeightUpdateResult):
+            raise EngineUnavailableError("weight update returned no result")
+        return result
+
+    def _weights_result(
+        self, operation: int, status: WeightUpdateStatus, *, started_ns: int, **fields
+    ) -> WeightUpdateResult:
+        controller = self._controller
+        revision, generation = controller.weights_identity() if controller else ("", 0)
+        return WeightUpdateResult(
+            status=status,
+            operation=operation,
+            revision_before=fields.pop("revision_before", revision),
+            revision_after=revision,
+            generation=generation,
+            waited_seconds=max(0, self._clock() - started_ns) / 1e9,
+            **fields,
+        )
+
+    def _start_weight_update(self, payload, future: Future) -> None:
+        source, revision, seconds, abort_running, backup, probe = payload
+        now = self._clock()
+        operation = next(self._weight_ids)
+        controller = self._controller
+        assert controller is not None  # _apply_controls refuses without one
+        refusal = (
+            "another weight update is in progress"
+            if self._weights is not None
+            else controller.weight_update_refusal(revision)
+        )
+        if refusal is not None:
+            future.set_result(
+                self._weights_result(
+                    operation, WeightUpdateStatus.REFUSED, started_ns=now, detail=refusal
+                )
+            )
+            self.stats.weight_updates.labels(WeightUpdateStatus.REFUSED.value).inc()
+            return
+        aborted: tuple[str, ...] = ()
+        if abort_running:
+            aborted = tuple(self._handles)
+            for request_id in aborted:
+                self.engine.abort(request_id, reason="weight update")
+        self._weights = WeightOperation(
+            operation=operation,
+            started_ns=now,
+            deadline_ns=now + int(seconds * 1e9),
+            source=source,
+            revision=revision,
+            backup=backup,
+            probe=probe,
+            future=future,
+            aborted=aborted,
+        )
+
+    def _poll_weights(self) -> None:
+        """Run the parked update once quiescent; time it out otherwise."""
+        operation = self._weights
+        if operation is None:
+            return
+        if operation.future.cancelled():
+            self._weights = None  # the caller gave up before anything was touched
+            return
+        blockers = self._quiescence_blockers()
+        if blockers and self._clock() < operation.deadline_ns:
+            return
+        self._weights = None
+        if blockers:
+            self._answer_weights(
+                operation,
+                self._weights_result(
+                    operation.operation,
+                    WeightUpdateStatus.TIMEOUT,
+                    started_ns=operation.started_ns,
+                    aborted_requests=operation.aborted,
+                    blockers=blockers,
+                ),
+            )
+            return
+        controller = self._controller
+        assert controller is not None
+        revision_before, _ = controller.weights_identity()
+        outcome = controller.apply_weight_update(
+            operation.source,
+            revision=operation.revision,
+            backup=operation.backup,
+            probe=operation.probe,
+        )
+        result = self._weights_result(
+            operation.operation,
+            outcome.status,
+            started_ns=operation.started_ns,
+            revision_before=revision_before,
+            digest_before=outcome.old_digests.get("target", ""),
+            digest_after=outcome.new_digests.get("target", ""),
+            mutated=outcome.mutated,
+            backup_bytes=outcome.backup_bytes,
+            load_seconds=outcome.load_seconds,
+            aborted_requests=operation.aborted,
+            detail=outcome.detail,
+        )
+        self._answer_weights(operation, result)
+        if outcome.status is WeightUpdateStatus.FAILED:
+            raise _WeightUpdateFailed(f"weight update failed: {outcome.detail}")
+
+    def _answer_weights(self, operation: WeightOperation, result: WeightUpdateResult) -> None:
+        self.stats.weight_updates.labels(result.status.value).inc()
+        if not operation.future.cancelled():
+            try:
+                operation.future.set_result(result)
+            except InvalidStateError:  # cancelled concurrently
+                pass
+
     def _quiescence_blockers(self) -> tuple[str, ...]:
         """Every owner that may still read or write KV; empty means flush-safe.
 
@@ -523,6 +692,9 @@ class ServingService:
             if command == "flush":
                 seconds, drain = payload
                 self._start_flush(seconds, drain, future)
+                continue
+            if command == "weights":
+                self._start_weight_update(payload, future)
                 continue
             try:
                 if command == "status":
@@ -936,20 +1108,34 @@ class ServingService:
             handle.put(GenerationFailed(code, message), terminal=True)
 
     def _idle_wait_seconds(self) -> float:
-        """Bound the owner's sleep by the parked flush deadline, if any."""
+        """Bound the owner's sleep by the parked flush/update deadlines, if any."""
         wait = 0.001 if self._handles else 0.05
-        operation = self._flush
-        if operation is not None:
-            remaining = (operation.deadline_ns - self._clock()) / 1e9
-            wait = min(wait, max(remaining, 0.0))
+        for operation in (self._flush, self._weights):
+            if operation is not None:
+                remaining = (operation.deadline_ns - self._clock()) / 1e9
+                wait = min(wait, max(remaining, 0.0))
         return wait
+
+    def _fail_parked(self, error: BaseException) -> None:
+        """Answer every parked maintenance caller instead of stranding it."""
+        flush, self._flush = self._flush, None
+        if flush is not None:
+            flush.fail(error)
+        weights, self._weights = self._weights, None
+        if weights is not None and not weights.future.done():
+            try:
+                weights.future.set_exception(error)
+            except InvalidStateError:
+                pass
 
     def _run(self):
         try:
             while True:
-                # A draining flush fences admission: queued requests wait (and
-                # keep their queue deadlines) until it resolves.
-                fenced = self._flush is not None and self._flush.drain
+                # A draining flush or a weight update fences admission: queued
+                # requests wait (and keep their queue deadlines) until it resolves.
+                fenced = self._weights is not None or (
+                    self._flush is not None and self._flush.drain
+                )
                 for _ in range(0 if fenced else 32):
                     try:
                         request, spec, future, timings = self._commands.get_nowait()
@@ -959,9 +1145,7 @@ class ServingService:
                     self._admit(request, spec, future, timings)
                 self._apply_controls()
                 if self._closing.is_set():
-                    operation, self._flush = self._flush, None
-                    if operation is not None:
-                        operation.fail(EngineUnavailableError("engine is closing"))
+                    self._fail_parked(EngineUnavailableError("engine is closing"))
                     result = self.engine.close()
                     self._collect()
                     self._gauges()
@@ -972,6 +1156,7 @@ class ServingService:
                     self.engine.step()
                     self._collect()
                     self._poll_flush()
+                    self._poll_weights()
                     self._gauges()
                     if self._migration is not None:
                         self._migration.poll()
@@ -985,13 +1170,13 @@ class ServingService:
                 code, message = "worker_failed", str(exc)
             elif isinstance(exc, _FlushFailed):
                 code, message = "cache_flush_failed", str(exc)
+            elif isinstance(exc, _WeightUpdateFailed):
+                code, message = "weight_update_failed", str(exc)
             else:
                 code, message = "engine_unavailable", "engine owner failed"
             self._fail_engine(exc, code=code, message=message)
         finally:
-            operation, self._flush = self._flush, None
-            if operation is not None:
-                operation.fail(EngineUnavailableError("engine owner stopped"))
+            self._fail_parked(EngineUnavailableError("engine owner stopped"))
             with self._lock:
                 self._stopped.set()
                 while True:
