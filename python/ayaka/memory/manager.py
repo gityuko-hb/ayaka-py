@@ -2146,6 +2146,21 @@ class RuntimeMemoryManager:
                 if not record.committed
                 for page in record.allocated_pages
             }
+            # A partially kept speculative commit abandons whole rejected pages,
+            # which stay RESERVED (no reservation owner, in-flight refs only)
+            # until retirement unmarks them. Their owner is the committed lease.
+            for record in self._reservations.values():
+                if not record.committed:
+                    continue
+                for page in record.allocated_pages:
+                    meta = self.allocator.get_meta(page)
+                    if meta.allocation_state is not PageAllocationState.RESERVED:
+                        continue
+                    if meta.reservation_refs or not meta.inflight_refs:
+                        raise InvariantViolationError(
+                            "abandoned speculative page is not held only by its lease"
+                        )
+                    reserved_pages.add(page)
             if self._tier is not None:
                 # Promotion destinations are reservations the tier owns
                 # directly; no transaction ever sees them.

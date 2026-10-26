@@ -2090,6 +2090,24 @@ class KVCacheGroupManager:
                     if plan.group_name == runtime.descriptor.name
                     for page in plan.allocated_pages
                 }
+                # Pages a partially kept speculative commit rejected stay RESERVED
+                # with in-flight refs only until retirement; the lease owns them.
+                for record in self._reservations.values():
+                    if not record.committed:
+                        continue
+                    for plan in record.group_plans:
+                        if plan.group_name != runtime.descriptor.name:
+                            continue
+                        for page in plan.allocated_pages:
+                            meta = runtime.allocator.get_meta(page)
+                            if meta.allocation_state is not PageAllocationState.RESERVED:
+                                continue
+                            if meta.reservation_refs or not meta.inflight_refs:
+                                raise InvariantViolationError(
+                                    f"group {runtime.descriptor.name} abandoned speculative "
+                                    "page is not held only by its lease"
+                                )
+                            reserved.add(page)
                 if self._tier is not None:
                     tier_reserved = set(self._tier.reserved_pages(runtime.descriptor.name))
                     if reserved & tier_reserved:
