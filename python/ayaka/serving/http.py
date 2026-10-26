@@ -19,6 +19,7 @@ from ayaka.serving.errors import (
 )
 from ayaka.serving.generation import GenerationPipeline
 from ayaka.serving.protocol import (
+    LogprobRenderer,
     Result,
     anthropic_stream,
     normalize,
@@ -313,7 +314,12 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
         body = await _body(request)
         spec = _normalize(body, protocol)
         handle = await _while_connected(request, pipeline.prepare(spec, request.state.tenant))
-        result = Result(spec.model)
+        renderer = (
+            LogprobRenderer(processor.tokenizer.describe_tokens)
+            if spec.logprobs is not None
+            else None
+        )
+        result = Result(spec.model, logprobs=renderer)
 
         async def events():
             async with aclosing(pipeline.generate_events(handle)) as source:

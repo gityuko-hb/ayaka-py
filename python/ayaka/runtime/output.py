@@ -17,6 +17,7 @@ from ayaka.request.stream import (
     OutputEvent,
     OutputHistoryExpired,
     ResolvedStopPolicy,
+    TokenLogprobs,
     TokenUsage,
 )
 from ayaka.sched.outcome import FinishReason
@@ -174,8 +175,14 @@ class OutputProcessor:
         sequence_epoch: int,
         generated_tokens: int,
         prompt_tokens: int,
+        logprobs: TokenLogprobs | None = None,
     ) -> FinishDecision | None:
-        """Decode one published sample and evaluate its stop policy exactly once."""
+        """Decode one published sample and evaluate its stop policy exactly once.
+
+        ``logprobs`` is the sample's report, carried unchanged on its event.
+        """
+        if logprobs is not None and logprobs.token_id != token_id:
+            raise ValueError("logprob report belongs to a different token")
         state = self._state(request_id)
         before = generated_tokens - 1
         delta = ""
@@ -200,6 +207,7 @@ class OutputProcessor:
             usage=TokenUsage(prompt_tokens, generated_tokens),
             finish_reason=reason,
             child_index=state.child_index,
+            logprobs=logprobs,
         )
         state.events.append(event)
         self._trim(state)

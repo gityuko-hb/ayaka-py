@@ -14,6 +14,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -103,6 +104,9 @@ class TokenizerService:
         self._closed = False
         self._cache: OrderedDict[tuple[str, bool, str], tuple[int, ...]] = OrderedDict()
         self._cache_bytes = 0
+        #: Lazily built per-token byte table for logprob reports (empty when the
+        #: tokenizer is not byte-level).
+        self._byte_table: tuple[bytes, ...] | None = None
         self._pool = (
             ThreadPoolExecutor(
                 max_workers=config.encode_pool_workers, thread_name_prefix="ayaka-encode"
@@ -423,6 +427,29 @@ class TokenizerService:
             # The per-request decoder and encoder share the same adapter resource.
             decoder._lock = self._adapter_lock
             return decoder
+
+    def describe_tokens(self, ids: Sequence[int]) -> tuple[tuple[str, bytes], ...]:
+        """Text and raw bytes of each token on its own, for logprob reports.
+
+        Every id is decoded alone with special tokens kept, so the strings need
+        not concatenate to the generated text. The bytes are the token's exact
+        byte sequence when the tokenizer has a byte-level table, otherwise the
+        UTF-8 encoding of its text.
+        """
+        tokenizer = self.tokenizer
+        if tokenizer is None or not self.loaded.capabilities.text_decode:
+            raise ValueError("tokenizer disabled: token text is unavailable")
+        with self._adapter_lock:
+            table = self._byte_table
+            if table is None:
+                build = getattr(tokenizer, "token_bytes_table", None)
+                table = self._byte_table = tuple(build()) if build is not None else ()
+            described = []
+            for token in ids:
+                text = tokenizer.decode([token], skip_special_tokens=False)
+                raw = table[token] if 0 <= token < len(table) and table[token] else b""
+                described.append((text, raw or text.encode()))
+        return tuple(described)
 
     def close(self, *, cancel_pending: bool = True) -> None:
         """Stop admission and join native work; safe to call repeatedly."""

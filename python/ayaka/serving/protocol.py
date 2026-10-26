@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable, Sequence
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -20,6 +21,7 @@ from ayaka.serving.events import (
     GenerationFailed,
     GenerationFinished,
     ReasoningDelta,
+    TokenLogprobs,
     ToolCallArgumentsDelta,
     ToolCallEnd,
     ToolCallStart,
@@ -245,9 +247,10 @@ def normalize(body: dict, protocol: str) -> GenerationSpec:
             value = data.pop(field, 1)
             if type(value) is not int or value != 1:
                 raise UnsupportedFeatureError("only one completion per request is supported")
-        # logprobs/top_logprobs/echo/suffix stay explicitly rejected: accepting
-        # them without a response payload would silently lie to the client.
-        for field in ("logprobs", "top_logprobs", "echo", "suffix"):
+        _normalize_logprobs(data, protocol)
+        # echo/suffix stay explicitly rejected: prompt logprobs and insertion
+        # have no payload here, and accepting them would lie to the client.
+        for field in ("echo", "suffix"):
             value = data.pop(field, None)
             if value is not None and value is not False:
                 raise UnsupportedFeatureError(f"{field} is not supported by this serving runner")
@@ -281,6 +284,131 @@ def _fields(data, allowed):
         raise UnsupportedFeatureError(f"unsupported field: {sorted(unknown)[0]}")
 
 
+def _normalize_logprobs(data: dict, protocol: str) -> None:
+    """Map the OpenAI logprob fields onto ``GenerationSpec.logprobs`` in place.
+
+    Chat takes ``logprobs: bool`` plus ``top_logprobs: int``; legacy completions
+    take ``logprobs: int``. ``None`` and ``False`` mean off, as before the
+    capability was wired. The server-wide ceiling is checked at preparation.
+    """
+    enabled = data.pop("logprobs", None)
+    top = data.pop("top_logprobs", None)
+    if top is False:
+        top = None
+    if top is not None and (type(top) is not int or top < 0):
+        raise InvalidRequestError(
+            "top_logprobs must be a nonnegative integer", param="top_logprobs"
+        )
+    if protocol == "chat":
+        if enabled is not None and type(enabled) is not bool:
+            raise InvalidRequestError("logprobs must be a boolean", param="logprobs")
+        if top and not enabled:
+            raise InvalidRequestError("top_logprobs requires logprobs=true", param="top_logprobs")
+        if enabled:
+            data["logprobs"] = top or 0
+        return
+    if top is not None:
+        raise UnsupportedFeatureError(
+            "top_logprobs is a chat field; completions take logprobs=<count>"
+        )
+    if enabled is None or enabled is False:
+        return
+    if type(enabled) is not int or enabled < 0:
+        raise InvalidRequestError("logprobs must be a nonnegative integer", param="logprobs")
+    data["logprobs"] = enabled
+
+
+#: OpenAI's JSON-safe floor for logprobs (``-inf`` cannot be serialized).
+_MIN_LOGPROB = -9999.0
+
+
+def _wire_logprob(value: float) -> float:
+    return max(value, _MIN_LOGPROB)
+
+
+class LogprobRenderer:
+    """Render ``TokenLogprobs`` reports in the OpenAI chat and legacy shapes.
+
+    ``describe`` maps token ids to ``(text, bytes)`` (see
+    ``TokenizerService.describe_tokens``); it runs on the transport side, never
+    on the engine thread. There is one entry per sampled token, including hidden
+    special tokens and tokens whose text a stop string removed, so the count
+    equals ``usage.completion_tokens``.
+    """
+
+    def __init__(self, describe: Callable[[Sequence[int]], Sequence[tuple[str, bytes]]]):
+        self._describe = describe
+
+    def _described(self, reports: Sequence[TokenLogprobs]):
+        ids: list[int] = []
+        for report in reports:
+            ids.append(report.token_id)
+            ids.extend(token for token, _ in report.top)
+        described = tuple(self._describe(ids))
+        if len(described) != len(ids):
+            raise ValueError("token description count does not match the request")
+        return iter(described)
+
+    def chat(self, reports: Sequence[TokenLogprobs]) -> dict:
+        """``choices[].logprobs`` of a chat completion or chunk."""
+        described = self._described(reports)
+        content = []
+        for report in reports:
+            text, raw = next(described)
+            top = []
+            for _, logprob in report.top:
+                alternative, alternative_raw = next(described)
+                top.append(
+                    {
+                        "token": alternative,
+                        "logprob": _wire_logprob(logprob),
+                        "bytes": list(alternative_raw),
+                    }
+                )
+            content.append(
+                {
+                    "token": text,
+                    "logprob": _wire_logprob(report.logprob),
+                    "bytes": list(raw),
+                    "top_logprobs": top,
+                }
+            )
+        return {"content": content, "refusal": None}
+
+    def completion(self, reports: Sequence[TokenLogprobs], *, text_offset: int = 0) -> dict:
+        """``choices[].logprobs`` of a legacy completion or chunk.
+
+        ``top_logprobs`` maps token text to logprob and always holds the sampled
+        token, so it has up to ``logprobs + 1`` entries (two alternatives that
+        decode to the same text share one key). ``text_offset`` accumulates the
+        per-token text lengths from ``text_offset``.
+        """
+        described = self._described(reports)
+        tokens: list[str] = []
+        token_logprobs: list[float] = []
+        top_logprobs: list[dict[str, float]] = []
+        offsets: list[int] = []
+        offset = text_offset
+        for report in reports:
+            text, _ = next(described)
+            alternatives: dict[str, float] = {}
+            for _, logprob in report.top:
+                alternative, _ = next(described)
+                alternatives.setdefault(alternative, _wire_logprob(logprob))
+            alternatives.setdefault(text, _wire_logprob(report.logprob))
+            tokens.append(text)
+            token_logprobs.append(_wire_logprob(report.logprob))
+            top_logprobs.append(alternatives)
+            offsets.append(offset)
+            offset += len(text)
+        return {
+            "tokens": tokens,
+            "token_logprobs": token_logprobs,
+            "top_logprobs": top_logprobs,
+            "text_offset": offsets,
+        }
+
+
 def sse(value, event=None) -> bytes:
     prefix = f"event: {event}\n" if event else ""
     data = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
@@ -297,14 +425,20 @@ def usage_dict(usage):
 
 
 class Result:
-    def __init__(self, model: str):
+    """Accumulates one generation; ``logprobs`` renders reports when requested."""
+
+    def __init__(self, model: str, *, logprobs: LogprobRenderer | None = None):
         self.id, self.model, self.created = "gen_" + uuid4().hex, model, int(time.time())
         self.text, self.reasoning, self.calls = "", "", {}
         self.finished = None
+        self.logprobs = logprobs
+        self.reports: list[TokenLogprobs] = []
 
     def add(self, event):
         if isinstance(event, ContentDelta):
             self.text += event.text
+        elif isinstance(event, TokenLogprobs):
+            self.reports.append(event)
         elif isinstance(event, ReasoningDelta):
             self.reasoning += event.text
         elif isinstance(event, ToolCallStart):
@@ -410,10 +544,17 @@ class Result:
             message["reasoning_content"] = self.reasoning
         if self.calls:
             message["tool_calls"] = list(self.calls.values())
+        logprobs = None
+        if self.logprobs is not None:
+            logprobs = (
+                self.logprobs.completion(self.reports)
+                if protocol == "completion"
+                else self.logprobs.chat(self.reports)
+            )
         choice = (
-            {"text": self.text, "logprobs": None}
+            {"text": self.text, "logprobs": logprobs}
             if protocol == "completion"
-            else {"message": message, "logprobs": None}
+            else {"message": message, "logprobs": logprobs}
         )
         return {
             "id": self.id,
@@ -454,11 +595,28 @@ def _wire_event(event):
 
 
 async def openai_stream(events, result: Result, spec, protocol):
-    def chunk(delta=None, finish=None, usage=None):
+    renderer = result.logprobs
+    pending: list[TokenLogprobs] = []
+    text_offset = 0
+
+    def take_logprobs():
+        """Reports of the tokens since the last chunk, rendered for this chunk."""
+        nonlocal text_offset
+        if renderer is None:
+            return None
+        reports = list(pending)
+        pending.clear()
+        if protocol == "completion":
+            payload = renderer.completion(reports, text_offset=text_offset)
+            text_offset += sum(len(token) for token in payload["tokens"])
+            return payload
+        return renderer.chat(reports)
+
+    def chunk(delta=None, finish=None, usage=None, logprobs=None):
         choice = (
-            {"index": 0, "text": delta or "", "logprobs": None, "finish_reason": finish}
+            {"index": 0, "text": delta or "", "logprobs": logprobs, "finish_reason": finish}
             if protocol == "completion"
-            else {"index": 0, "delta": delta or {}, "logprobs": None, "finish_reason": finish}
+            else {"index": 0, "delta": delta or {}, "logprobs": logprobs, "finish_reason": finish}
         )
         return sse(
             {
@@ -483,8 +641,13 @@ async def openai_stream(events, result: Result, spec, protocol):
             )
             break
         result.add(event)
-        if isinstance(event, ContentDelta):
-            yield chunk(event.text if protocol == "completion" else {"content": event.text})
+        if isinstance(event, TokenLogprobs):
+            pending.append(event)
+        elif isinstance(event, ContentDelta):
+            yield chunk(
+                event.text if protocol == "completion" else {"content": event.text},
+                logprobs=take_logprobs(),
+            )
         elif isinstance(event, ReasoningDelta) and protocol == "chat":
             yield chunk({"reasoning_content": event.text})
         elif isinstance(event, ToolCallStart):
@@ -505,6 +668,10 @@ async def openai_stream(events, result: Result, spec, protocol):
                 {"tool_calls": [{"index": event.index, "function": {"arguments": event.fragment}}]}
             )
         elif isinstance(event, GenerationFinished):
+            if pending:
+                # Tokens without visible text (EOS, a held stop string) still
+                # get their reports, in one empty-delta chunk before the finish.
+                yield chunk(logprobs=take_logprobs())
             yield chunk(
                 finish="tool_calls" if event.finish_reason == "tool_call" else event.finish_reason
             )

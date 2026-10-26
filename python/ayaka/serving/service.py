@@ -34,6 +34,7 @@ from ayaka.serving.events import (
     GenerationFinished,
     ReasoningDelta,
     ServingEvent,
+    TokenLogprobs,
     ToolCallArgumentsDelta,
     ToolCallEnd,
     ToolCallStart,
@@ -62,6 +63,18 @@ def _event_bytes(event: ServingEvent) -> int:
         return len(event.arguments.encode()) + len(event.name)
     if isinstance(event, ToolCallStart):
         return len(event.name)
+    return 0
+
+
+#: Estimated wire bytes of one reported token or alternative (text, bytes
+#: array, logprob and JSON framing); token text is rendered after the queue.
+LOGPROB_ENTRY_BYTES = 64
+
+
+def _logprob_bytes(event: ServingEvent) -> int:
+    """Estimated payload of a logprob report, charged to its own byte ceiling."""
+    if isinstance(event, TokenLogprobs):
+        return LOGPROB_ENTRY_BYTES * (1 + len(event.top))
     return 0
 
 
@@ -111,6 +124,8 @@ class GenerationHandle:
         self._limit = config.max_stream_events
         self._byte_limit = config.max_stream_bytes
         self._queued_bytes = 0
+        self._logprob_byte_limit = config.max_stream_logprob_bytes
+        self._queued_logprob_bytes = 0
         self._terminal_sent = False
         self.overflow: str | None = None
         self.cursor = 0
@@ -143,11 +158,13 @@ class GenerationHandle:
         """Queue one event; returns False when the consumer is over budget.
 
         The terminal event has a reserved slot and is delivered exactly once,
-        regardless of how full the queue is. Non-terminal events must fit both
-        the event-count and UTF-8 byte ceilings; ``overflow`` names the budget
+        regardless of how full the queue is. Non-terminal events must fit the
+        event-count ceiling and their byte ceiling: UTF-8 text for content,
+        a separate estimate for logprob reports. ``overflow`` names the budget
         that rejected the event so the caller can record a bounded reason.
         """
         size = _event_bytes(event)
+        logprob_size = _logprob_bytes(event)
         with self._lock:
             if terminal:
                 if self._terminal_sent:
@@ -159,8 +176,12 @@ class GenerationHandle:
             elif self._queued_bytes + size > self._byte_limit:
                 self.overflow = "bytes"
                 return False
+            elif self._queued_logprob_bytes + logprob_size > self._logprob_byte_limit:
+                self.overflow = "logprob_bytes"
+                return False
             self._events.append(event)
             self._queued_bytes += size
+            self._queued_logprob_bytes += logprob_size
             waiter, self._waiter = self._waiter, None
         if waiter is not None:
             try:
@@ -175,6 +196,7 @@ class GenerationHandle:
                 if self._events:
                     event = self._events.popleft()
                     self._queued_bytes -= _event_bytes(event)
+                    self._queued_logprob_bytes -= _logprob_bytes(event)
                     return event
                 waiter = asyncio.get_running_loop().create_future()
                 self._waiter = waiter
@@ -455,6 +477,10 @@ class ServingService:
                 if handle.error or handle.cancelled.is_set():
                     continue
                 try:
+                    # The token's report precedes the text it produced, so a
+                    # stream adapter can attach it to that text's chunk.
+                    if event.logprobs is not None and not handle.put(event.logprobs):
+                        raise OverloadedError("output consumer is too slow")
                     for parsed in handle.parser.feed(event.delta):
                         if not handle.put(parsed):
                             raise OverloadedError("output consumer is too slow")

@@ -1,12 +1,16 @@
 """Capabilities are refused explicitly, before any resource is touched (research F02, E11/E12/E15).
 
 The research found several implementations that exist in source but are *not*
-wired into the serving path: internal logprob reports (the HTTP layer has no
-payload for them), auxiliary distributed/communication/dependency plans (the
-resident KV runtime has no adopter) and grouped COW.  The contract is that such
-requests fail with a structured error at the boundary rather than being
-accepted and silently dropped.  These tests pin that current truth, so the day a
-capability is wired the matching test must be updated deliberately.
+wired into the serving path: internal logprob reports, auxiliary distributed/
+communication/dependency plans (the resident KV runtime has no adopter) and
+grouped COW.  The contract is that such requests fail with a structured error at
+the boundary rather than being accepted and silently dropped.  These tests pin
+that current truth, so the day a capability is wired the matching test must be
+updated deliberately.
+
+Generation logprobs are now wired (``test_logprobs.py``), so ``logprobs`` and
+``top_logprobs`` moved from the refused list to a validated mapping; prompt
+logprobs (``echo``) and ``suffix`` still have no payload and stay refused.
 """
 
 from __future__ import annotations
@@ -52,7 +56,7 @@ _BODIES = {
 
 
 @pytest.mark.parametrize("protocol", ["completion", "chat"])
-@pytest.mark.parametrize("field", ["logprobs", "top_logprobs", "echo", "suffix"])
+@pytest.mark.parametrize("field", ["echo", "suffix"])
 def test_options_without_a_response_payload_are_rejected(protocol: str, field: str) -> None:
     body = {**_BODIES[protocol], field: 5 if field != "suffix" else "tail"}
     with pytest.raises(UnsupportedFeatureError) as caught:
@@ -67,7 +71,50 @@ def test_options_without_a_response_payload_are_rejected(protocol: str, field: s
 @pytest.mark.parametrize("unset", [None, False])
 def test_explicitly_unset_options_are_accepted(protocol: str, field: str, unset: object) -> None:
     spec = normalize({**_BODIES[protocol], field: unset}, protocol)
-    assert spec.model == "ayaka"
+    assert spec.model == "ayaka" and spec.logprobs is None
+
+
+def test_chat_logprobs_map_to_the_requested_alternative_count() -> None:
+    chat = _BODIES["chat"]
+    assert normalize({**chat, "logprobs": True}, "chat").logprobs == 0
+    assert normalize({**chat, "logprobs": True, "top_logprobs": 4}, "chat").logprobs == 4
+    assert normalize({**chat, "logprobs": False, "top_logprobs": 0}, "chat").logprobs is None
+
+
+def test_completion_logprobs_count_maps_directly() -> None:
+    completion = _BODIES["completion"]
+    assert normalize({**completion, "logprobs": 3}, "completion").logprobs == 3
+    assert normalize({**completion, "logprobs": 0}, "completion").logprobs == 0
+
+
+@pytest.mark.parametrize(
+    ("protocol", "extra", "error"),
+    [
+        ("chat", {"top_logprobs": 2}, InvalidRequestError),  # needs logprobs=true
+        ("chat", {"logprobs": 1}, InvalidRequestError),  # chat takes a boolean
+        ("chat", {"logprobs": True, "top_logprobs": -1}, InvalidRequestError),
+        ("chat", {"logprobs": True, "top_logprobs": 1.5}, InvalidRequestError),
+        ("completion", {"logprobs": True}, InvalidRequestError),  # legacy takes a count
+        ("completion", {"logprobs": -2}, InvalidRequestError),
+        ("completion", {"top_logprobs": 2}, UnsupportedFeatureError),  # a chat field
+    ],
+)
+def test_malformed_logprob_fields_are_refused(
+    protocol: str, extra: dict, error: type[Exception]
+) -> None:
+    with pytest.raises(InvalidRequestError) as caught:
+        normalize({**_BODIES[protocol], **extra}, protocol)
+    assert type(caught.value) is error
+    assert caught.value.status_code == 400
+
+
+def test_logprobs_stay_unsupported_outside_the_openai_protocols() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+    anthropic = {"model": "ayaka", "max_tokens": 4, "messages": messages, "logprobs": True}
+    with pytest.raises(UnsupportedFeatureError, match="unsupported field"):
+        normalize(anthropic, "anthropic")
+    with pytest.raises(UnsupportedFeatureError, match="unsupported field"):
+        normalize({"model": "ayaka", "input": "hi", "top_logprobs": 2}, "responses")
 
 
 @pytest.mark.parametrize("value", [2, 0, True, 1.0, "1"])

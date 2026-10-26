@@ -63,6 +63,9 @@ def build_tokenizer(directory: Path, vocab_size: int) -> Path:
         bos_token="<s>",
         eos_token="</s>",
         pad_token="<pad>",
+        # Chat requests render as their message texts, so a chat prompt equals
+        # the completion prompt of the same words.
+        chat_template="{% for m in messages %}{{ m['content'] }} {% endfor %}",
     ).save_pretrained(directory)
     return directory
 
@@ -190,6 +193,17 @@ class CpuServing:
             return list(await asyncio.gather(*(self.agenerate(p, **kwargs) for p in prompts)))
 
         return asyncio.run(asyncio.wait_for(all_of(), 120))
+
+    def http(self):
+        """A Starlette test client on the production HTTP app over this stack.
+
+        The app's lifespan is not entered, so this stack keeps ownership of
+        shutdown; ``close`` drains it as usual.
+        """
+        from ayaka.serving.http import create_app
+        from starlette.testclient import TestClient
+
+        return TestClient(create_app(self.service, self.runtime.processor, close=lambda: True))
 
     # -- oracle ----------------------------------------------------------
 

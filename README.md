@@ -161,6 +161,13 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   `ServingConfig.max_history_events` (mặc định `0` = không giới hạn) chặn số event giữ lại cho
   mỗi request; consumer tụt quá giới hạn nhận `OutputHistoryExpired` và chỉ request đó bị hủy,
   không bao giờ mất token một cách âm thầm.
+- HTTP OpenAI trả **generation logprobs**: chat `logprobs: true` + `top_logprobs: k`, legacy
+  completions `logprobs: k` (cả stream lẫn non-stream). Giá trị là RAW (phân phối model trước
+  penalty/mask/temperature), một mục cho mỗi token đã sample kể cả token đặc biệt bị ẩn, nên số
+  mục bằng `usage.completion_tokens`. `k` bị giới hạn bởi `ServingConfig.max_logprobs` (mặc định
+  20); report trong hàng đợi stream có trần byte riêng `max_stream_logprob_bytes`. Request có
+  logprobs không đi qua speculative decoding. `echo`/`suffix` (prompt logprobs), tool calls và
+  reasoning parser khi bật logprobs vẫn bị từ chối rõ ràng.
 
 ## Phát triển và kiểm tra
 

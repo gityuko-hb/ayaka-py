@@ -3,6 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from ayaka.request.stream import TokenLogprobs
+
+__all__ = [
+    "ContentDelta",
+    "GenerationFailed",
+    "GenerationFinished",
+    "ReasoningDelta",
+    "ServingEvent",
+    "TokenLogprobs",
+    "ToolCallArgumentsDelta",
+    "ToolCallEnd",
+    "ToolCallStart",
+    "UsageUpdate",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class ContentDelta:
@@ -57,12 +72,15 @@ class GenerationFailed:
     retryable: bool = False
 
 
+#: ``TokenLogprobs`` reports one sampled token and is queued just before the
+#: text events that token produced; only requests that asked for logprobs get it.
 type ServingEvent = (
     ContentDelta
     | ReasoningDelta
     | ToolCallStart
     | ToolCallArgumentsDelta
     | ToolCallEnd
+    | TokenLogprobs
     | GenerationFinished
     | GenerationFailed
 )

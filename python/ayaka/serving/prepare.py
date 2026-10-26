@@ -69,6 +69,9 @@ class GenerationSpec(BaseModel):
     response_format: dict | None = None
     tools: list[dict] = Field(default_factory=list)
     tool_choice: str | dict = "auto"
+    #: Generation logprobs: top alternatives per sampled token (0 = the sampled
+    #: token only); None disables them. Protocol adapters map their own fields.
+    logprobs: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def check_values(self):
@@ -249,6 +252,24 @@ class RequestProcessor:
         self.tokenizer, self.config = tokenizer, config
         self._clock = clock or time.monotonic_ns
 
+    def _check_logprobs(self, spec: GenerationSpec, *, reasoning: bool) -> None:
+        """Refuse logprob requests this server cannot report truthfully.
+
+        A report covers every sampled token as plain content. Tool calls and a
+        reasoning parser split tokens across channels the wire formats cannot
+        attribute, so those combinations are refused rather than approximated.
+        """
+        assert spec.logprobs is not None
+        if spec.logprobs > self.config.max_logprobs:
+            raise InvalidRequestError(
+                f"at most {self.config.max_logprobs} logprob alternatives per token are supported",
+                param="logprobs",
+            )
+        if spec.tools and spec.tool_choice != "none":
+            raise UnsupportedFeatureError("logprobs cannot be combined with tool calls")
+        if reasoning and spec.messages is not None and self.config.reasoning_parser != "none":
+            raise UnsupportedFeatureError("logprobs cannot be combined with a reasoning parser")
+
     def prepare(
         self,
         spec: GenerationSpec,
@@ -271,6 +292,8 @@ class RequestProcessor:
             raise UnsupportedFeatureError("structured decoding is disabled")
         if spec.tools and spec.tool_choice == "auto" and self.config.tool_parser == "none":
             raise UnsupportedFeatureError("automatic tools require a configured tool parser")
+        if spec.logprobs is not None:
+            self._check_logprobs(spec, reasoning=constraint is None)
         if spec.messages is not None:
             messages = chat_messages(spec.messages)
             if constraint is not None and constraint.kind == "tool_calls":
@@ -337,6 +360,7 @@ class RequestProcessor:
                 frequency_penalty=spec.frequency_penalty,
                 presence_penalty=spec.presence_penalty,
                 seed=spec.seed,
+                logprobs=spec.logprobs,
             ),
             stop=StopCriteria(
                 max_tokens=spec.max_tokens,

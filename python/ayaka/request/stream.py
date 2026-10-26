@@ -49,12 +49,48 @@ class TokenUsage:
         require_int(self.completion_tokens, "completion_tokens")
 
 
+def _require_logprob(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, float):
+        raise TypeError(f"{name} must be a float")
+
+
+@dataclass(frozen=True, slots=True)
+class TokenLogprobs:
+    """Generation logprob report for the one token an :class:`OutputEvent` published.
+
+    ``logprob`` is the sampled token's logprob under the request's
+    ``logprob_mode`` (RAW by default: the model distribution before penalties,
+    masks and temperature). ``top`` holds the requested top-k alternatives as
+    ``(token_id, logprob)`` pairs, most likely first; it may or may not contain
+    the sampled token. Token text is rendered by the transport that owns the
+    tokenizer, never on the engine thread.
+    """
+
+    token_id: int
+    logprob: float
+    top: tuple[tuple[int, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        require_frozen(self, "token logprobs")
+        require_int(self.token_id, "logprob token_id")
+        _require_logprob(self.logprob, "logprob")
+        if type(self.top) is not tuple:
+            raise TypeError("top logprobs must be a tuple")
+        for entry in self.top:
+            if type(entry) is not tuple or len(entry) != 2:
+                raise TypeError("top logprobs must be (token_id, logprob) pairs")
+            require_int(entry[0], "top logprob token_id")
+            _require_logprob(entry[1], "top logprob")
+
+
 @dataclass(frozen=True, slots=True)
 class OutputEvent:
     """Append-only output. event_index is per request incarnation, starting at 0.
 
     ``child_index`` is set only for parallel-sampling children; the parent
     stream interleaves children and the caller separates them by this index.
+    ``logprobs`` reports the published token when the request asked for
+    logprobs; it is ``None`` otherwise.
     """
 
     request_id: str
@@ -64,6 +100,7 @@ class OutputEvent:
     usage: TokenUsage
     finish_reason: FinishReason | None = None
     child_index: int | None = None
+    logprobs: TokenLogprobs | None = None
 
     def __post_init__(self) -> None:
         require_frozen(self, "output event")
@@ -76,6 +113,8 @@ class OutputEvent:
             raise TypeError("finish_reason must be FinishReason")
         if self.child_index is not None:
             require_int(self.child_index, "child_index", minimum=0)
+        if self.logprobs is not None and not isinstance(self.logprobs, TokenLogprobs):
+            raise TypeError("logprobs must be TokenLogprobs")
 
 
 class OutputHistoryExpired(LookupError):

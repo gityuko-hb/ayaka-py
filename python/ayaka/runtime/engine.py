@@ -19,13 +19,13 @@ from collections.abc import Callable, Sequence
 
 from ayaka.configs.base import ConfigError
 from ayaka.configs.scheduler import ResolvedSchedulerPlan
-from ayaka.executor.completion import CompletionCoordinator, ShutdownResult
+from ayaka.executor.completion import CompletionCoordinator, PublishedSample, ShutdownResult
 from ayaka.metrics import IterationStats, StatLogger, StatLoggerManager
 from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.parallel import expand_parallel_request
 from ayaka.request.schema import Request
 from ayaka.request.states import RequestState
-from ayaka.request.stream import OutputEvent
+from ayaka.request.stream import OutputEvent, TokenLogprobs
 from ayaka.runtime.output import FinishDecision, OutputProcessor
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import DeadlineExceededError, SequenceAllocator
@@ -47,6 +47,18 @@ QUEUED_STATES: frozenset[RequestState] = frozenset(
         RequestState.ADMITTED,
     }
 )
+
+
+def _token_logprobs(sample: PublishedSample) -> TokenLogprobs | None:
+    """The sample's materialized generation report as a transport-neutral value."""
+    report = sample.logprobs
+    if report is None:
+        return None
+    return TokenLogprobs(
+        sample.token_id,
+        report.token_logprob,
+        tuple((entry.token_id, entry.logprob) for entry in report.top_logprobs),
+    )
 
 
 class Engine:
@@ -242,6 +254,7 @@ class Engine:
                         else len(lifecycle.output_token_ids)
                     ),
                     prompt_tokens=lifecycle.request.prompt_len,
+                    logprobs=_token_logprobs(sample),
                 )
                 if decision is not None:
                     finishes.append(decision)

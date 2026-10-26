@@ -54,6 +54,12 @@ class ServingConfig:
     max_request_chunks: int = 4096
     max_stream_events: int = 128
     max_stream_bytes: int = 1 << 20
+    #: Largest per-token top-alternative count a request may ask for
+    #: (OpenAI ``top_logprobs`` / legacy completions ``logprobs``).
+    max_logprobs: int = 20
+    #: Separate queued-byte ceiling for logprob reports, so enabling them never
+    #: eats the text budget; estimated at a fixed size per reported token.
+    max_stream_logprob_bytes: int = 1 << 20
     #: Per-request cap on retained output events (0 = unbounded). The service
     #: consumes after every engine step, so the quota must cover one speculative
     #: step; a consumer that falls behind it is failed, never silently skipped.
@@ -112,6 +118,8 @@ class ServingConfig:
             raise ValueError("max_admitted_requests must be nonnegative")
         if self.max_pending_controls < 0:
             raise ValueError("max_pending_controls must be nonnegative")
+        if type(self.max_logprobs) is not int or self.max_logprobs < 0:
+            raise ValueError("max_logprobs must be a nonnegative integer")
         if self.max_history_events < 0:
             raise ValueError("max_history_events must be nonnegative")
         if self.max_history_events:
@@ -142,6 +150,7 @@ class ServingConfig:
             "max_request_chunks",
             "max_stream_events",
             "max_stream_bytes",
+            "max_stream_logprob_bytes",
             "max_pending_commands",
             "max_parser_bytes",
             "slo_history_size",

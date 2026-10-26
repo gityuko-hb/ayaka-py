@@ -15,8 +15,14 @@ from types import SimpleNamespace
 import pytest
 from ayaka.configs.serving import ServingConfig
 from ayaka.request.schema import Request, RequestId
-from ayaka.serving.events import ContentDelta, GenerationFailed, GenerationFinished, UsageUpdate
-from ayaka.serving.service import GenerationHandle
+from ayaka.serving.events import (
+    ContentDelta,
+    GenerationFailed,
+    GenerationFinished,
+    TokenLogprobs,
+    UsageUpdate,
+)
+from ayaka.serving.service import LOGPROB_ENTRY_BYTES, GenerationHandle
 
 
 def _handle(max_events: int = 3, max_bytes: int = 16) -> GenerationHandle:
@@ -132,3 +138,48 @@ def test_a_vanished_consumer_loop_cancels_the_request_instead_of_raising() -> No
     loop.close()  # the event loop is gone; waking it raises RuntimeError internally
     assert handle.put(ContentDelta("x")) is True
     assert handle.cancelled.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Logprob reports have their own byte ceiling (research A-03)
+# ---------------------------------------------------------------------------
+
+
+def _logprob_handle(max_logprob_bytes: int, max_bytes: int = 8) -> GenerationHandle:
+    config = ServingConfig(
+        max_stream_events=100,
+        max_stream_bytes=max_bytes,
+        max_stream_logprob_bytes=max_logprob_bytes,
+    )
+    request = Request(request_id=RequestId("r1"), prompt_token_ids=(1, 2, 3))
+    spec = SimpleNamespace(messages=None, tools=(), tool_choice="none")
+    return GenerationHandle(request, spec, config)  # type: ignore[arg-type]
+
+
+def _report(alternatives: int) -> TokenLogprobs:
+    return TokenLogprobs(7, -0.5, tuple((i, -1.0 - i) for i in range(alternatives)))
+
+
+def test_logprob_reports_use_their_own_ceiling_not_the_text_one() -> None:
+    handle = _logprob_handle(max_logprob_bytes=3 * LOGPROB_ENTRY_BYTES)
+    assert handle.put(ContentDelta("x" * 8)) is True  # the text ceiling is full
+    assert handle.put(_report(2)) is True  # three entries still fit the logprob one
+    assert handle.put(_report(0)) is False
+    assert handle.overflow == "logprob_bytes"
+
+
+def test_draining_a_report_releases_its_logprob_bytes() -> None:
+    handle = _logprob_handle(max_logprob_bytes=2 * LOGPROB_ENTRY_BYTES)
+    for _ in range(20):
+        assert handle.put(_report(1)) is True
+        assert _next(handle) == _report(1)
+    assert handle.overflow is None
+
+
+def test_a_full_logprob_ceiling_still_delivers_the_terminal() -> None:
+    handle = _logprob_handle(max_logprob_bytes=LOGPROB_ENTRY_BYTES)
+    assert handle.put(_report(0)) is True
+    assert handle.put(_report(0)) is False
+    assert handle.put(_terminal(), terminal=True) is True
+    assert isinstance(_next(handle), TokenLogprobs)
+    assert isinstance(_next(handle), GenerationFinished)
