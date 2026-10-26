@@ -20,7 +20,7 @@ from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from threading import RLock
+from threading import Lock, RLock, local
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -39,18 +39,105 @@ logger = logging.getLogger(__name__)
 # Capture is a process/device bootstrap operation. Serializing all devices is
 # conservative; this gate is never held by ordinary serving replay.
 _capture_gate = RLock()
+# Gate telemetry (research A-04: measure before narrowing). Only the outermost
+# acquisition per thread is timed, so re-entrant scopes are counted once.
+_gate_stats_lock = Lock()
+_gate_stats: dict[str, list[int]] = {}
+_gate_local = local()
+_MAX_GATE_OWNERS = 64
+
+
+@dataclass(frozen=True, slots=True)
+class EnqueueGateStats:
+    """Host time spent waiting for and holding the enqueue gate, per owner label.
+
+    ``contended`` counts outermost acquisitions that found the gate held by
+    another thread. These are host enqueue scopes, not GPU execution times.
+    """
+
+    owner: str
+    acquisitions: int
+    contended: int
+    wait_ns_total: int
+    wait_ns_max: int
+    held_ns_total: int
+    held_ns_max: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "acquisitions": self.acquisitions,
+            "contended": self.contended,
+            "wait_seconds_total": self.wait_ns_total / 1e9,
+            "wait_seconds_max": self.wait_ns_max / 1e9,
+            "held_seconds_total": self.held_ns_total / 1e9,
+            "held_seconds_max": self.held_ns_max / 1e9,
+        }
+
+
+def enqueue_gate_stats() -> tuple[EnqueueGateStats, ...]:
+    """A consistent snapshot of the gate counters, one entry per owner label."""
+    with _gate_stats_lock:
+        return tuple(EnqueueGateStats(owner, *values) for owner, values in _gate_stats.items())
+
+
+def reset_enqueue_gate_stats() -> None:
+    with _gate_stats_lock:
+        _gate_stats.clear()
+
+
+def _record_gate(owner: str, *, waited_ns: int, contended: bool, held_ns: int) -> None:
+    with _gate_stats_lock:
+        values = _gate_stats.get(owner)
+        if values is None:
+            if len(_gate_stats) >= _MAX_GATE_OWNERS:
+                owner = "other"
+            values = _gate_stats.setdefault(owner, [0, 0, 0, 0, 0, 0])
+        values[0] += 1
+        values[1] += int(contended)
+        values[2] += waited_ns
+        values[3] = max(values[3], waited_ns)
+        values[4] += held_ns
+        values[5] = max(values[5], held_ns)
 
 
 @contextmanager
-def execution_enqueue_gate():
+def execution_enqueue_gate(owner: str = "default"):
     """Prevent cooperating workers from enqueueing during bootstrap capture.
 
     This serializes host enqueue scopes only, not completion. Capture performs
     the stream/device joins after acquiring it; workers never wait for GPU
-    completion while holding this gate.
+    completion while holding this gate. ``owner`` labels the wait/held
+    telemetry (see :func:`enqueue_gate_stats`); it never changes the locking.
     """
-    with _capture_gate:
+    depth = getattr(_gate_local, "depth", 0)
+    if depth:  # re-entrant scope of the same thread: never waits, counted once
+        with _capture_gate:
+            _gate_local.depth = depth + 1
+            try:
+                yield
+            finally:
+                _gate_local.depth = depth
+        return
+    started = time.perf_counter_ns()
+    contended = not _capture_gate.acquire(blocking=False)
+    if contended:
+        _capture_gate.acquire()
+    acquired = time.perf_counter_ns()
+    _gate_local.depth = 1
+    try:
         yield
+    finally:
+        _gate_local.depth = 0
+        released = time.perf_counter_ns()
+        try:
+            _record_gate(
+                owner,
+                waited_ns=acquired - started,
+                contended=contended,
+                held_ns=released - acquired,
+            )
+        finally:
+            _capture_gate.release()
 
 
 class GraphOwnerState(StrEnum):
@@ -66,7 +153,16 @@ class GraphOwnerState(StrEnum):
     CLOSED = "closed"
 
 
-__all__ = ["CaptureProgram", "DecodeGraphConfig", "DecodeGraphPool", "DecodeGraphPoolError"]
+__all__ = [
+    "CaptureProgram",
+    "DecodeGraphConfig",
+    "DecodeGraphPool",
+    "DecodeGraphPoolError",
+    "EnqueueGateStats",
+    "enqueue_gate_stats",
+    "execution_enqueue_gate",
+    "reset_enqueue_gate_stats",
+]
 
 
 class DecodeGraphPoolError(RuntimeError):

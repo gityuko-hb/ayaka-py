@@ -276,8 +276,11 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
 
     @app.get("/stats")
     async def stats():
+        from ayaka.runner.graph.pool import enqueue_gate_stats
+
         stall = getattr(service, "stall", None)
         return {
+            "enqueue_gate": {stats.owner: stats.as_dict() for stats in enqueue_gate_stats()},
             "ready": service.ready,
             "frontend_active": pipeline.active,
             "outstanding": service.outstanding,
@@ -335,6 +338,54 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
                 raise InvalidRequestError(str(exc)) from exc
             status_code = {"flushed": 200, "busy": 409, "timeout": 409}.get(result.status, 500)
             return JSONResponse(result.as_dict(), status_code=status_code)
+
+        @app.post("/v1/profile/start")
+        async def profile_start(request: Request):
+            """Start one bounded profiling window; 409 while another is active."""
+            from ayaka.serving.profiling import ProfilerBusyError
+
+            body = await _body(request)
+            unknown = set(body) - {"max_steps", "trace_path", "activities"}
+            if unknown:
+                raise InvalidRequestError(f"unsupported field: {sorted(unknown)[0]}")
+            options = {key: body[key] for key in ("max_steps", "trace_path") if key in body}
+            if "activities" in body:
+                if not isinstance(body["activities"], list):
+                    raise InvalidRequestError("activities must be a list", param="activities")
+                options["activities"] = tuple(body["activities"])
+            try:
+                session = await asyncio.to_thread(admin.start_profile, **options)
+            except ValueError as exc:
+                raise InvalidRequestError(str(exc)) from exc
+            except ProfilerBusyError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            return {"session": session}
+
+        @app.post("/v1/profile/stop")
+        async def profile_stop():
+            """Stop the active window; 409 when none is active."""
+            from ayaka.serving.profiling import ProfilerBusyError
+
+            try:
+                result = await asyncio.to_thread(admin.stop_profile)
+            except ProfilerBusyError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            return result.as_dict()
+
+        @app.get("/v1/cache/events")
+        async def cache_events(limit: int = 256):
+            """Drain prefix-cache telemetry; a ``sequence`` gap means dropped events."""
+            log = getattr(admin, "cache_events", None)
+            if log is None:
+                raise InvalidRequestError("cache events are disabled (cache_event_buffer=0)")
+            if limit < 1:
+                raise InvalidRequestError("limit must be positive", param="limit")
+            events = log.drain(limit)
+            return {
+                "events": [event.as_dict() for event in events],
+                "dropped": log.dropped,
+                "pending": log.pending,
+            }
 
         @app.post("/v1/weights/update")
         async def weights_update(request: Request):

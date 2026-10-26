@@ -52,6 +52,13 @@ from ayaka.serving.load import LoadSnapshot
 from ayaka.serving.migration import MigrationController
 from ayaka.serving.parsers import OutputParser
 from ayaka.serving.prepare import GenerationSpec, PrepareTimings
+from ayaka.serving.profiling import (
+    ProfilerBusyError,
+    ProfileSession,
+    ProfileSessionResult,
+    ProfileSessionStatus,
+    validate_profile_options,
+)
 from ayaka.serving.stats import ServingStats, UsageRecord
 from ayaka.serving.weights import WeightOperation, WeightUpdateResult, WeightUpdateStatus
 from ayaka.weights.update import WeightSource
@@ -164,6 +171,8 @@ class GenerationHandle:
         self.last_published_ns = 0
         self.first_socket_write_ns = 0
         self.error: str | None = None
+        #: Set by the service on admission: wakes the owner loop on cancel.
+        self._wake: Callable[[], None] | None = None
         self.parser = OutputParser(
             reasoning=config.reasoning_parser == "think"
             and request.constraint is None
@@ -176,6 +185,9 @@ class GenerationHandle:
 
     def cancel(self) -> None:
         self.cancelled.set()
+        wake = self._wake
+        if wake is not None:
+            wake()  # the owner aborts promptly instead of at its next poll
 
     def put(self, event: ServingEvent, *, terminal=False) -> bool:
         """Queue one event; returns False when the consumer is over budget.
@@ -271,6 +283,10 @@ class ServingService:
         #: The one parked weight update (engine thread only); see ``update_weights``.
         self._weights: WeightOperation | None = None
         self._weight_ids = itertools.count(1)
+        #: The active profiling window (engine thread only) and the last result.
+        self._profile: ProfileSession | None = None
+        self._profile_ids = itertools.count(1)
+        self._last_profile: ProfileSessionResult | None = None
         #: Prompt tokens of queued, not yet admitted commands (under ``_lock``).
         self._queued_tokens = 0
         #: The ticket that tripped the completion watchdog, while it stays stuck.
@@ -451,6 +467,89 @@ class ServingService:
             raise EngineUnavailableError("weight update did not answer in time") from exc
         if not isinstance(result, WeightUpdateResult):
             raise EngineUnavailableError("weight update returned no result")
+        return result
+
+    def start_profile(
+        self,
+        *,
+        max_steps: int | None = None,
+        trace_path: str | None = None,
+        activities: tuple[str, ...] = ("cpu",),
+        recorder_factory=None,
+        timeout: float = 10.0,
+    ) -> int:
+        """Start one bounded profiling window on the owner thread; returns its id.
+
+        Raises:
+            ValueError: For invalid options, before any state changes.
+            ProfilerBusyError: When a session is already active.
+            RuntimeError: When the recorder failed to start (the session is
+                recorded as FAILED in :meth:`last_profile`; nothing keeps running).
+            EngineUnavailableError: When the engine is closing or did not answer.
+        """
+        options = validate_profile_options(max_steps, trace_path, activities)
+        return self._control("profile_start", (options, recorder_factory), timeout)
+
+    def stop_profile(self, *, timeout: float = 30.0) -> ProfileSessionResult:
+        """Stop the active window and return its result.
+
+        Raises:
+            ProfilerBusyError: When no session is active.
+        """
+        return self._control("profile_stop", None, timeout)
+
+    def last_profile(self) -> ProfileSessionResult | None:
+        """The most recently finished session (stopped, auto-stopped or failed)."""
+        return self._last_profile
+
+    def _control(self, command: str, payload, timeout: float):
+        if not self.ready:
+            raise EngineUnavailableError("engine is unavailable")
+        future: Future = Future()
+        with self._lock:
+            try:
+                self._controls.put_nowait((command, payload, future))
+            except queue.Full as exc:
+                self.stats.record_rejection("control")
+                raise EngineUnavailableError("engine control queue is full") from exc
+        self._signal.set()
+        try:
+            return future.result(timeout)
+        except TimeoutError as exc:
+            future.cancel()
+            raise EngineUnavailableError(f"{command} did not answer in time") from exc
+
+    def _start_profile(self, payload, future: Future) -> None:
+        (max_steps, trace_path, activities), recorder_factory = payload
+        if self._profile is not None:
+            future.set_exception(
+                ProfilerBusyError(f"profiling session {self._profile.session} is active")
+            )
+            return
+        session = ProfileSession(
+            session=next(self._profile_ids),
+            max_steps=max_steps,
+            trace_path=trace_path,
+            activities=activities,
+            **({"recorder_factory": recorder_factory} if recorder_factory is not None else {}),
+        )
+        try:
+            session.start()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller as FAILED
+            self._last_profile = ProfileSessionResult(
+                session.session, ProfileSessionStatus.FAILED, 0, 0.0, reason=f"start: {exc}"
+            )
+            future.set_exception(RuntimeError(f"profiler failed to start: {exc}"))
+            return
+        self._profile = session
+        future.set_result(session.session)
+
+    def _end_profile(self, reason: str) -> ProfileSessionResult | None:
+        session, self._profile = self._profile, None
+        if session is None:
+            return None
+        result = session.finish(reason)
+        self._last_profile = result
         return result
 
     def _weights_result(
@@ -696,6 +795,16 @@ class ServingService:
             if command == "weights":
                 self._start_weight_update(payload, future)
                 continue
+            if command == "profile_start":
+                self._start_profile(payload, future)
+                continue
+            if command == "profile_stop":
+                result = self._end_profile("stop")
+                if result is None:
+                    future.set_exception(ProfilerBusyError("no active profiling session"))
+                else:
+                    future.set_result(result)
+                continue
             try:
                 if command == "status":
                     result = controller.cache_status()
@@ -833,6 +942,7 @@ class ServingService:
             handle.ingress_ns = timings.ingress_ns
             handle.validation_done_ns = timings.validation_done_ns
             handle.tokenize_done_ns = timings.tokenize_done_ns
+        handle._wake = self._signal.set
         self._handles[str(request.request_id)] = handle
         future.set_result(handle)
 
@@ -1107,14 +1217,49 @@ class ServingService:
         for handle in self._handles.values():
             handle.put(GenerationFailed(code, message), terminal=True)
 
-    def _idle_wait_seconds(self) -> float:
-        """Bound the owner's sleep by the parked flush/update deadlines, if any."""
-        wait = 0.001 if self._handles else 0.05
+    def _idle_wait_seconds(self, progressed: bool = True) -> float:
+        """How long the owner may sleep before its next iteration.
+
+        Work in flight polls every millisecond, as before. When live requests
+        exist but the step moved nothing and nothing needs polling (no
+        completion fence, tier transfer or migration), the owner sleeps up to
+        50 ms, waking at the nearest request deadline; arrivals, controls and
+        cancels set the signal and wake it at once. Parked flush/update
+        deadlines bound every sleep.
+        """
+        if not self._handles:
+            wait = 0.05
+        elif progressed or self._needs_polling():
+            wait = 0.001
+        else:
+            wait = 0.05
+            now = self._clock()
+            for lifecycle in self.engine.requests:
+                for deadline in (
+                    lifecycle.request.deadline_ns,
+                    lifecycle.request.queue_deadline_ns,
+                ):
+                    if deadline is not None:
+                        wait = min(wait, max(deadline - now, 0) / 1e9)
         for operation in (self._flush, self._weights):
             if operation is not None:
                 remaining = (operation.deadline_ns - self._clock()) / 1e9
                 wait = min(wait, max(remaining, 0.0))
         return wait
+
+    def _needs_polling(self) -> bool:
+        """Progress that no signal announces: fences, tier copies, migrations."""
+        executor = getattr(self.engine, "executor", None)
+        if executor is not None and getattr(executor, "pending_completion", False):
+            return True
+        if self._migration is not None:
+            return True
+        kv = getattr(self.engine, "kv", None)
+        if kv is not None and not getattr(kv, "closed", True):
+            tier = kv.tier_metrics()
+            if tier is not None and tier.pending_transfers:
+                return True
+        return False
 
     def _fail_parked(self, error: BaseException) -> None:
         """Answer every parked maintenance caller instead of stranding it."""
@@ -1144,8 +1289,10 @@ class ServingService:
                     self._dequeued(request)
                     self._admit(request, spec, future, timings)
                 self._apply_controls()
+                progressed = True
                 if self._closing.is_set():
                     self._fail_parked(EngineUnavailableError("engine is closing"))
+                    self._end_profile("shutdown")
                     result = self.engine.close()
                     self._collect()
                     self._gauges()
@@ -1153,7 +1300,9 @@ class ServingService:
                         self._drained = True
                         return
                 else:
-                    self.engine.step()
+                    progressed = self.engine.step()
+                    if self._profile is not None and self._profile.on_step():
+                        self._end_profile("max_steps")
                     self._collect()
                     self._poll_flush()
                     self._poll_weights()
@@ -1161,7 +1310,7 @@ class ServingService:
                     if self._migration is not None:
                         self._migration.poll()
                     self._raise_if_admission_closed()
-                self._signal.wait(self._idle_wait_seconds())
+                self._signal.wait(self._idle_wait_seconds(progressed))
                 self._signal.clear()
         except BaseException as exc:
             if isinstance(exc, _EngineQuarantined):
@@ -1177,6 +1326,7 @@ class ServingService:
             self._fail_engine(exc, code=code, message=message)
         finally:
             self._fail_parked(EngineUnavailableError("engine owner stopped"))
+            self._end_profile("shutdown")
             with self._lock:
                 self._stopped.set()
                 while True:

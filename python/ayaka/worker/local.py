@@ -105,6 +105,8 @@ class LocalWorker(StepWorker):
         self.runner = runner
         self.multiplexer = multiplexer
         self._device = resolved
+        #: Telemetry label for this worker's enqueue-gate wait/held times.
+        self._gate_owner = f"worker:{resolved}"
         self.max_inflight = max_inflight
         self.metrics = metrics or RuntimeMetrics()
         self.fence_factory = fence_factory
@@ -220,7 +222,7 @@ class LocalWorker(StepWorker):
                 context = torch.cuda.stream(lane.stream)
             from ayaka.runner.graph.pool import execution_enqueue_gate
 
-            with execution_enqueue_gate(), context, torch.inference_mode():
+            with execution_enqueue_gate(self._gate_owner), context, torch.inference_mode():
                 prepare_execution = getattr(runner, "prepare_execution", None)
                 execute_batch = getattr(runner, "execute_batch", None)
                 batch = prepare_execution(step) if prepare_execution is not None else None

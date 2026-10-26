@@ -109,13 +109,71 @@ class ProfileResult:
         return [asdict(s) for s in self.stats]
 
 
-def _parse_profiler_events(prof: Any) -> list[KernelStats]:
-    """Extract per-kernel stats from ``torch.profiler`` key averages.
+def _device_us(event: Any) -> float:
+    """Self device time of one profiler event in microseconds (0 when none)."""
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        value = getattr(event, attr, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return 0.0
 
-    Reads ``self_cuda_time_total`` (microseconds) from each event that has
-    non-zero CUDA time, groups by kernel name, and computes percentages.
-    Per-invocation extrema are not available from key averages and stay ``None``.
+
+def _is_device_event(event: Any) -> bool:
+    """Kernel-side events only: a CPU operator's "self CUDA" time repeats its kernels."""
+    device_type = getattr(event, "device_type", None)
+    return device_type is None or "CPU" not in str(device_type)
+
+
+def _parse_raw_events(prof: Any) -> list[KernelStats] | None:
+    """Per-invocation stats from raw device events, or ``None`` when unavailable.
+
+    Every raw kernel event is one invocation, so ``min_us``/``max_us`` here are
+    measured extremes (research A-07: tails need raw events, not averages).
     """
+    events_of = getattr(prof, "events", None)
+    if events_of is None:
+        return None
+    try:
+        events = list(events_of())
+    except Exception:  # noqa: BLE001 - a recorder without raw events falls back
+        return None
+    durations: dict[str, list[float]] = {}
+    for evt in events:
+        us = _device_us(evt)
+        if us <= 0 or not _is_device_event(evt):
+            continue
+        name = getattr(evt, "key", None) or getattr(evt, "name", None) or "(unknown)"
+        durations.setdefault(str(name), []).append(us)
+    if not durations:
+        return None
+    total_us = sum(sum(values) for values in durations.values())
+    stats = [
+        KernelStats(
+            name=name,
+            calls=len(values),
+            total_us=round(sum(values), 1),
+            avg_us=round(sum(values) / len(values), 1),
+            min_us=round(min(values), 1),
+            max_us=round(max(values), 1),
+            pct=round(sum(values) / total_us * 100, 2),
+        )
+        for name, values in durations.items()
+    ]
+    stats.sort(key=lambda s: s.total_us, reverse=True)
+    return stats
+
+
+def _parse_profiler_events(prof: Any) -> list[KernelStats]:
+    """Extract per-kernel stats, measured per invocation when raw events exist.
+
+    Raw device events give exact min/max per kernel. Without them, falls back to
+    ``key_averages``: reads ``self_cuda_time_total`` (microseconds) from each
+    event with non-zero CUDA time and computes percentages; per-invocation
+    extrema are not available there and stay ``None``.
+    """
+    measured = _parse_raw_events(prof)
+    if measured is not None:
+        return measured
     events = prof.key_averages()
     raw: list[tuple[str, int, float]] = []
     for evt in events:

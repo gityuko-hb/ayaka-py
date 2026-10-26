@@ -189,6 +189,13 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   digest cũ (`rolled_back`). Không có restore được xác minh thì `failed` và engine dừng. Request
   admit trước khi bắt đầu chạy hết trên weights cũ; request đến sau chạy trên weights mới. Từ
   chối rõ ràng khi có CUDA graph đã capture, PDMux lanes, draft model hoặc layer lượng tử hóa.
+- Instrumentation (P2): `/stats.enqueue_gate` đo thời gian chờ/giữ `execution_enqueue_gate` theo
+  worker (chỉ lần acquire ngoài cùng); profiler kernel lấy min/max thật từ raw device event;
+  `start_profile`/`stop_profile` (route `/v1/profile/start|stop`) là một cửa sổ profiling có
+  giới hạn trên owner thread, không bao giờ có recorder thứ hai, dọn sạch khi lỗi; owner được
+  đánh thức ngay khi cancel và ngủ tới deadline gần nhất khi rảnh; `cache_event_buffer` bật log
+  sự kiện prefix-cache có giới hạn (`GET /v1/cache/events`); `ayaka.metrics.estimate` ước lượng
+  FLOPs/bytes theo `(q, p)` từ config model, luôn gắn nhãn là ước lượng.
 
 ## Phát triển và kiểm tra
 

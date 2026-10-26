@@ -72,6 +72,9 @@ class ServingConfig:
     max_pending_prompt_tokens: int = 0
     #: Dedicated control-channel budget; 0 reuses ``max_pending_commands``.
     max_pending_controls: int = 0
+    #: Bounded prefix-cache event log for telemetry (0 = off); events never
+    #: authorize frees or admissions and the oldest are dropped when full.
+    cache_event_buffer: int = 0
     #: Completion watchdog: a ticket unsettled this long makes the service not
     #: ready and records a diagnostic; nothing is freed. ``None`` disables it.
     completion_watchdog_seconds: float | None = None
@@ -128,6 +131,8 @@ class ServingConfig:
             raise ValueError("max_pending_controls must be nonnegative")
         if type(self.max_logprobs) is not int or self.max_logprobs < 0:
             raise ValueError("max_logprobs must be a nonnegative integer")
+        if type(self.cache_event_buffer) is not int or self.cache_event_buffer < 0:
+            raise ValueError("cache_event_buffer must be a nonnegative integer")
         if type(self.max_pending_prompt_tokens) is not int or self.max_pending_prompt_tokens < 0:
             raise ValueError("max_pending_prompt_tokens must be a nonnegative integer")
         if self.completion_watchdog_seconds is not None and (

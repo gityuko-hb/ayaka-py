@@ -14,7 +14,8 @@ from ayaka.kvcache.grouped_manager import KVCacheGroupManager
 from ayaka.kvcache.grouped_prefix import GroupedPrefixCache
 from ayaka.memory.manager import RuntimeMemoryManager
 from ayaka.memory.sequence import PageTableEntry
-from ayaka.prefix.global_index import PrefixIndexPublisher
+from ayaka.prefix.events import CacheEventKind, CacheEventLog
+from ayaka.prefix.global_index import PrefixIndexPublisher, prompt_digest_pairs
 from ayaka.prefix.identity import PrefixCacheContext
 from ayaka.prefix.interface import (
     CachedBlockInfo,
@@ -81,7 +82,13 @@ class PrefixService:
         self._max_entries: int | None = None
         self._transfers: set[PrefixTransfer] = set()
         self._index_publisher = index_publisher
+        #: Optional bounded telemetry of residency changes (never an authority).
+        self._events: CacheEventLog | None = None
         self.closed = False
+
+    def attach_event_log(self, log: CacheEventLog | None) -> None:
+        """Record publish/evict/clear events into ``log`` (``None`` detaches)."""
+        self._events = log
 
     @property
     def max_entries(self) -> int | None:
@@ -177,6 +184,13 @@ class PrefixService:
             self._index_publisher.publish(
                 published, context=context, page_size=self.backend.page_size
             )
+        if result is not None and self._events is not None and not self._grouped:
+            covered = 0  # cumulative, like PrefixBlockIdentity.token_count
+            for digest, block_tokens in prompt_digest_pairs(
+                published, page_size=self.backend.page_size, context=context
+            ):
+                covered += block_tokens
+                self._events.record(CacheEventKind.STORED, digest, covered)
         if self.max_entries is not None:
             while self.store.snapshot().terminal_entries > self.max_entries:
                 self.evict()
@@ -192,14 +206,20 @@ class PrefixService:
         self.require_open()
         if isinstance(self.store, GroupedPrefixCache):
             return self.store.evict_entry(entry_id, safe_epoch=self.backend.current_epoch)
-        publisher = self._index_publisher
-        before = self.store.evictable_leaves() if publisher is not None else ()
+        publisher, events = self._index_publisher, self._events
+        observed = publisher is not None or events is not None
+        before = self.store.evictable_leaves() if observed else ()
         evicted = self.store.evict_entry(entry_id, safe_epoch=self.backend.current_epoch)
-        if evicted and publisher is not None:
+        if evicted and observed:
             after = {info.handle.index for info in self.store.evictable_leaves()}
             leaf = self._evicted_leaf(before, entry_id, remaining=after)
             if leaf is not None:
-                publisher.withdraw_digest(leaf.identity.digest)
+                if publisher is not None:
+                    publisher.withdraw_digest(leaf.identity.digest)
+                if events is not None:
+                    events.record(
+                        CacheEventKind.REMOVED, leaf.identity.digest, leaf.identity.token_count
+                    )
         return evicted
 
     @staticmethod
@@ -238,12 +258,15 @@ class PrefixService:
             raise RuntimeError("prefix cache clear refused: a prefix transfer is still live")
         store, publisher = self.store, self._index_publisher
         if isinstance(store, GroupedPrefixCache) or publisher is None:
-            return self.backend.clear_prefix_cache()  # grouped entries are never advertised
-        before = {info.identity.digest for info in store.cached_block_index()}
-        released = self.backend.clear_prefix_cache()
-        remaining = {info.identity.digest for info in store.cached_block_index()}
-        for digest in before - remaining:
-            publisher.withdraw_digest(digest)
+            released = self.backend.clear_prefix_cache()  # grouped entries are never advertised
+        else:
+            before = {info.identity.digest for info in store.cached_block_index()}
+            released = self.backend.clear_prefix_cache()
+            remaining = {info.identity.digest for info in store.cached_block_index()}
+            for digest in before - remaining:
+                publisher.withdraw_digest(digest)
+        if self._events is not None:
+            self._events.record(CacheEventKind.CLEARED)
         return released
 
     def close(self) -> bool:

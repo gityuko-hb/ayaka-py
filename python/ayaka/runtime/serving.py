@@ -50,6 +50,7 @@ from ayaka.memory.tiering import TieringConfig
 from ayaka.memory.workspace import WorkspaceManager
 from ayaka.obs import runtime_event
 from ayaka.plan import ComputePlan, ExecutionPlan, GraphMode, MemoryPlan
+from ayaka.prefix.events import CacheEventLog
 from ayaka.prefix.identity import build_prefix_context
 from ayaka.runner.buffers import RunnerBuffers, RunnerBufferSpec
 from ayaka.runner.model_runner import ModelRunner
@@ -355,6 +356,12 @@ class ServingRuntime:
         self._weights_revision = weights_revision
         #: Committed weight updates since boot (see ``update_weights``).
         self._weights_generation = 0
+        #: Prefix-cache telemetry shared across cache rebuilds (None when off).
+        self.cache_events: CacheEventLog | None = (
+            CacheEventLog(self.config.cache_event_buffer)
+            if self.config.cache_event_buffer
+            else None
+        )
         self._resize_safety_bytes = resize_safety_bytes
         self._resize_headroom_source = resize_headroom_bytes
         self._chunk_pressure = chunk_pressure
@@ -1240,6 +1247,8 @@ class ServingRuntime:
         self.storage = tail.storage
         self.manager = tail.manager
         self.kv = tail.kv
+        if self.cache_events is not None and self._prefix_context is not None:
+            tail.kv.prefix_service.attach_event_log(self.cache_events)
         self.workspace = tail.workspace
         self.workspace_allocator = tail.workspace_allocator
         self.runner_buffers = tail.buffers
@@ -1420,6 +1429,20 @@ class ServingRuntime:
             backup=backup,
             probe=probe,
         )
+
+    def start_profile(self, **options) -> int:
+        """Start a bounded profiling window; see :meth:`ServingService.start_profile`."""
+        self._require_live()
+        if self.service is None:
+            raise RuntimeError("runtime has no serving service")
+        return self.service.start_profile(**options)
+
+    def stop_profile(self):
+        """Stop the active profiling window and return its result."""
+        self._require_live()
+        if self.service is None:
+            raise RuntimeError("runtime has no serving service")
+        return self.service.stop_profile()
 
     def checkpoint_source(self, path: str | Path) -> CheckpointWeightSource:
         """A checkpoint source using this model family's validating loader."""
