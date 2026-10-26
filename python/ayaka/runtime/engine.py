@@ -31,6 +31,7 @@ from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import DeadlineExceededError, SequenceAllocator
 from ayaka.sched.outcome import FinishReason, RequestOutcome, SchedulerReport
 from ayaka.sched.plan import BatchStepPlan
+from ayaka.sched.prepare_ahead import PrepareAheadShadow
 from ayaka.serving.router import RemoteKVPending
 
 __all__ = ["Engine"]
@@ -86,6 +87,8 @@ class Engine:
         self._scheduler = scheduler
         self._coordinator = coordinator
         self._output = output
+        #: Optional R1 shadow recorder; observes launches, never changes them.
+        self.prepare_ahead: PrepareAheadShadow | None = None
         self._allocator = allocator
         self._remote_kv = remote_kv
         self._settled = 0
@@ -278,6 +281,8 @@ class Engine:
             self._coordinator.launch(ticket)
             launched_tokens += ticket.prepared.step.execution_num_tokens
             did = True
+        if self.prepare_ahead is not None:
+            self._observe_prepare_ahead()
 
         self._allocator.advance_epoch(self._settled)
         if self._manager is not None:
@@ -291,6 +296,20 @@ class Engine:
         # A pending completion fence is progress-capable work: the loop must
         # stay alive until the executor settles or quarantines it.
         return did or self._coordinator.executor.pending_completion
+
+    def _observe_prepare_ahead(self) -> None:
+        """R1 shadow: would a larger inflight ceiling have had independent work?"""
+        assert self.prepare_ahead is not None
+        blocked = not self._coordinator.executor.has_submission_capacity()
+        ready = 0
+        if blocked:
+            ready = sum(
+                1
+                for lifecycle in self._requests
+                if not lifecycle.is_terminal
+                and not self._scheduler.is_inflight(lifecycle.request_id)
+            )
+        self.prepare_ahead.observe(capacity_blocked=blocked, ready_independent=ready)
 
     def _record_stats(
         self,

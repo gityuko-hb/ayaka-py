@@ -196,6 +196,12 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   đánh thức ngay khi cancel và ngủ tới deadline gần nhất khi rảnh; `cache_event_buffer` bật log
   sự kiện prefix-cache có giới hạn (`GET /v1/cache/events`); `ayaka.metrics.estimate` ước lượng
   FLOPs/bytes theo `(q, p)` từ config model, luôn gắn nhãn là ước lượng.
+- Prototype nghiên cứu ở **shadow mode** (mặc định tắt, không đổi bất kỳ quyết định nào):
+  `shadow_prepare_ahead` (R1) đếm số vòng bị chặn bởi trần `max_inflight` trong khi còn request
+  độc lập chờ; `shadow_forecast` (R2) dự báo độ dài output theo quantile cho từng bucket prompt
+  và báo calibration trong `/stats.shadow`; `ayaka.prefix.restore_cost.decide_restore` (R3) là
+  hàm quyết định restore/recompute theo cost-to-ready, có biên bất định, budget và boundary chung
+  của mọi group. Allocator vẫn là nơi duy nhất cấp phát.
 
 ## Phát triển và kiểm tra
 

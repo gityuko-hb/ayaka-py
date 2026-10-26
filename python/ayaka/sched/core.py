@@ -371,6 +371,10 @@ class SchedulerCore(BaseScheduler):
     def has_unfinished(self) -> bool:
         return self._requests.num_active > 0
 
+    def is_inflight(self, request_id: str) -> bool:
+        """Whether a launched, unsettled ticket owns ``request_id`` (read-only)."""
+        return self._owns_inflight(request_id)
+
     # schedule() and update_from_output() remain algorithm-specific.
     @abstractmethod
     def schedule(self) -> ExecutionTicket | None: ...

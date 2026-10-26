@@ -221,6 +221,18 @@ async def _while_connected(request, operation):
         await asyncio.gather(worker, watcher, return_exceptions=True)
 
 
+def _shadow_report(service, admin) -> dict[str, object]:
+    """Shadow research probes, reported only when enabled (they never steer)."""
+    report: dict[str, object] = {}
+    forecaster = getattr(service, "forecaster", None)
+    if forecaster is not None:
+        report["forecast"] = forecaster.calibration().as_dict()
+    prepare_ahead = getattr(admin, "prepare_ahead", None)
+    if prepare_ahead is not None:
+        report["prepare_ahead"] = prepare_ahead.snapshot().as_dict()
+    return report
+
+
 def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
     pipeline = GenerationPipeline(service, processor)
 
@@ -286,6 +298,7 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
             "outstanding": service.outstanding,
             "conservation": service.stats.conservation(outstanding=service.outstanding),
             "token_conservation": service.stats.token_conservation(),
+            "shadow": _shadow_report(service, admin),
             "watchdog": {
                 "threshold_seconds": processor.config.completion_watchdog_seconds,
                 "stalled": None if stall is None else stall.as_dict(),

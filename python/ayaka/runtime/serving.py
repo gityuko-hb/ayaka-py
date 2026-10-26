@@ -58,6 +58,8 @@ from ayaka.runtime.kv import ChunkPressurePolicy
 from ayaka.runtime.output import OutputProcessor
 from ayaka.runtime.resident import ResidentKVEngine
 from ayaka.sampling.engine import SamplingCoordinator
+from ayaka.sched.forecast import OutputLengthForecaster
+from ayaka.sched.prepare_ahead import PrepareAheadShadow
 from ayaka.serving.constraints import GrammarConstraints
 from ayaka.serving.flush import FlushResult
 from ayaka.serving.http import create_app
@@ -356,6 +358,10 @@ class ServingRuntime:
         self._weights_revision = weights_revision
         #: Committed weight updates since boot (see ``update_weights``).
         self._weights_generation = 0
+        #: Shadow research probes, shared across cache rebuilds (None when off).
+        self.prepare_ahead: PrepareAheadShadow | None = (
+            PrepareAheadShadow() if self.config.shadow_prepare_ahead else None
+        )
         #: Prefix-cache telemetry shared across cache rebuilds (None when off).
         self.cache_events: CacheEventLog | None = (
             CacheEventLog(self.config.cache_event_buffer)
@@ -559,6 +565,7 @@ class ServingRuntime:
                 constraints=self._constraints,
                 controller=self,
                 clock=self._clock,
+                forecaster=OutputLengthForecaster() if self.config.shadow_forecast else None,
             )
         except BaseException:
             try:
@@ -1253,6 +1260,8 @@ class ServingRuntime:
         self.workspace_allocator = tail.workspace_allocator
         self.runner_buffers = tail.buffers
         self.engine = tail.engine
+        if self.prepare_ahead is not None:
+            tail.engine.prepare_ahead = self.prepare_ahead
         mirror = getattr(tail.manager, "host_storage", None)
         self._mirror_bytes = 0 if mirror is None else int(mirror.total_bytes)
         self._mirror_pinned = bool(mirror is not None and mirror.pinned)

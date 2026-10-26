@@ -23,6 +23,7 @@ from ayaka.kvcache.status import CacheStatus
 from ayaka.request.schema import Request
 from ayaka.request.states import RequestState
 from ayaka.request.stream import OutputHistoryExpired
+from ayaka.sched.forecast import OutputLengthForecaster
 from ayaka.sched.outcome import FinishReason
 from ayaka.serving.errors import (
     DeadlineExceededError,
@@ -112,6 +113,9 @@ class _WeightUpdateFailed(RuntimeError):
     """A weight update failed without a verified restore; admission stops."""
 
 
+#: Finishes that end a request on its own terms (scored by the R2 forecast).
+_NATURAL_FINISHES = frozenset({"stop", "eos", "length"})
+
 #: How long a flush caller waits past its own timeout for the owner's answer.
 _FLUSH_REPLY_GRACE_SECONDS = 10.0
 
@@ -170,6 +174,8 @@ class GenerationHandle:
         self.first_published_ns = 0
         self.last_published_ns = 0
         self.first_socket_write_ns = 0
+        #: R2 shadow forecast made at admission (None when the probe is off).
+        self.forecast: int | None = None
         self.error: str | None = None
         #: Set by the service on admission: wakes the owner loop on cancel.
         self._wake: Callable[[], None] | None = None
@@ -246,6 +252,9 @@ class GenerationHandle:
 class ServingService:
     """Transport never reads or mutates live scheduler/lifecycle dictionaries."""
 
+    #: R2 shadow forecaster (instance attribute when enabled); off by default.
+    forecaster: OutputLengthForecaster | None = None
+
     def __init__(
         self,
         engine,
@@ -256,6 +265,7 @@ class ServingService:
         controller=None,
         router=None,
         migration: MigrationController | None = None,
+        forecaster: OutputLengthForecaster | None = None,
         clock: Callable[[], int] | None = None,
     ):
         self.engine, self.config = engine, config
@@ -277,6 +287,8 @@ class ServingService:
         self._router = router
         #: Optional chờ-KV migration: drives parked requests out of the park.
         self._migration = migration
+        #: Optional R2 shadow forecaster: scored at terminal, never consulted.
+        self.forecaster = forecaster
         #: The one parked cache flush (engine thread only); see ``flush_cache``.
         self._flush: FlushOperation | None = None
         self._flush_ids = itertools.count(1)
@@ -938,6 +950,8 @@ class ServingService:
             return
         handle = GenerationHandle(request, spec, self.config)
         handle.admitted_ns = self._clock()
+        if self.forecaster is not None:
+            handle.forecast = self.forecaster.predict(request.prompt_len, request.stop.max_tokens)
         if timings is not None:
             handle.ingress_ns = timings.ingress_ns
             handle.validation_done_ns = timings.validation_done_ns
@@ -1064,6 +1078,19 @@ class ServingService:
                 cancel_reason = _cancel_reason_label(lifecycle)
                 self.stats.record_cancellation(cancel_reason)
             terminal_ns = self._clock()
+            if (
+                self.forecaster is not None
+                and handle.forecast is not None
+                and status in _NATURAL_FINISHES
+            ):
+                # Natural finishes only: cancels, timeouts and errors cut a
+                # request short and say nothing about its output length.
+                self.forecaster.observe(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    censored=status == "length",
+                    forecast=handle.forecast,
+                )
             self.engine.forget(request_id)
             self.engine.executor.runner.forget_request(request_id)
             self.engine.requests.forget(request_id)

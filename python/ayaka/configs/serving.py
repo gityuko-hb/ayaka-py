@@ -72,6 +72,11 @@ class ServingConfig:
     max_pending_prompt_tokens: int = 0
     #: Dedicated control-channel budget; 0 reuses ``max_pending_commands``.
     max_pending_controls: int = 0
+    #: Shadow research probes (R1 prepare-ahead, R2 output-length forecast):
+    #: they observe and report in /stats but never change a scheduling or
+    #: allocation decision. Off by default.
+    shadow_prepare_ahead: bool = False
+    shadow_forecast: bool = False
     #: Bounded prefix-cache event log for telemetry (0 = off); events never
     #: authorize frees or admissions and the oldest are dropped when full.
     cache_event_buffer: int = 0
