@@ -213,6 +213,10 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   giả (thread + loopback) và hai process Gloo thật: output trùng engine một rank, step bị từ chối
   thì mọi rank rollback trước khi launch, lỗi sau launch thì mọi rank fail-closed và không
   publish. Đây chưa phải TP/PP thật trên GPU và serving HTTP vẫn chạy một rank.
+- `ayaka.distributed.epoch_plan` (R4, chỉ là hàm quyết định, chưa nối vào scheduler): mỗi rank đề
+  xuất tối đa 8 plan cùng ngữ nghĩa cho một epoch; sau khi gather, mọi rank chọn plan có
+  `max_rank(compute + comm)` nhỏ nhất trong các plan sẵn sàng trên mọi rank active, hoặc cùng abort
+  trước khi submit khi lệch epoch/generation/capability hay không còn plan nào sẵn sàng.
 
 ## Phát triển và kiểm tra
 
