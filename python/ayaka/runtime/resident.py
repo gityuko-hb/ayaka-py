@@ -307,6 +307,8 @@ class ResidentKVEngine(Engine):
         called once with ``(resources, kv, runner, max_inflight)`` and owns
         every object handed to it exactly like ``LocalWorker`` would — the
         resources owner is still built here and still closed by the worker.
+        A worker exposing ``bind_execution_plan`` receives the resolved
+        execution plan once it exists, before any step can launch.
         """
         resolved_scheduler = scheduler_config or SchedulerConfig()
         parallel = parallel_config or ParallelConfig()
@@ -359,6 +361,11 @@ class ResidentKVEngine(Engine):
                     else None
                 ),
             )
+            # A rank worker is built before the plan exists; it must enforce
+            # this plan's identity on every broadcast step.
+            bind_execution_plan = getattr(worker, "bind_execution_plan", None)
+            if bind_execution_plan is not None:
+                bind_execution_plan(execution)
             capabilities = SchedulerCapabilities(
                 max_num_seqs=resolved_scheduler.max_num_seqs,
                 chunked_prefill=resolved_scheduler.enable_chunked_prefill,

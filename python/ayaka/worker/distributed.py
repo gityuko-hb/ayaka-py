@@ -43,6 +43,7 @@ from ayaka.distributed.execution import (
     RankLocalStepHost,
 )
 from ayaka.distributed.step_envelope import DistributedStepEnvelope
+from ayaka.exceptions import InvariantViolationError
 from ayaka.executor.ticket import CompletionFence as ExecutorCompletionFence
 from ayaka.executor.ticket import FenceResult, WorkState
 from ayaka.plan import ExecutionPlan
@@ -117,15 +118,28 @@ def _wait_fence(fence: ExecutorCompletionFence) -> CompletionFence:
 
 
 class LocalStepHost(RankLocalStepHost):
-    """Rank-local host: stage a ``WorkerStep``, validate it, execute locally."""
+    """Rank-local host: stage a ``WorkerStep``, validate it, execute locally.
 
-    def __init__(self, local: StepWorker, *, plan_identity: Mapping[str, Any]) -> None:
+    The plan identity may be bound after construction (an engine builds its
+    worker before its execution plan); until then every step is refused.
+    """
+
+    def __init__(self, local: StepWorker, *, plan_identity: Mapping[str, Any] | None) -> None:
         self.local = local
-        self._plan_identity = dict(plan_identity)
+        self._plan_identity = None if plan_identity is None else dict(plan_identity)
         self._staged: WorkerStep | None = None
         self.last_outcome: WorkerOutcome | None = None
 
+    def bind_plan_identity(self, plan_identity: Mapping[str, Any]) -> None:
+        """Bind the identity once; a different rebinding is an invariant violation."""
+        identity = dict(plan_identity)
+        if self._plan_identity is not None and self._plan_identity != identity:
+            raise InvariantViolationError("distributed host is bound to another execution plan")
+        self._plan_identity = identity
+
     def plan_identity(self) -> Mapping[str, Any]:
+        if self._plan_identity is None:
+            raise RuntimeError("distributed host has no bound execution plan identity")
         return dict(self._plan_identity)
 
     def stage(self, step: WorkerStep) -> None:
@@ -248,7 +262,7 @@ class DistributedStepWorker:
         control: DistributedControlPlane,
         local: StepWorker,
         *,
-        plan_identity: Mapping[str, Any],
+        plan_identity: Mapping[str, Any] | None = None,
         allow_graph: bool = False,
         step_timeout_s: float | None = None,
         shutdown_timeout_s: float | None = None,
@@ -329,6 +343,10 @@ class DistributedStepWorker:
 
     def initialize(self) -> None:
         self.local.initialize()
+
+    def bind_execution_plan(self, execution: ExecutionPlan) -> None:
+        """Bind the global plan identity every broadcast step must match."""
+        self.host.bind_plan_identity(execution_plan_identity(execution))
 
     def execute(self, step: WorkerStep) -> WorkerOutcome:
         self.host.stage(step)
@@ -443,7 +461,7 @@ def build_distributed_worker(
     plan: ResolvedDistributedPlan,
     local: StepWorker,
     *,
-    plan_identity: Mapping[str, Any],
+    plan_identity: Mapping[str, Any] | None = None,
     allow_graph: bool = False,
     step_timeout_s: float | None = None,
     shutdown_timeout_s: float | None = None,

@@ -207,6 +207,12 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   các entry đó bị evict để lần append ghi thẳng vào page thay vì copy. Thao tác là all-or-nothing
   giữa các group; pin lạ, request thứ hai, step đang chạy hay host tier đều bị từ chối và không
   đổi gì.
+- `ResidentKVEngine.from_configs(worker_factory=...)` gắn execution plan vào worker có
+  `bind_execution_plan` (ví dụ `DistributedStepWorker`) trước khi bất kỳ step nào chạy; worker
+  chưa gắn plan sẽ từ chối mọi step. Giao thức distributed được kiểm chứng trên CPU bằng rank
+  giả (thread + loopback) và hai process Gloo thật: output trùng engine một rank, step bị từ chối
+  thì mọi rank rollback trước khi launch, lỗi sau launch thì mọi rank fail-closed và không
+  publish. Đây chưa phải TP/PP thật trên GPU và serving HTTP vẫn chạy một rank.
 
 ## Phát triển và kiểm tra
 
