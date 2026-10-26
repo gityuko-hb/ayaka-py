@@ -156,6 +156,7 @@ class ServingRuntime:
         detect_hardware_snapshot: bool = True,
         draft_model=None,
         draft_tokenizer_path: str | Path | None = None,
+        scheduler_kind: str = "continuous",
     ):
         """Build model bindings and materialize the initial KV slab.
 
@@ -212,6 +213,12 @@ class ServingRuntime:
                 frozen host mirror; ``max_inflight_bytes`` bounds in-flight
                 staging. NVMe/swap tiers are rejected. Tiering moves block
                 residency only: the device slab capacity stays frozen.
+            scheduler_kind: ``continuous`` (default, production policy) or
+                ``eager``: the whole-prompt reference scheduler, served on the
+                same executor for golden-output comparisons and debugging. Eager
+                has no chunked prefill and no preemption, so a prompt longer
+                than ``batch_tokens`` cannot be scheduled; speculative decoding
+                requires ``continuous``.
 
         Decode-graph policy comes from ``config.decode_graph`` /
         ``config.graph_buckets``; ``graph_pool_bytes`` overrides the auto-sized
@@ -302,6 +309,18 @@ class ServingRuntime:
             raise ValueError("prefill CUDA graphs require a CUDA device")
         if resize_safety_bytes < 0:
             raise ValueError("resize_safety_bytes must be non-negative")
+        kind = str(scheduler_kind).strip().lower().replace("-", "_")
+        if kind not in ("continuous", "eager"):
+            raise ValueError("scheduler_kind must be 'continuous' or 'eager'")
+        if kind == "eager" and (
+            self.config.speculative_decoding is not None or self.config.execution_lanes is not None
+        ):
+            raise ValueError(
+                "speculative decoding and PDMux lanes require the continuous scheduler"
+            )
+        #: Eager is the whole-prompt reference policy: no chunking, no preemption.
+        self._scheduler_kind = kind
+        reference = kind == "eager"
 
         self._model = model
         self._device = device
@@ -439,22 +458,23 @@ class ServingRuntime:
                 kv_dtype=DType.from_str(dtype_name),
                 layer_range=(0, model_config.num_hidden_layers),
                 max_num_batched_tokens=batch_tokens,
-                enable_chunked_prefill=True,
+                enable_chunked_prefill=not reference,
             ),
         )
         self._scheduler_config = SchedulerConfig(
-            preemption_mode=PreemptionMode.RECOMPUTE,
+            preemption_mode=PreemptionMode.NONE if reference else PreemptionMode.RECOMPUTE,
             max_num_seqs=max_requests,
             max_num_requests=max_pending_requests,
             max_inflight=max_inflight,
             max_num_batched_tokens=batch_tokens,
-            max_prefill_chunk_tokens=prefill_chunk,
+            enable_chunked_prefill=not reference,
+            max_prefill_chunk_tokens=None if reference else prefill_chunk,
         )
         self._capabilities = SchedulerCapabilities(
             max_num_seqs=max_requests,
-            chunked_prefill=True,
+            chunked_prefill=not reference,
             prefix_cache=True,
-            recompute_preemption=True,
+            recompute_preemption=not reference,
             graph_mode=GraphMode.REPLAY if self._decode_graph else GraphMode.EAGER,
         )
         # R07: persistent per-flight metadata buffers. The device footprint is
@@ -735,6 +755,7 @@ class ServingRuntime:
             plan,
             kv,
             runner,
+            kind=self._scheduler_kind,
             sampling=self._sampling,
             output=self._output,
             prefix_context=self._prefix_context,
