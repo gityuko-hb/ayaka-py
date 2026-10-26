@@ -13,6 +13,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 
 from ayaka.configs.serving import ServingConfig
+from ayaka.executor.base import TicketAge
 from ayaka.kvcache.resize import (
     CacheRebuildRejected,
     CacheResizeFatal,
@@ -47,6 +48,7 @@ from ayaka.serving.flush import (
     FlushStatus,
     validate_flush_timeout,
 )
+from ayaka.serving.load import LoadSnapshot
 from ayaka.serving.migration import MigrationController
 from ayaka.serving.parsers import OutputParser
 from ayaka.serving.prepare import GenerationSpec, PrepareTimings
@@ -260,6 +262,23 @@ class ServingService:
         #: The one parked cache flush (engine thread only); see ``flush_cache``.
         self._flush: FlushOperation | None = None
         self._flush_ids = itertools.count(1)
+        #: Prompt tokens of queued, not yet admitted commands (under ``_lock``).
+        self._queued_tokens = 0
+        #: The ticket that tripped the completion watchdog, while it stays stuck.
+        self._stall: TicketAge | None = None
+        self._load_versions = itertools.count(1)
+        self._load = LoadSnapshot(
+            version=0,
+            taken_ns=self._clock(),
+            ready=False,
+            live_generations=0,
+            queued_commands=0,
+            queued_prompt_tokens=0,
+            running=0,
+            waiting=0,
+            free_pages=0,
+            total_pages=0,
+        )
         runner = engine.executor.runner
         runner.set_request_source(engine.requests.get, constraints=constraints)
         self._thread = threading.Thread(target=self._run, name="ayaka-engine", daemon=True)
@@ -270,9 +289,12 @@ class ServingService:
         """Readiness requires a live owner and an executor that accepts work.
 
         A quarantined ticket or a worker that left READY makes this False even
-        before the owner loop observes it, so admission stops immediately.
+        before the owner loop observes it, so admission stops immediately. So
+        does a ticket the completion watchdog found stuck, until it settles.
         """
         if self._closing.is_set() or self._fatal is not None or self._stopped.is_set():
+            return False
+        if self._stall is not None:
             return False
         kv = getattr(self.engine, "kv", None)
         if kv is not None and getattr(kv, "closed", False):
@@ -531,22 +553,48 @@ class ServingService:
         timings: PrepareTimings | None = None,
     ) -> Future[GenerationHandle]:
         future: Future[GenerationHandle] = Future()
+        tokens = request.prompt_len
+        token_limit = self.config.max_pending_prompt_tokens
         with self._lock:
             if not self.ready:
                 raise EngineUnavailableError("engine is unavailable")
             self.stats.conservation_submitted.inc()
+            if token_limit and self._queued_tokens and self._queued_tokens + tokens > token_limit:
+                # Weigh ingress by prompt tokens, not only by command count, so a
+                # few huge prompts cannot pin unbounded host memory in the queue.
+                self.stats.record_rejection("ingress_tokens")
+                raise OverloadedError("engine ingress token budget is full")
             try:
                 self._commands.put_nowait((request, spec, future, timings))
             except queue.Full as exc:
                 self.stats.record_rejection("ingress")
                 raise OverloadedError("engine ingress queue is full") from exc
+            self._queued_tokens += tokens
         self._signal.set()
         return future
+
+    def _dequeued(self, request: Request) -> None:
+        """Return a command's prompt tokens to the ingress budget."""
+        with self._lock:
+            self._queued_tokens -= request.prompt_len
 
     @property
     def outstanding(self) -> int:
         """Requests offered but not settled: queued commands plus live handles."""
         return len(self._handles) + self._commands.qsize()
+
+    @property
+    def stall(self) -> TicketAge | None:
+        """The ticket holding the service not ready, while it stays unsettled."""
+        return self._stall
+
+    def load_snapshot(self) -> LoadSnapshot:
+        """The latest detached load snapshot; safe from any thread, never blocks."""
+        return self._load
+
+    def load_report(self) -> dict[str, object]:
+        """``load_snapshot`` as a dict, aged on this service's clock."""
+        return self._load.as_dict(now_ns=self._clock())
 
     def _admit(self, request, spec, future, timings=None):
         if not future.set_running_or_notify_cancel():
@@ -616,6 +664,11 @@ class ServingService:
         self._handles[str(request.request_id)] = handle
         future.set_result(handle)
 
+    def _withhold(self, handle: GenerationHandle) -> None:
+        """Count one published token that will never reach its stream."""
+        reason = handle.overflow or ("cancelled" if handle.cancelled.is_set() else "error")
+        self.stats.stream_tokens_withheld.labels(reason).inc()
+
     def _collect(self):
         for request_id, handle in tuple(self._handles.items()):
             lifecycle = self.engine.requests.get(request_id)
@@ -634,10 +687,14 @@ class ServingService:
                     handle.error = str(exc)
                     self.stats.stream_overflows.labels(handle.overflow).inc()
                     self.engine.abort(request_id)
+                skipped = exc.base - handle.cursor
+                self.stats.stream_tokens_published.inc(skipped)
+                self.stats.stream_tokens_withheld.labels("history").inc(skipped)
                 handle.cursor = exc.base
                 events = self.engine.events_since(request_id, handle.cursor)
             for event in events:
                 handle.cursor += 1
+                self.stats.stream_tokens_published.inc()
                 if event.usage.completion_tokens:
                     now_ns = self._clock()
                     if handle.first_token is None:
@@ -645,6 +702,7 @@ class ServingService:
                         handle.first_published_ns = now_ns
                     handle.last_published_ns = now_ns
                 if handle.error or handle.cancelled.is_set():
+                    self._withhold(handle)
                     continue
                 try:
                     # The token's report precedes the text it produced, so a
@@ -659,8 +717,21 @@ class ServingService:
                         self.stats.stream_overflows.labels(handle.overflow).inc()
                     handle.error = str(exc)
                     self.engine.abort(request_id)
+                    self._withhold(handle)
+                else:
+                    self.stats.stream_tokens_forwarded.inc()
             if not lifecycle.is_terminal:
                 continue
+            if handle.cursor != len(lifecycle.output_token_ids):
+                # Every published token emits exactly one output event; a gap
+                # here means the stream ledger and the lifecycle disagree.
+                self.stats.stream_token_mismatches.inc()
+                _LOG.warning(
+                    "token conservation mismatch id=%s events=%d usage=%d",
+                    request_id,
+                    handle.cursor,
+                    len(lifecycle.output_token_ids),
+                )
             reason = lifecycle.finish_reason
             cancelled = lifecycle.state is RequestState.CANCELLED
             if lifecycle.state is RequestState.FAILED:
@@ -767,10 +838,12 @@ class ServingService:
         runner = getattr(self.engine.executor, "runner", None)
         graph_snapshot = getattr(runner, "graph_stats", None)
         self.stats.update_graph_stats(graph_snapshot() if graph_snapshot is not None else None)
+        oldest = self._watch_completion()
         if self.engine.kv.closed:
             self.stats.kv_free.set(0)
             self.stats.kv_total.set(0)
             self.stats.clear_tiering()
+            self._publish_load(oldest, free_pages=0, total_pages=0)
             return
         snapshot = self.engine.kv.snapshot()
         self.stats.kv_free.set(snapshot.free_pages)
@@ -779,6 +852,50 @@ class ServingService:
         if tier is not None:
             self.stats.update_tiering(tier)
         self.stats.update_pressure(self.engine.kv.pressure_metrics)
+        self._publish_load(oldest, free_pages=snapshot.free_pages, total_pages=snapshot.total_pages)
+
+    def _watch_completion(self) -> TicketAge | None:
+        """Track the oldest unsettled ticket; hold readiness while one is stuck.
+
+        A trip records which ticket, step and requests are waiting and stops
+        admission; resources stay retained (a slow device is not a failed one).
+        Readiness returns once that ticket settles or ages back under the limit.
+        """
+        executor = getattr(self.engine, "executor", None)
+        oldest_of = getattr(executor, "oldest_unsettled", None)
+        oldest = oldest_of() if oldest_of is not None else None
+        self.stats.oldest_ticket_age.set(0.0 if oldest is None else oldest.age_ns / 1e9)
+        limit = self.config.completion_watchdog_seconds
+        if limit is None:
+            return oldest
+        stuck = oldest is not None and oldest.age_ns > limit * 1e9
+        if stuck and self._stall is None:
+            self.stats.completion_stalls.inc()
+            _LOG.warning("completion watchdog: %s", oldest.as_dict() if oldest else None)
+        elif not stuck and self._stall is not None:
+            _LOG.warning("completion watchdog cleared: %s", self._stall.as_dict())
+        self._stall = oldest if stuck else None
+        return oldest
+
+    def _publish_load(self, oldest: TicketAge | None, *, free_pages: int, total_pages: int) -> None:
+        """Swap in a fresh immutable load snapshot (one reference assignment)."""
+        with self._lock:
+            queued_tokens = self._queued_tokens
+        scheduler = self.engine.scheduler
+        self._load = LoadSnapshot(
+            version=next(self._load_versions),
+            taken_ns=self._clock(),
+            ready=self.ready,
+            live_generations=len(self._handles),
+            queued_commands=self._commands.qsize(),
+            queued_prompt_tokens=queued_tokens,
+            running=scheduler.num_running,
+            waiting=scheduler.num_waiting,
+            free_pages=free_pages,
+            total_pages=total_pages,
+            oldest_ticket_age_seconds=None if oldest is None else oldest.age_ns / 1e9,
+            stalled=self._stall is not None,
+        )
 
     def _raise_if_admission_closed(self) -> None:
         """Surface quarantine/worker failure on the owner thread.
@@ -838,6 +955,7 @@ class ServingService:
                         request, spec, future, timings = self._commands.get_nowait()
                     except queue.Empty:
                         break
+                    self._dequeued(request)
                     self._admit(request, spec, future, timings)
                 self._apply_controls()
                 if self._closing.is_set():
@@ -878,9 +996,10 @@ class ServingService:
                 self._stopped.set()
                 while True:
                     try:
-                        _, _, future, _ = self._commands.get_nowait()
+                        request, _, future, _ = self._commands.get_nowait()
                     except queue.Empty:
                         break
+                    self._queued_tokens -= request.prompt_len  # _lock is already held
                     if not future.done():
                         self.stats.record_rejection("engine")
                         future.set_exception(EngineUnavailableError("engine owner stopped"))

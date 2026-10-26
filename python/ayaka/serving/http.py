@@ -276,17 +276,28 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
 
     @app.get("/stats")
     async def stats():
+        stall = getattr(service, "stall", None)
         return {
             "ready": service.ready,
             "frontend_active": pipeline.active,
             "outstanding": service.outstanding,
             "conservation": service.stats.conservation(outstanding=service.outstanding),
+            "token_conservation": service.stats.token_conservation(),
+            "watchdog": {
+                "threshold_seconds": processor.config.completion_watchdog_seconds,
+                "stalled": None if stall is None else stall.as_dict(),
+            },
             "slo": service.stats.slo_summary(targets=processor.config.slo_targets),
             "slo_groups": service.stats.slo_groups(),
             "graph": service.stats.graph_snapshot(),
             "scheduler": service.stats.scheduler_snapshot(),
             "recent_requests": service.stats.recent(),
         }
+
+    @app.get("/load")
+    async def load():
+        """The detached load snapshot; ``age_seconds`` says how stale it is."""
+        return service.load_report()
 
     if admin is not None:
 

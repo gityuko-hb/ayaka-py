@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import logging
+from dataclasses import dataclass
 from itertools import count
 
 from ayaka.executor.ticket import (
@@ -25,6 +26,31 @@ from ayaka.speculative.metadata import VerifyLayout
 from ayaka.utils.validation import require_int
 
 _EXECUTOR_IDS = count(1)
+
+
+@dataclass(frozen=True, slots=True)
+class TicketAge:
+    """How long one unsettled ticket has waited for completion (diagnostic only).
+
+    ``age_ns`` runs from submission on the executor's metrics clock. A large age
+    proves nothing about the device by itself: it is a watchdog input, never a
+    licence to free the ticket's resources.
+    """
+
+    ticket_id: TicketId
+    step_id: int
+    state: TicketState
+    age_ns: int
+    request_ids: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "ticket_id": str(self.ticket_id),
+            "step_id": self.step_id,
+            "state": self.state.value,
+            "age_seconds": self.age_ns / 1e9,
+            "request_ids": list(self.request_ids),
+        }
 
 
 class Executor(abc.ABC):
@@ -79,6 +105,33 @@ class Executor(abc.ABC):
 
     def get_ticket(self, ticket_id: TicketId) -> ExecutionTicket | None:
         return self._tickets.get(ticket_id)
+
+    def oldest_unsettled(self) -> TicketAge | None:
+        """The longest-waiting SUBMITTED/DRAINING ticket, or ``None``.
+
+        Quarantined tickets are excluded: they are already a reported failure
+        with retained resources, not work that may still complete.
+        """
+        oldest: TicketAge | None = None
+        now: int | None = None
+        for ticket in self._tickets.values():
+            if ticket.state not in (TicketState.SUBMITTED, TicketState.DRAINING):
+                continue
+            if ticket._submitted_ns is None:
+                continue
+            if now is None:
+                now = self.metrics.now_ns()
+            age = max(0, now - ticket._submitted_ns)
+            if oldest is None or age > oldest.age_ns:
+                step = ticket.prepared.step
+                oldest = TicketAge(
+                    ticket.id,
+                    step.step_id,
+                    ticket.state,
+                    age,
+                    tuple(value.request_id for value in step.inputs),
+                )
+        return oldest
 
     @property
     def quarantined(self) -> tuple[ExecutionTicket, ...]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -65,8 +66,15 @@ class ServingConfig:
     #: step; a consumer that falls behind it is failed, never silently skipped.
     max_history_events: int = 0
     max_pending_commands: int = 256
+    #: Prompt tokens queued for admission across all pending commands (0 = only
+    #: the command count bounds ingress). One request is always accepted into an
+    #: empty queue, so an oversized prompt fails on its own context limit instead.
+    max_pending_prompt_tokens: int = 0
     #: Dedicated control-channel budget; 0 reuses ``max_pending_commands``.
     max_pending_controls: int = 0
+    #: Completion watchdog: a ticket unsettled this long makes the service not
+    #: ready and records a diagnostic; nothing is freed. ``None`` disables it.
+    completion_watchdog_seconds: float | None = None
     max_parser_bytes: int = 1 << 20
     #: Bounded SLO history: the most recent settled requests behind /stats.
     slo_history_size: int = 128
@@ -120,6 +128,15 @@ class ServingConfig:
             raise ValueError("max_pending_controls must be nonnegative")
         if type(self.max_logprobs) is not int or self.max_logprobs < 0:
             raise ValueError("max_logprobs must be a nonnegative integer")
+        if type(self.max_pending_prompt_tokens) is not int or self.max_pending_prompt_tokens < 0:
+            raise ValueError("max_pending_prompt_tokens must be a nonnegative integer")
+        if self.completion_watchdog_seconds is not None and (
+            not isinstance(self.completion_watchdog_seconds, (int, float))
+            or isinstance(self.completion_watchdog_seconds, bool)
+            or not math.isfinite(self.completion_watchdog_seconds)
+            or self.completion_watchdog_seconds <= 0
+        ):
+            raise ValueError("completion_watchdog_seconds must be positive and finite or None")
         if self.max_history_events < 0:
             raise ValueError("max_history_events must be nonnegative")
         if self.max_history_events:

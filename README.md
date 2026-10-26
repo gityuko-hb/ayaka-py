@@ -175,6 +175,13 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   ≤ 3600 s) chờ một operation duy nhất tới khi quiescent hoặc `timeout`; flush trùng lặp gộp
   vào operation đang chờ; `drain=True` giữ admission mới cho tới khi flush xong. Clear lỗi trả
   `failed` và dừng engine (fail-closed). HTTP trả 200 `flushed`, 409 `busy`/`timeout`.
+- Quan sát: `ServingConfig.completion_watchdog_seconds` (mặc định tắt) đưa service về not-ready
+  khi một ticket chưa settle quá ngưỡng, kèm chẩn đoán ticket/step/request trong `/stats`; không
+  giải phóng tài nguyên, tự hồi phục khi ticket settle. `GET /load` trả load snapshot bất biến,
+  có `version` và `age_seconds`, đọc được từ mọi thread. `max_pending_prompt_tokens` giới hạn
+  số prompt token đang xếp hàng ingress. `/stats.token_conservation` đối soát
+  `published = forwarded + withheld[reason]` và bằng usage khi quiescent. Một burst speculative
+  publish cùng lúc chỉ tạo một mẫu ITL, không tạo mẫu ITL giả cho từng token.
 
 ## Phát triển và kiểm tra
 

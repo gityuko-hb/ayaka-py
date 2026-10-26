@@ -172,6 +172,39 @@ class ServingStats:
             ["status"],
             registry=self.registry,
         )
+        # Token conservation at the stream boundary (research CT-O03): every
+        # published token is either forwarded to its stream or withheld.
+        self.stream_tokens_published = Counter(
+            "ayaka_stream_tokens_published",
+            "Published completion tokens observed by the serving owner",
+            registry=self.registry,
+        )
+        self.stream_tokens_forwarded = Counter(
+            "ayaka_stream_tokens_forwarded",
+            "Published tokens whose text reached a live stream",
+            registry=self.registry,
+        )
+        self.stream_tokens_withheld = Counter(
+            "ayaka_stream_tokens_withheld",
+            "Published tokens not forwarded, by reason",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.stream_token_mismatches = Counter(
+            "ayaka_stream_token_mismatches",
+            "Finished streams whose observed token count disagreed with usage",
+            registry=self.registry,
+        )
+        self.oldest_ticket_age = Gauge(
+            "ayaka_oldest_ticket_age_seconds",
+            "Age of the longest-waiting unsettled execution ticket (0 when none)",
+            registry=self.registry,
+        )
+        self.completion_stalls = Counter(
+            "ayaka_completion_stalls",
+            "Completion watchdog trips (a ticket exceeded the configured age)",
+            registry=self.registry,
+        )
         self.running = Gauge(
             "ayaka_running_requests", "Scheduler running requests", registry=self.registry
         )
@@ -473,6 +506,32 @@ class ServingStats:
             "timed_out": timed_out,
             "failed": failed,
             "outstanding": outstanding,
+        }
+
+    def token_conservation(self) -> dict[str, object]:
+        """Published = forwarded + withheld, always; at quiescence also = usage.
+
+        ``usage_completion`` sums ``usage.completion_tokens`` of settled
+        requests, so while streams are live it lags ``published``. A nonzero
+        ``mismatches`` means a finished stream saw a different token count than
+        its usage reported.
+        """
+        withheld: dict[str, int] = {}
+        for metric in self.stream_tokens_withheld.collect():
+            for sample in metric.samples:
+                if sample.name.endswith("_total"):
+                    withheld[sample.labels["reason"]] = int(sample.value)
+        usage = 0
+        for metric in self.tokens.collect():
+            for sample in metric.samples:
+                if sample.name.endswith("_total") and sample.labels.get("kind") == "completion":
+                    usage = int(sample.value)
+        return {
+            "published": int(self.stream_tokens_published._value.get()),
+            "forwarded": int(self.stream_tokens_forwarded._value.get()),
+            "withheld": withheld,
+            "usage_completion": usage,
+            "mismatches": int(self.stream_token_mismatches._value.get()),
         }
 
     def _terminal_counts(self) -> dict[str, int]:
