@@ -78,6 +78,26 @@ class OutputEvent:
             require_int(self.child_index, "child_index", minimum=0)
 
 
+class OutputHistoryExpired(LookupError):
+    """A consumer cursor points before the oldest retained output event.
+
+    The bounded history already dropped the events between ``cursor`` and
+    ``base``; they cannot be replayed. The consumer must fail the stream or
+    resynchronise at ``base`` rather than continue with a silent token gap.
+    """
+
+    def __init__(self, request_id: str, cursor: int, base: int) -> None:
+        super().__init__(
+            f"{request_id}: output history expired "
+            f"(cursor {cursor} is before the oldest retained event {base})"
+        )
+        self.request_id = request_id
+        #: Event index the consumer asked to resume from.
+        self.cursor = cursor
+        #: Index of the oldest event still retained.
+        self.base = base
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedStopPolicy:
     """Token/string stop wins over LENGTH on the same token; explicit IDs win EOS.

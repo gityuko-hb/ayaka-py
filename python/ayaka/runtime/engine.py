@@ -25,6 +25,7 @@ from ayaka.request.lifecycle import LifecycleManager, RequestLifecycle
 from ayaka.request.parallel import expand_parallel_request
 from ayaka.request.schema import Request
 from ayaka.request.states import RequestState
+from ayaka.request.stream import OutputEvent
 from ayaka.runtime.output import FinishDecision, OutputProcessor
 from ayaka.sched.core import SchedulerCore
 from ayaka.sched.interfaces import DeadlineExceededError, SequenceAllocator
@@ -401,6 +402,12 @@ class Engine:
 
     def events(self, request_id: str):
         return self._output.events(request_id)
+
+    def events_since(
+        self, request_id: str, cursor: int = 0, limit: int | None = None
+    ) -> tuple[OutputEvent, ...]:
+        """Events at or after absolute index ``cursor``; see ``OutputProcessor.events_since``."""
+        return self._output.events_since(request_id, cursor, limit)
 
     def finish_reason(self, request_id: str) -> FinishReason | None:
         lifecycle = self._requests.get(request_id)

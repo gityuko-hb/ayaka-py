@@ -496,7 +496,9 @@ class ServingRuntime:
                 ) != set(target_tokenizer.all_special_ids):
                     raise ValueError("draft and target tokenizer vocabularies/special IDs differ")
             self._output = OutputProcessor(
-                self.tokenizer, eos_token_ids=self.tokenizer.eos_token_ids
+                self.tokenizer,
+                eos_token_ids=self.tokenizer.eos_token_ids,
+                history_limit=self.config.max_history_events or None,
             )
             self._prefix_context = self._prefix_identity
             if self.config.structured_outputs:

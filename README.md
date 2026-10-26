@@ -156,6 +156,11 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   [SamplingParams](python/ayaka/sampling/params.py) và
   [SpeculativeDecodingConfig](python/ayaka/speculative/config.py) là các điểm vào cấu hình
   serving, sampling và n-gram speculation.
+- `Engine.events_since(request_id, cursor)` đọc output theo cursor tuyệt đối và chỉ sao chép
+  các event mới; `Engine.events(request_id)` vẫn trả bản sao toàn bộ lịch sử đang giữ.
+  `ServingConfig.max_history_events` (mặc định `0` = không giới hạn) chặn số event giữ lại cho
+  mỗi request; consumer tụt quá giới hạn nhận `OutputHistoryExpired` và chỉ request đó bị hủy,
+  không bao giờ mất token một cách âm thầm.
 
 ## Phát triển và kiểm tra
 
@@ -172,6 +177,9 @@ rtk proxy uv build
 Pytest được cấu hình tìm test trong `tests/`, với timeout 30 giây và marker `gpu`/`slow`.
 `tests/*` hiện bị Git ignore; khi bổ sung test cần kiểm tra file đã được track. Kết quả CPU
 reference cần được phân biệt với validation trên GPU CUDA thực tế.
+
+`python tools/bench_output_events.py` đo riêng bước thu thập output trên CPU (không phải
+benchmark serving end-to-end); dùng `--json` để lưu mẫu thô.
 
 Quy ước đóng góp nằm trong [AGENTS.md](AGENTS.md); sử dụng
 [pull request template](.github/PULL_REQUEST_TEMPLATE.md) để ghi rationale và kết quả kiểm tra.

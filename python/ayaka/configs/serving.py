@@ -54,6 +54,10 @@ class ServingConfig:
     max_request_chunks: int = 4096
     max_stream_events: int = 128
     max_stream_bytes: int = 1 << 20
+    #: Per-request cap on retained output events (0 = unbounded). The service
+    #: consumes after every engine step, so the quota must cover one speculative
+    #: step; a consumer that falls behind it is failed, never silently skipped.
+    max_history_events: int = 0
     max_pending_commands: int = 256
     #: Dedicated control-channel budget; 0 reuses ``max_pending_commands``.
     max_pending_controls: int = 0
@@ -108,6 +112,17 @@ class ServingConfig:
             raise ValueError("max_admitted_requests must be nonnegative")
         if self.max_pending_controls < 0:
             raise ValueError("max_pending_controls must be nonnegative")
+        if self.max_history_events < 0:
+            raise ValueError("max_history_events must be nonnegative")
+        if self.max_history_events:
+            from ayaka.speculative.config import MAX_DRAFT_TOKENS
+
+            # One speculative step publishes up to MAX_DRAFT_TOKENS + 1 events.
+            if self.max_history_events <= MAX_DRAFT_TOKENS:
+                raise ValueError(
+                    "max_history_events must be 0 (unbounded) or at least "
+                    f"{MAX_DRAFT_TOKENS + 1} to cover one speculative step"
+                )
         if self.default_request_timeout_seconds is not None and (
             not isinstance(self.default_request_timeout_seconds, (int, float))
             or isinstance(self.default_request_timeout_seconds, bool)

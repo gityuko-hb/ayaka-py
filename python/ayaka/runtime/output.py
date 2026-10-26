@@ -13,8 +13,14 @@ from typing import TYPE_CHECKING
 from ayaka.configs.base import ConfigError
 from ayaka.configs.tokenizer import DetokenizeParams
 from ayaka.request.schema import Request
-from ayaka.request.stream import OutputEvent, ResolvedStopPolicy, TokenUsage
+from ayaka.request.stream import (
+    OutputEvent,
+    OutputHistoryExpired,
+    ResolvedStopPolicy,
+    TokenUsage,
+)
 from ayaka.sched.outcome import FinishReason
+from ayaka.utils.validation import require_int
 
 if TYPE_CHECKING:
     from ayaka.runtime.collection import OutputListener
@@ -40,7 +46,10 @@ class _OutputState:
     prompt_tokens: int
     decoder: IncrementalDetokenizer | ProcessDetokenizer | None
     text: str = ""
+    #: Retained window: ``events[i]`` has ``event_index == base + i``.
     events: list[OutputEvent] = field(default_factory=list)
+    #: Absolute index of ``events[0]``; only advances when the history quota trims.
+    base: int = 0
     child_index: int | None = None
 
 
@@ -49,6 +58,10 @@ class OutputProcessor:
 
     Without a tokenizer only token-ID stops and length limits are available;
     advertising that limitation is the caller's job (see ``text_stops_supported``).
+
+    Each request keeps its published events so a pull consumer can resume from an
+    absolute cursor (:meth:`events_since`). ``history_limit`` bounds that history
+    per request; the default ``None`` retains every event until :meth:`forget`.
     """
 
     def __init__(
@@ -56,9 +69,13 @@ class OutputProcessor:
         tokenizer: TokenizerService | ProcessTokenizerPool | None = None,
         *,
         eos_token_ids: tuple[int, ...] = (),
+        history_limit: int | None = None,
     ) -> None:
+        if history_limit is not None:
+            require_int(history_limit, "history_limit", minimum=1)
         self._tokenizer = tokenizer
         self._eos_token_ids = tuple(eos_token_ids)
+        self._history_limit = history_limit
         self._states: dict[str, _OutputState] = {}
         self._listener: OutputListener | None = None
 
@@ -178,13 +195,14 @@ class OutputProcessor:
         event = OutputEvent(
             request_id=request_id,
             sequence_epoch=sequence_epoch,
-            event_index=len(state.events),
+            event_index=state.base + len(state.events),
             delta=delta,
             usage=TokenUsage(prompt_tokens, generated_tokens),
             finish_reason=reason,
             child_index=state.child_index,
         )
         state.events.append(event)
+        self._trim(state)
         if self._listener is not None:
             self._listener.on_output_event(event)
         if reason is None:
@@ -195,7 +213,57 @@ class OutputProcessor:
         return self._state(request_id).text
 
     def events(self, request_id: str) -> tuple[OutputEvent, ...]:
+        """Compatibility view: a copy of the whole retained history, oldest first.
+
+        Costs O(retained events) per call. Without ``history_limit`` that is every
+        event; with it, only the retained window. Pollers should use
+        :meth:`events_since`, which copies just the new events.
+        """
         return tuple(self._state(request_id).events)
+
+    def events_since(
+        self, request_id: str, cursor: int = 0, limit: int | None = None
+    ) -> tuple[OutputEvent, ...]:
+        """Events at or after absolute index ``cursor``, oldest first.
+
+        Copies only the delta, so a consumer that polls after every step does
+        O(new events) work in total instead of re-copying the history each time.
+        ``cursor`` is the ``event_index`` of the first event the caller has not
+        seen; advance it by ``len(result)``. ``limit`` caps the batch size.
+
+        Raises :class:`OutputHistoryExpired` when the bounded history already
+        dropped the event at ``cursor``, ``ValueError`` when ``cursor`` is ahead of
+        what was published, and ``KeyError`` for an unknown request.
+        """
+        require_int(cursor, "cursor")
+        if limit is not None:
+            require_int(limit, "limit")
+        state = self._state(request_id)
+        start = cursor - state.base
+        if start < 0:
+            raise OutputHistoryExpired(request_id, cursor, state.base)
+        end = len(state.events)
+        if start > end:
+            raise ValueError(
+                f"cursor {cursor} is ahead of the {state.base + end} events "
+                f"published for {request_id!r}"
+            )
+        if limit is not None:
+            end = min(end, start + limit)
+        return tuple(state.events[start:end])
+
+    def _trim(self, state: _OutputState) -> None:
+        """Enforce the history quota, always keeping the newest ``history_limit``.
+
+        Trims in blocks once the window reaches twice the quota, so each event
+        costs amortised O(1) and retained events stay below ``2 * history_limit``.
+        """
+        limit = self._history_limit
+        if limit is None or len(state.events) < 2 * limit:
+            return
+        drop = len(state.events) - limit
+        del state.events[:drop]
+        state.base += drop
 
     def _state(self, request_id: str) -> _OutputState:
         state = self._states.get(request_id)

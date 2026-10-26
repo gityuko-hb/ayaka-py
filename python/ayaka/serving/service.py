@@ -20,6 +20,7 @@ from ayaka.kvcache.resize import (
 from ayaka.kvcache.status import CacheStatus
 from ayaka.request.schema import Request
 from ayaka.request.states import RequestState
+from ayaka.request.stream import OutputHistoryExpired
 from ayaka.sched.outcome import FinishReason
 from ayaka.serving.errors import (
     DeadlineExceededError,
@@ -428,8 +429,22 @@ class ServingService:
             lifecycle = self.engine.requests.get(request_id)
             if handle.cancelled.is_set() and not lifecycle.is_terminal:
                 self.engine.abort(request_id, reason="client cancelled")
-            events = self.engine.events(request_id)
-            for event in events[handle.cursor :]:
+            try:
+                events = self.engine.events_since(request_id, handle.cursor)
+            except OutputHistoryExpired as exc:
+                # The consumer fell behind the bounded output history, so the
+                # skipped tokens can never be replayed. Fail only this request,
+                # like any other slow consumer. Resuming at the retained base keeps
+                # the cursor in step; with the error set, the loop below only
+                # records token timing and queues nothing.
+                if not handle.error:
+                    handle.overflow = "history"
+                    handle.error = str(exc)
+                    self.stats.stream_overflows.labels(handle.overflow).inc()
+                    self.engine.abort(request_id)
+                handle.cursor = exc.base
+                events = self.engine.events_since(request_id, handle.cursor)
+            for event in events:
                 handle.cursor += 1
                 if event.usage.completion_tokens:
                     now_ns = self._clock()
