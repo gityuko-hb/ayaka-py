@@ -71,10 +71,14 @@ class KernelStats:
     """Total self CUDA time in microseconds."""
     avg_us: float
     """Average self CUDA time per call in microseconds."""
-    min_us: float
-    """Minimum self CUDA time in microseconds."""
-    max_us: float
-    """Maximum self CUDA time in microseconds."""
+    min_us: float | None
+    """Shortest single invocation in microseconds; ``None`` when not measured.
+
+    ``torch.profiler`` key averages only expose per-kernel totals, so the
+    aggregate path leaves this ``None`` instead of passing the average off as a
+    measured extreme."""
+    max_us: float | None
+    """Longest single invocation in microseconds; ``None`` when not measured."""
     pct: float
     """Percentage of total GPU time across all kernels."""
 
@@ -110,6 +114,7 @@ def _parse_profiler_events(prof: Any) -> list[KernelStats]:
 
     Reads ``self_cuda_time_total`` (microseconds) from each event that has
     non-zero CUDA time, groups by kernel name, and computes percentages.
+    Per-invocation extrema are not available from key averages and stay ``None``.
     """
     events = prof.key_averages()
     raw: list[tuple[str, int, float]] = []
@@ -128,10 +133,9 @@ def _parse_profiler_events(prof: Any) -> list[KernelStats]:
     if total_us <= 0:
         return []
 
-    # Build stats with min/max approximated as avg (torch.profiler key_averages
-    # only exposes totals; per-invocation min/max would require event-level
-    # iteration which is expensive).  The values are still useful because the
-    # primary purpose is the percentage breakdown.
+    # key_averages only exposes totals, so per-invocation min/max are unmeasured:
+    # report None rather than echoing the average as a fake extreme.  Totals,
+    # averages and the percentage breakdown are what this path derives from data.
     stats: list[KernelStats] = []
     for name, count, cuda_us in raw:
         avg = cuda_us / max(count, 1)
@@ -141,8 +145,8 @@ def _parse_profiler_events(prof: Any) -> list[KernelStats]:
                 calls=count,
                 total_us=round(cuda_us, 1),
                 avg_us=round(avg, 1),
-                min_us=round(avg, 1),
-                max_us=round(avg, 1),
+                min_us=None,
+                max_us=None,
                 pct=round(cuda_us / total_us * 100, 2),
             )
         )
@@ -239,7 +243,10 @@ def _export_csv(stats: list[KernelStats], path: str | Path) -> None:
         writer = csv.writer(f)
         writer.writerow(["kernel", "calls", "total_us", "avg_us", "min_us", "max_us", "pct"])
         for s in stats:
-            writer.writerow([s.name, s.calls, s.total_us, s.avg_us, s.min_us, s.max_us, s.pct])
+            # An unmeasured extreme is an empty cell, never a fabricated number.
+            low = "" if s.min_us is None else s.min_us
+            high = "" if s.max_us is None else s.max_us
+            writer.writerow([s.name, s.calls, s.total_us, s.avg_us, low, high, s.pct])
 
 
 class KernelProfiler:
