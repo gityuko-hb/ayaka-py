@@ -216,6 +216,36 @@ class PrefixService:
         # pruning cannot create a new terminal, so the set difference is it.
         return next((info for info in before if info.handle.index not in remaining), None)
 
+    @property
+    def live_transfers(self) -> int:
+        """Prefix transfers whose reader may still copy cached pages."""
+        return sum(not transfer.retired for transfer in self._transfers)
+
+    def clear(self) -> int:
+        """Drop every resident entry and keep serving (administrative flush).
+
+        The caller proves quiescence first; a live transfer is refused here as
+        a backstop, before anything changes. Digests this node advertised for
+        the dropped blocks are withdrawn so peers stop routing here. Returns
+        the cache references released; their pages become free once the safe
+        epoch completes (``reclaim_deferred``).
+
+        Raises:
+            RuntimeError: When a prefix transfer has not retired.
+        """
+        self.require_open()
+        if self.live_transfers:
+            raise RuntimeError("prefix cache clear refused: a prefix transfer is still live")
+        store, publisher = self.store, self._index_publisher
+        if isinstance(store, GroupedPrefixCache) or publisher is None:
+            return self.backend.clear_prefix_cache()  # grouped entries are never advertised
+        before = {info.identity.digest for info in store.cached_block_index()}
+        released = self.backend.clear_prefix_cache()
+        remaining = {info.identity.digest for info in store.cached_block_index()}
+        for digest in before - remaining:
+            publisher.withdraw_digest(digest)
+        return released
+
     def close(self) -> bool:
         """Drop cache ownership only after all transfers have retired."""
         if self.closed:

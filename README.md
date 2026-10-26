@@ -168,6 +168,13 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   20); report trong hàng đợi stream có trần byte riêng `max_stream_logprob_bytes`. Request có
   logprobs không đi qua speculative decoding. `echo`/`suffix` (prompt logprobs), tool calls và
   reasoning parser khi bật logprobs vẫn bị từ chối rõ ràng.
+- `ServingService.flush_cache(timeout=..., drain=...)` (và route admin `POST /v1/cache/flush`)
+  xóa prefix cache trên owner thread **chỉ khi mọi owner KV đã quiescent**: không còn generation,
+  request chưa xong, ticket, page reserved/in-flight, transaction, lease, tier hay prefix
+  transfer. `timeout=0` trả `busy` ngay kèm danh sách owner đang bận; timeout dương (hữu hạn,
+  ≤ 3600 s) chờ một operation duy nhất tới khi quiescent hoặc `timeout`; flush trùng lặp gộp
+  vào operation đang chờ; `drain=True` giữ admission mới cho tới khi flush xong. Clear lỗi trả
+  `failed` và dừng engine (fail-closed). HTTP trả 200 `flushed`, 409 `busy`/`timeout`.
 
 ## Phát triển và kiểm tra
 

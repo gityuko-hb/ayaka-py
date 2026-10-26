@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import queue
 import threading
@@ -39,6 +40,12 @@ from ayaka.serving.events import (
     ToolCallEnd,
     ToolCallStart,
     UsageUpdate,
+)
+from ayaka.serving.flush import (
+    FlushOperation,
+    FlushResult,
+    FlushStatus,
+    validate_flush_timeout,
 )
 from ayaka.serving.migration import MigrationController
 from ayaka.serving.parsers import OutputParser
@@ -84,6 +91,14 @@ class _EngineQuarantined(RuntimeError):
 
 class _WorkerFailed(RuntimeError):
     """The device worker left READY; admission must stop."""
+
+
+class _FlushFailed(RuntimeError):
+    """A prefix-cache clear raised mid-way; state may be partial, admission stops."""
+
+
+#: How long a flush caller waits past its own timeout for the owner's answer.
+_FLUSH_REPLY_GRACE_SECONDS = 10.0
 
 
 def _cancel_reason_label(lifecycle) -> str:
@@ -242,6 +257,9 @@ class ServingService:
         self._router = router
         #: Optional chờ-KV migration: drives parked requests out of the park.
         self._migration = migration
+        #: The one parked cache flush (engine thread only); see ``flush_cache``.
+        self._flush: FlushOperation | None = None
+        self._flush_ids = itertools.count(1)
         runner = engine.executor.runner
         runner.set_request_source(engine.requests.get, constraints=constraints)
         self._thread = threading.Thread(target=self._run, name="ayaka-engine", daemon=True)
@@ -314,12 +332,160 @@ class ServingService:
             raise EngineUnavailableError("cache status returned no status")
         return result
 
+    def flush_cache(self, *, timeout: float = 0.0, drain: bool = False) -> FlushResult:
+        """Drop the prefix cache once no owner can read KV (engine owner thread).
+
+        ``timeout`` is how long, in finite seconds, a busy engine may take to
+        become quiescent; ``0`` answers ``BUSY`` at once. ``drain=True`` also
+        holds new admissions while the flush waits, so a steady stream of
+        requests cannot starve it; held requests keep their queue deadlines.
+        A flush issued while another waits joins it and gets the same outcome
+        (its own ``timeout``/``drain`` are not applied). ``FAILED`` means the
+        clear raised; the engine then stops admitting work, fail-closed.
+
+        Raises:
+            TypeError, ValueError: For a non-numeric, NaN, infinite, negative or
+                oversized timeout, or a non-boolean ``drain``.
+            EngineUnavailableError: When the engine is closing, has no cache
+                controller, or did not answer in time.
+        """
+        seconds = validate_flush_timeout(timeout)
+        if type(drain) is not bool:
+            raise TypeError("drain must be a boolean")
+        if not self.ready:
+            raise EngineUnavailableError("engine is unavailable")
+        future: Future = Future()
+        with self._lock:
+            try:
+                self._controls.put_nowait(("flush", (seconds, drain), future))
+            except queue.Full as exc:
+                self.stats.record_rejection("control")
+                raise EngineUnavailableError("engine control queue is full") from exc
+        self._signal.set()
+        try:
+            result = future.result(seconds + _FLUSH_REPLY_GRACE_SECONDS)
+        except TimeoutError as exc:
+            future.cancel()  # the owner drops a cancelled caller, never answers it
+            raise EngineUnavailableError("cache flush did not answer in time") from exc
+        if not isinstance(result, FlushResult):
+            raise EngineUnavailableError("cache flush returned no result")
+        return result
+
+    def _quiescence_blockers(self) -> tuple[str, ...]:
+        """Every owner that may still read or write KV; empty means flush-safe.
+
+        Queued, not yet admitted commands hold nothing and do not block.
+        """
+        blockers: list[str] = []
+        if self._handles:
+            blockers.append(f"{len(self._handles)} live generations")
+        engine = self.engine
+        if engine.has_unfinished:
+            blockers.append("scheduler has unfinished requests")
+        executor = getattr(engine, "executor", None)
+        if executor is not None:
+            tickets = len(tuple(getattr(executor, "tickets", ())))
+            if tickets:
+                blockers.append(f"{tickets} unretired tickets")
+            if getattr(executor, "pending_completion", False):
+                blockers.append("a completion fence is pending")
+            if getattr(executor, "quarantined", ()):
+                blockers.append("quarantined tickets retain resources")
+        controller = self._controller
+        if controller is not None:
+            blockers.extend(controller.flush_blockers())
+        return tuple(blockers)
+
+    def _start_flush(self, seconds: float, drain: bool, future: Future) -> None:
+        pending = self._flush
+        if pending is not None:
+            pending.waiters.append(future)  # coalesce: one destructive operation
+            return
+        now = self._clock()
+        operation = FlushOperation(
+            operation=next(self._flush_ids),
+            started_ns=now,
+            deadline_ns=now + int(seconds * 1e9),
+            drain=drain,
+            waiters=[future],
+        )
+        blockers = self._quiescence_blockers()
+        if not blockers:
+            self._run_flush(operation)
+        elif seconds == 0:
+            self._answer_flush(operation, FlushStatus.BUSY, blockers=blockers)
+        else:
+            self._flush = operation
+
+    def _poll_flush(self) -> None:
+        """Resolve the parked flush: quiescent wins, then the deadline."""
+        operation = self._flush
+        if operation is None:
+            return
+        if not operation.live_waiters():
+            # Every caller gave up: nothing to flush and the fence lifts.
+            self._flush = None
+            self.stats.cache_flushes.labels("abandoned").inc()
+            return
+        blockers = self._quiescence_blockers()
+        if not blockers:
+            self._flush = None
+            self._run_flush(operation)
+        elif self._clock() >= operation.deadline_ns:
+            self._flush = None
+            self._answer_flush(operation, FlushStatus.TIMEOUT, blockers=blockers)
+
+    def _run_flush(self, operation: FlushOperation) -> None:
+        controller = self._controller
+        assert controller is not None
+        before = self.engine.kv.snapshot().free_pages
+        try:
+            released = controller.flush_prefix_cache()
+        except BaseException as exc:
+            self._answer_flush(operation, FlushStatus.FAILED, detail=str(exc))
+            raise _FlushFailed(f"prefix cache flush failed: {exc}") from exc
+        after = self.engine.kv.snapshot().free_pages
+        self._answer_flush(
+            operation,
+            FlushStatus.FLUSHED,
+            released=released,
+            free_before=before,
+            free_after=after,
+        )
+
+    def _answer_flush(
+        self,
+        operation: FlushOperation,
+        status: FlushStatus,
+        *,
+        blockers: tuple[str, ...] = (),
+        released: int = 0,
+        free_before: int = 0,
+        free_after: int = 0,
+        detail: str = "",
+    ) -> None:
+        callers = len(operation.live_waiters())
+        result = FlushResult(
+            status=status,
+            operation=operation.operation,
+            released_refs=released,
+            free_pages_before=free_before,
+            free_pages_after=free_after,
+            callers=callers,
+            waited_seconds=max(0, self._clock() - operation.started_ns) / 1e9,
+            blockers=blockers,
+            detail=detail,
+        )
+        operation.answer(result)
+        self.stats.cache_flushes.labels(status.value).inc()
+
     def _apply_controls(self) -> None:
         """Run queued cache controls on the engine thread between steps.
 
         Raises:
             CacheResizeFatal: When a rebuild cannot be recovered; the run loop
                 treats it like any fatal engine error and drains resources.
+            _FlushFailed: When a cache flush raised; handled the same way.
         """
         while True:
             try:
@@ -331,6 +497,10 @@ class ServingService:
             controller = self._controller
             if controller is None or self._closing.is_set() or self._fatal is not None:
                 future.set_exception(EngineUnavailableError("engine is unavailable"))
+                continue
+            if command == "flush":
+                seconds, drain = payload
+                self._start_flush(seconds, drain, future)
                 continue
             try:
                 if command == "status":
@@ -648,10 +818,22 @@ class ServingService:
         for handle in self._handles.values():
             handle.put(GenerationFailed(code, message), terminal=True)
 
+    def _idle_wait_seconds(self) -> float:
+        """Bound the owner's sleep by the parked flush deadline, if any."""
+        wait = 0.001 if self._handles else 0.05
+        operation = self._flush
+        if operation is not None:
+            remaining = (operation.deadline_ns - self._clock()) / 1e9
+            wait = min(wait, max(remaining, 0.0))
+        return wait
+
     def _run(self):
         try:
             while True:
-                for _ in range(32):
+                # A draining flush fences admission: queued requests wait (and
+                # keep their queue deadlines) until it resolves.
+                fenced = self._flush is not None and self._flush.drain
+                for _ in range(0 if fenced else 32):
                     try:
                         request, spec, future, timings = self._commands.get_nowait()
                     except queue.Empty:
@@ -659,6 +841,9 @@ class ServingService:
                     self._admit(request, spec, future, timings)
                 self._apply_controls()
                 if self._closing.is_set():
+                    operation, self._flush = self._flush, None
+                    if operation is not None:
+                        operation.fail(EngineUnavailableError("engine is closing"))
                     result = self.engine.close()
                     self._collect()
                     self._gauges()
@@ -668,21 +853,27 @@ class ServingService:
                 else:
                     self.engine.step()
                     self._collect()
+                    self._poll_flush()
                     self._gauges()
                     if self._migration is not None:
                         self._migration.poll()
                     self._raise_if_admission_closed()
-                self._signal.wait(0.001 if self._handles else 0.05)
+                self._signal.wait(self._idle_wait_seconds())
                 self._signal.clear()
         except BaseException as exc:
             if isinstance(exc, _EngineQuarantined):
                 code, message = "engine_quarantined", str(exc)
             elif isinstance(exc, _WorkerFailed):
                 code, message = "worker_failed", str(exc)
+            elif isinstance(exc, _FlushFailed):
+                code, message = "cache_flush_failed", str(exc)
             else:
                 code, message = "engine_unavailable", "engine owner failed"
             self._fail_engine(exc, code=code, message=message)
         finally:
+            operation, self._flush = self._flush, None
+            if operation is not None:
+                operation.fail(EngineUnavailableError("engine owner stopped"))
             with self._lock:
                 self._stopped.set()
                 while True:

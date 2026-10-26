@@ -310,6 +310,21 @@ def create_app(service, processor, *, close=None, admin=None) -> FastAPI:
                 raise cache_resize_error(exc) from exc
             return status.as_dict()
 
+        @app.post("/v1/cache/flush")
+        async def cache_flush(request: Request):
+            """Drop the prefix cache once quiescent; 200 flushed, 409 busy/timeout."""
+            body = await _body(request)
+            unknown = set(body) - {"timeout", "drain"}
+            if unknown:
+                raise InvalidRequestError(f"unsupported field: {sorted(unknown)[0]}")
+            timeout, drain = body.get("timeout", 0.0), body.get("drain", False)
+            try:
+                result = await asyncio.to_thread(admin.flush_cache, timeout=timeout, drain=drain)
+            except (TypeError, ValueError) as exc:
+                raise InvalidRequestError(str(exc)) from exc
+            status_code = {"flushed": 200, "busy": 409, "timeout": 409}.get(result.status, 500)
+            return JSONResponse(result.as_dict(), status_code=status_code)
+
     async def generate(request: Request, protocol: str):
         body = await _body(request)
         spec = _normalize(body, protocol)

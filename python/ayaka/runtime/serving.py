@@ -58,6 +58,7 @@ from ayaka.runtime.output import OutputProcessor
 from ayaka.runtime.resident import ResidentKVEngine
 from ayaka.sampling.engine import SamplingCoordinator
 from ayaka.serving.constraints import GrammarConstraints
+from ayaka.serving.flush import FlushResult
 from ayaka.serving.http import create_app
 from ayaka.serving.prepare import RequestProcessor
 from ayaka.serving.service import ServingService
@@ -1328,6 +1329,59 @@ class ServingRuntime:
             safety_bytes=self._resize_safety_bytes,
             budget_bytes=self._frozen_budget(),
         )
+
+    def flush_cache(self, *, timeout: float = 0.0, drain: bool = False) -> FlushResult:
+        """Drop the prefix cache once every KV owner is quiescent.
+
+        Delegates to :meth:`ServingService.flush_cache`, which owns the
+        deadline, coalescing and admission-fence policy.
+        """
+        self._require_live()
+        if self.service is None:
+            raise RuntimeError("runtime has no serving service")
+        return self.service.flush_cache(timeout=timeout, drain=drain)
+
+    def flush_blockers(self) -> tuple[str, ...]:
+        """KV-side owners that still pin pages; engine owner thread only.
+
+        The service adds its own owners (generations, scheduler, tickets).
+        """
+        kv = self.kv
+        if kv is None or kv.closed:
+            return ("KV cache is closed",)
+        snapshot = kv.snapshot()
+        blockers = [
+            f"{count} {label}"
+            for label, count in (
+                ("live sequences", snapshot.live_sequences),
+                ("reserved pages", snapshot.reserved_pages),
+                ("in-flight pages", snapshot.inflight_pages),
+                ("open transactions", snapshot.open_transactions),
+                ("active prefix leases", snapshot.active_leases),
+            )
+            if count
+        ]
+        tier = kv.tier_metrics()
+        if tier is not None and tier.pending_transfers:
+            blockers.append(f"{tier.pending_transfers} tier transfers")
+        if self._prefix_context is not None and kv.prefix_service.live_transfers:
+            blockers.append(f"{kv.prefix_service.live_transfers} prefix transfers")
+        return tuple(blockers)
+
+    def flush_prefix_cache(self) -> int:
+        """Clear every cached prefix and reclaim it; engine owner thread only.
+
+        Called only after :meth:`flush_blockers` and the service's own owners
+        report quiescence. Returns the cache references released.
+        """
+        kv = self.kv
+        assert kv is not None
+        if self._prefix_context is not None:
+            released = kv.prefix_service.clear()
+        else:
+            released = kv.clear_prefix_cache()
+        kv.reclaim_deferred()
+        return released
 
     def resize(self, pages: int, *, timeout: float = 30.0) -> CacheStatus:
         """Request a capacity change through the engine owner thread.

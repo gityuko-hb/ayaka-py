@@ -166,6 +166,12 @@ class ServingStats:
             ["reason"],
             registry=self.registry,
         )
+        self.cache_flushes = Counter(
+            "ayaka_cache_flushes",
+            "Prefix-cache flush operations by outcome (coalesced callers count once)",
+            ["status"],
+            registry=self.registry,
+        )
         self.running = Gauge(
             "ayaka_running_requests", "Scheduler running requests", registry=self.registry
         )

@@ -197,13 +197,16 @@ class CpuServing:
     def http(self):
         """A Starlette test client on the production HTTP app over this stack.
 
-        The app's lifespan is not entered, so this stack keeps ownership of
-        shutdown; ``close`` drains it as usual.
+        The admin routes are bound to this runtime. The app's lifespan is not
+        entered, so this stack keeps ownership of shutdown; ``close`` drains it.
         """
         from ayaka.serving.http import create_app
         from starlette.testclient import TestClient
 
-        return TestClient(create_app(self.service, self.runtime.processor, close=lambda: True))
+        app = create_app(
+            self.service, self.runtime.processor, close=lambda: True, admin=self.runtime
+        )
+        return TestClient(app)
 
     # -- oracle ----------------------------------------------------------
 
