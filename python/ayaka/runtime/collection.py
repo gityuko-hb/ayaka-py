@@ -50,6 +50,11 @@ class OutputStream:
     Single-consumer: like the serving handle, only one ``next_event`` waiter
     is tracked at a time. ``put`` never blocks the engine thread; ``close`` is
     idempotent and always accepted so a terminal slot is never refused.
+
+    Closing is monotonic. ``_closed`` is set once under the stream lock and never
+    cleared, so the fact outlives the queued terminal marker: after the consumer
+    pops the marker, a late ``put`` is still dropped, a repeated ``close`` queues
+    no second marker, and every later ``next_event`` terminates immediately.
     """
 
     def __init__(self, request_id: str, *, limit: int = 1024) -> None:
@@ -60,12 +65,23 @@ class OutputStream:
         self._events: deque[OutputEvent | None] = deque()
         self._waiter: asyncio.Future | None = None
         self._limit = limit
+        self._closed = False
         self.overflowed = False
 
-    def put(self, event: OutputEvent) -> bool:
-        """Nonblocking push; ``False`` when the buffer is full (nonterminal)."""
+    @property
+    def closed(self) -> bool:
+        """Whether ``close`` ran; stays true after the consumer drains the marker."""
         with self._lock:
-            if self._events and self._events[-1] is _CLOSED:
+            return self._closed
+
+    def put(self, event: OutputEvent) -> bool:
+        """Nonblocking push; ``False`` when the buffer is full (nonterminal).
+
+        A closed stream drops the event and still reports ``True``: lateness is
+        not overflow, so the caller must not abort a request that already ended.
+        """
+        with self._lock:
+            if self._closed:
                 return True  # closed; a late duplicate/stale event is dropped
             if len(self._events) >= self._limit:
                 self.overflowed = True
@@ -76,10 +92,15 @@ class OutputStream:
         return True
 
     def close(self) -> None:
-        """Append the terminal marker and wake any waiting consumer."""
+        """Append the terminal marker once and wake any waiting consumer.
+
+        The marker does not count against the data limit, so a full queue still
+        accepts its terminal.
+        """
         with self._lock:
-            if self._events and self._events[-1] is _CLOSED:
+            if self._closed:
                 return
+            self._closed = True
             self._events.append(_CLOSED)
             waiter, self._waiter = self._waiter, None
         self._notify(waiter)
@@ -89,7 +110,11 @@ class OutputStream:
             return len(self._events)
 
     async def next_event(self) -> OutputEvent:
-        """Await the next event; raises ``StopAsyncIteration`` once closed."""
+        """Await the next event; raises ``StopAsyncIteration`` once closed.
+
+        Termination is permanent: calls after the marker was consumed raise
+        immediately instead of parking a waiter no producer will ever wake.
+        """
         while True:
             with self._lock:
                 if self._events:
@@ -98,6 +123,8 @@ class OutputStream:
                         raise StopAsyncIteration
                     if event is not None:
                         return event
+                elif self._closed:
+                    raise StopAsyncIteration
                 waiter = asyncio.get_running_loop().create_future()
                 self._waiter = waiter
             try:
