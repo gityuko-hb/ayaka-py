@@ -45,10 +45,14 @@ class RequestTiming:
     finished_ns: int = 0
     num_output_tokens: int = 0
     inter_token_intervals_ns: list[int] = field(default_factory=list)
-    """Bounded per-token publication gaps, in arrival order.
+    """Bounded publication gaps, in arrival order.
 
-    The first published token establishes ``first_token_ns``; later tokens
-    append ``now - previous`` while the sample cap lasts. The buffer is an
+    The first published token establishes ``first_token_ns``; each later
+    publication instant appends ``now - previous`` while the sample cap lasts.
+    Tokens published at the same instant (a speculative step settling several
+    accepted drafts) form one burst and add no zero-length samples: a client
+    receives them together, so per-token ITL there would be fabricated.
+    ``tpot_ns`` still divides by every token. The buffer is an
     inter-token-latency distribution for benchmarks and never feeds scheduling.
     """
 
@@ -101,8 +105,8 @@ class RequestTiming:
             self.first_token_ns = now_ns
             self.last_token_ns = now_ns
             return
-        if now_ns < self.last_token_ns:
-            return
+        if now_ns <= self.last_token_ns:
+            return  # same burst (or a regressing clock): no interval to sample
         if len(self.inter_token_intervals_ns) < MAX_INTER_TOKEN_SAMPLES:
             self.inter_token_intervals_ns.append(now_ns - self.last_token_ns)
         self.last_token_ns = now_ns

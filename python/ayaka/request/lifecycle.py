@@ -354,11 +354,14 @@ class RequestLifecycle:
             raise ValueError("output token budget is exhausted")
         if self.state is RequestState.ADMITTED:
             self.machine.transition(RequestState.DECODING, now_ns=now_ns)
+        # One settlement publishes the whole burst at one instant: stamp every
+        # token with the same time so ITL records one gap, not fake per-token ones.
+        burst_ns = now_ns if now_ns is not None else self.machine.clock.now().as_nanos()
         position = scheduled.query_start
         for token in token_ids:
             self.machine.commit_computed_range(position, 1)
             self.machine.on_token_generated(1)
-            self.machine.mark_published(now_ns=now_ns)
+            self.machine.mark_published(now_ns=burst_ns)
             self._output_token_ids.append(token)
             self._known_tokens += (token,)
             position += 1
