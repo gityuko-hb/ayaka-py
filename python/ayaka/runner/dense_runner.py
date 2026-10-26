@@ -485,8 +485,22 @@ class DenseModelRunner:
         parts: list[tuple[int, str, SampleLogprobTensors, int]] = []
         if report.raw:
             assert snapshot is not None, "raw-mode rows require the pre-mutation snapshot"
+            # The snapshot packs only the raw rows, in report order: index it by
+            # position in that order, never by sampling row (a batch whose first
+            # sampling rows report nothing would read past the snapshot).
+            rows = torch.tensor(
+                [entry.sampling_row for entry in report.raw],
+                dtype=torch.long,
+                device=logits.device,
+            )
+            packed = LogprobPlan(
+                entries=tuple(
+                    LogprobEntry(sampling_row=index, k=entry.k)
+                    for index, entry in enumerate(report.raw)
+                )
+            )
             tensors = compute_raw_logprobs(
-                snapshot[: len(report.raw)], token_ids, LogprobPlan(entries=report.raw)
+                snapshot[: len(report.raw)], token_ids.index_select(0, rows), packed
             )
             for index, entry in enumerate(report.raw):
                 parts.append((entry.sampling_row, "raw", tensors, index))
