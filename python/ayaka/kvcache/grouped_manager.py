@@ -1854,16 +1854,75 @@ class KVCacheGroupManager:
             return cache.clear(safe_epoch=epoch)
 
     def privatize_prefix_tail(self, sequence: SequenceHandle) -> bool:
-        """Grouped COW unshare is not implemented; pressure reports capacity instead.
+        """Give a sole idle consumer exclusive ownership of its partial tails.
 
-        Homogeneous KV can drop a sole-consumer cache ref on one truncated
-        tail page. A grouped boundary pins whole per-group page sets, so
-        unsharing would require evicting a canonical entry with no guarantee
-        that the pages freed are the ones an appender needs. Returning
-        ``False`` keeps the pressure loop honest: it reports a capacity error
-        instead of making an unsafe guess.
+        A grouped boundary holds its pages through all-group pins, so an
+        appender whose truncated tail is still pinned by canonical entries
+        must copy it in every such group. When this sequence is the only
+        request on each such tail and every pin on it belongs to a cache
+        entry, evicting those entries lets the append write in place and
+        saves one page per group. All-or-nothing across groups: every tail is
+        checked and every pin attributed before any entry is evicted, so a
+        foreign pin, a second consumer, an in-flight reader or a host tier
+        refuses with nothing changed. No committed token, version or device
+        byte changes; physical validity narrows to the request boundary.
         """
-        return False
+        with self._lock:
+            cache = self._prefix_cache
+            if cache is None or self.tiering_enabled:
+                return False
+            state = self._get_sequence_state(sequence)
+            if (
+                state.pending_transaction_index is not None
+                or state.active_lease_index is not None
+                or state.release_requested
+                or state.blocked_until_epoch > self.current_epoch
+            ):
+                return False
+            tails: list[tuple[_GroupRuntime, GroupPageTableEntry, int]] = []
+            for runtime in self._group_runtimes:
+                block = state.committed_tokens // runtime.descriptor.storage_spec.page_size
+                tail = next(
+                    (
+                        entry
+                        for entry in state.group_tables[runtime.descriptor.name]
+                        if entry.logical_block == block
+                    ),
+                    None,
+                )
+                if tail is None:
+                    continue  # a full last page: the next append opens a fresh block
+                meta = runtime.allocator.get_meta(tail.page)
+                if meta.can_mutate and meta.valid_tokens == tail.valid_tokens:
+                    continue  # already private
+                if (
+                    meta.request_refs != 1
+                    or meta.cache_refs
+                    or meta.inflight_refs
+                    or meta.reservation_refs
+                ):
+                    return False
+                tails.append((runtime, tail, meta.pin_refs))
+            if not tails:
+                return False
+            owners = cache.entries_pinning(
+                [(runtime.descriptor.name, tail.page) for runtime, tail, _ in tails]
+            )
+            victims: set[int] = set()
+            for runtime, tail, pins in tails:
+                pinned_by = owners[(runtime.descriptor.name, tail.page)]
+                if len(pinned_by) != pins:
+                    return False  # a pin outside the cache keeps the page shared
+                victims.update(pinned_by)
+            for entry_id in sorted(victims):
+                if not cache.evict_entry(entry_id, safe_epoch=self.current_epoch):
+                    raise InvariantViolationError("grouped prefix tail owner refused eviction")
+            for runtime, tail, _ in tails:
+                if not runtime.allocator.get_meta(tail.page).can_mutate:
+                    raise InvariantViolationError("grouped prefix tail still has another owner")
+                runtime.allocator.set_valid_tokens(tail.page, tail.valid_tokens)
+                runtime.allocator.reclaim_completed()
+            return True
 
     def require_prefix_cache_supported(self) -> None:
         """Raise when this manager cannot serve canonical prefix sharing.

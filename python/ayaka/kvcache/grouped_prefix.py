@@ -15,14 +15,14 @@ token sequence twice reuses the first canonical pin.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from itertools import count
 from threading import RLock
 from typing import TYPE_CHECKING
 
 from ayaka.exceptions import InvariantViolationError, PrefixCapabilityStaleError
-from ayaka.handles import PrefixHandle
+from ayaka.handles import KVPageHandle, PrefixHandle
 from ayaka.prefix.identity import (
     PrefixCacheContext,
     build_identities,
@@ -490,6 +490,28 @@ class GroupedPrefixCache:
         if snapshot is not None:
             self._manager.unpin_prefix(snapshot)
         return True
+
+    def entries_pinning(
+        self, pages: Collection[tuple[str, KVPageHandle]]
+    ) -> dict[tuple[str, KVPageHandle], tuple[int, ...]]:
+        """Map each ``(group, page)`` to the device-resident entries pinning it.
+
+        An entry's snapshot pins each of its pages once, so the tuple length is
+        the number of pins this cache owns on that page; pins held outside the
+        cache are not counted.
+        """
+        wanted = set(pages)
+        owners: dict[tuple[str, KVPageHandle], list[int]] = {key: [] for key in wanted}
+        with self._lock:
+            for entry in self._entries.values():
+                if entry.snapshot is None:
+                    continue
+                for name, entries in entry.snapshot.groups:
+                    for item in entries:
+                        key = (name, item.page)
+                        if key in wanted:
+                            owners[key].append(entry.entry_id)
+        return {key: tuple(ids) for key, ids in owners.items()}
 
     def evict(self, target_pages: int, *, safe_epoch: int) -> int:
         """Evict LRU entries until ``target_pages`` worth of pins are released."""

@@ -316,9 +316,10 @@ class LogicalKVManager:
     def privatize_prefix_tail(self, sequence: SequenceHandle) -> bool:
         """Relinquish cache sharing on a sole-consumer partial tail.
 
-        Grouped boundaries pin whole per-group page sets, so unsharing is not
-        implemented there; the backend reports ``False`` and pressure handling
-        reports an explicit capacity error instead of guessing.
+        Grouped backends unshare every group's tail or none: each pin on a
+        tail must belong to a cache entry, which is then evicted. Any other
+        owner returns ``False`` and pressure handling reports an explicit
+        capacity error instead of guessing.
         """
         self._require_open()
         return self.backend.privatize_prefix_tail(sequence)

@@ -202,6 +202,11 @@ Chi tiết các trường request, validation và chuyển đổi protocol nằm
   và báo calibration trong `/stats.shadow`; `ayaka.prefix.restore_cost.decide_restore` (R3) là
   hàm quyết định restore/recompute theo cost-to-ready, có biên bất định, budget và boundary chung
   của mọi group. Allocator vẫn là nơi duy nhất cấp phát.
+- Grouped KV dưới áp lực bộ nhớ có thể bỏ chia sẻ tail page (COW unshare): khi request là
+  consumer duy nhất của tail ở mọi group và mọi pin trên tail đều thuộc entry của prefix cache,
+  các entry đó bị evict để lần append ghi thẳng vào page thay vì copy. Thao tác là all-or-nothing
+  giữa các group; pin lạ, request thứ hai, step đang chạy hay host tier đều bị từ chối và không
+  đổi gì.
 
 ## Phát triển và kiểm tra
 
