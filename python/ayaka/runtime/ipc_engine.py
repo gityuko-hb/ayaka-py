@@ -506,15 +506,29 @@ class IpcRegionRegistry:
             if entry.descriptors:
                 return
             entry.closing = True
-            self._try_finalize_export(entry)
+            blockers = self._try_finalize_export(entry)
+            if blockers:
+                raise IpcLifetimeError(
+                    "exporter release refused: " + "; ".join(blockers) + "; allocation retained"
+                )
 
     def confirm_close(self, descriptor: IpcRegionDescriptor, rank: int) -> None:
-        """Record the peer close ACK for ``rank`` and finalize when quiescent."""
+        """Record the peer close ACK for ``rank`` and finalize when quiescent.
+
+        A repeated ACK is idempotent. An ACK from a rank the export never
+        declared is refused and not recorded, so it cannot satisfy a later
+        declaration. While other owners remain, the deferred release simply
+        stays deferred; only :meth:`release` reports the refusal.
+        """
         rank = _require_plain_int(rank, "close-ACK rank")
         if rank < 0:
             raise ValueError("close-ACK rank must be non-negative")
         with self._lock:
             entry = self._find_export_entry(descriptor)
+            if rank not in entry.pending_peers:
+                raise IpcLifetimeError(
+                    f"close-ACK from rank {rank}, which this export never declared"
+                )
             entry.acked_peers.add(rank)
             self._try_finalize_export(entry)
 
@@ -524,6 +538,7 @@ class IpcRegionRegistry:
             self._find_export(descriptor).holds += 1
 
     def unhold(self, descriptor: IpcRegionDescriptor) -> None:
+        """Return a local lease; a deferred release finalizes once no owner remains."""
         with self._lock:
             entry = self._find_export_entry(descriptor)
             if entry.holds <= 0:
@@ -531,9 +546,10 @@ class IpcRegionRegistry:
             entry.holds -= 1
             self._try_finalize_export(entry)
 
-    def _try_finalize_export(self, entry: _ExportedRegion) -> None:
+    def _try_finalize_export(self, entry: _ExportedRegion) -> list[str]:
+        """Drop a closing export once no owner remains; return what still blocks it."""
         if not entry.closing or entry.descriptors:
-            return
+            return []
         blockers: list[str] = []
         if entry.holds:
             blockers.append(f"{entry.holds} local holds")
@@ -543,11 +559,10 @@ class IpcRegionRegistry:
         if outstanding:
             blockers.append(f"close-ACK missing from ranks {sorted(outstanding)}")
         if blockers:
-            raise IpcLifetimeError(
-                "exporter release refused: " + "; ".join(blockers) + "; allocation retained"
-            )
+            return blockers
         self._exports.pop(entry.handle, None)
         entry.owner = None
+        return []
 
     # -- importer side -----------------------------------------------------
 
